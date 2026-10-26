@@ -1,0 +1,20 @@
+services:
+  hermes-webui:
+    user: "1024:1024"
+
+    environment:
+      WANTED_UID: "1024"
+      WANTED_GID: "1024"
+      PYTHONPATH: "/opt/hermes"
+      UV_CACHE_DIR: "/uv_cache"
+      UV_PYTHON_INSTALL_DIR: "/uv_cache/python"
+
+    volumes:
+      - ./hermes-webui:/app
+      - ./hermes-agent:/opt/hermes:ro
+      - dev-venv:/app/venv
+      - dev-uv-cache:/uv_cache
+
+volumes:
+  dev-venv:
+  dev-uv-cache:

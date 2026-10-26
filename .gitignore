@@ -1,0 +1,16 @@
+.upstream/
+release/
+runtime/
+.env
+.env.*
+!**/.env*.example
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+**/node_modules/
+hermes-webui/hermes-agent-src/
+hermes-webui/venv.previous/
+hermes-webui/hermes-agent-src.previous/
+hermes-webui/.agent-venv-rebuild*

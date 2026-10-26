@@ -1,0 +1,2723 @@
+const _WEBUI_DISPATCHABLE_AGENT_COMMANDS = new Set([
+  'reload-mcp','reload-skills','codex-runtime','credits',
+  'moa','sessions','resume','pet'
+]);
+// ── Slash commands ──────────────────────────────────────────────────────────
+// Built-in commands intercepted before send(). Each command runs locally
+// (no round-trip to the agent) and shows feedback via toast or local message.
+
+const COMMANDS=[
+  // noEcho:true = action-only commands that don't produce a chat response.
+  // Commands without noEcho get a user message echoed to the chat (#840).
+  {name:'help',      desc:t('cmd_help'),             fn:cmdHelp},
+  {name:'clear',     desc:t('cmd_clear'),         fn:cmdClear,     noEcho:true},
+  {name:'compress',  desc:t('cmd_compress'),       fn:cmdCompress, arg:'[focus topic]', noEcho:true},
+  {name:'compact',   desc:t('cmd_compact_alias'),       fn:cmdCompact, noEcho:true},
+  {name:'model',     desc:t('cmd_model'),  fn:cmdModel,     arg:'model_name', subArgs:'models', noEcho:true},
+  {name:'workspace', desc:t('cmd_workspace'),            fn:cmdWorkspace, arg:'name',           noEcho:true},
+  {name:'terminal',  desc:t('cmd_terminal'),             fn:cmdTerminal,                        noEcho:true},
+  {name:'new',       desc:t('cmd_new'),            fn:cmdNew,       noEcho:true},
+  {name:'usage',     desc:t('cmd_usage'),   fn:cmdUsage,     noEcho:true},
+  {name:'theme',     desc:t('cmd_theme'), fn:cmdTheme, arg:'name',  noEcho:true},
+  {name:'personality', desc:t('cmd_personality'), fn:cmdPersonality, arg:'name', subArgs:'personalities'},
+  {name:'skills',    desc:t('cmd_skills'),   fn:cmdSkills,   arg:'query'},
+  {name:'use',       desc:t('cmd_use'),      fn:cmdUse,      arg:'skill-name', subArgs:'skills', noEcho:true},
+  {name:'stop',      desc:t('cmd_stop'),     fn:cmdStop,      noEcho:true},
+  {name:'goal',      desc:t('cmd_goal'),     fn:cmdGoal,      arg:'[status|pause|resume|clear|text]', subArgs:['status','pause','resume','clear']},
+  {name:'queue',     desc:t('cmd_queue'),    fn:cmdQueue,     arg:'message', noEcho:true},
+  {name:'interrupt', desc:t('cmd_interrupt'), fn:cmdInterrupt, arg:'message', noEcho:true},
+  {name:'steer',     desc:t('cmd_steer'),    fn:cmdSteer,     arg:'message', noEcho:true},
+  {name:'title',     desc:t('cmd_title'),    fn:cmdTitle,    arg:'[title]'},
+  {name:'retry',     desc:t('cmd_retry'),    fn:cmdRetry,     noEcho:true},
+  {name:'undo',      desc:t('cmd_undo'),     fn:cmdUndo,      noEcho:true},
+  {name:'btw',       desc:t('cmd_btw'),      fn:cmdBtw,       arg:'question', noEcho:true},
+  {name:'background',desc:t('cmd_background'),fn:cmdBackground,arg:'prompt',  noEcho:true},
+  {name:'status',    desc:t('cmd_status'),   fn:cmdStatus},
+  {name:'voice',     desc:t('cmd_voice'),    fn:cmdVoice,     noEcho:true},
+  {name:'reasoning', desc:t('cmd_reasoning'), fn:cmdReasoning, arg:'show|hide|none|minimal|low|medium|high|xhigh|max', subArgs:['show','hide','none','minimal','low','medium','high','xhigh','max'], noEcho:true},
+  {name:'yolo', desc:t('cmd_yolo'), fn:cmdYolo, noEcho:true},
+  {name:'branch', desc:t('cmd_branch'), fn:cmdBranch, arg:'[name]', noEcho:true},
+];
+
+const SLASH_SUBARG_SOURCES={
+  model:{desc:t('cmd_model'), subArgs:'models'},
+  personality:{desc:t('cmd_personality'), subArgs:'personalities'},
+};
+
+function parseCommand(text){
+  if(!text.startsWith('/'))return null;
+  const parts=text.slice(1).split(/\s+/);
+  const name=parts[0].toLowerCase();
+  const args=parts.slice(1).join(' ').trim();
+  return {name,args};
+}
+
+const DESKTOP_COMPANION_EXTENSION_ID='desktop-companion';
+const DESKTOP_COMPANION_NAME='Desktop Companion';
+const DESKTOP_COMPANION_INSTALL_PATH='Settings -> Extensions -> Gallery -> Desktop Companion';
+const DESKTOP_COMPANION_SETUP_GUIDE_URL='https://github.com/franksong2702/hermes-webui-desktop-companion#after-gallery-install';
+const DESKTOP_COMPANION_LOCAL_APP_LABEL='Desktop Companion app';
+
+function _getDesktopCompanionStatusGlobal(){
+  if(typeof window==='undefined') return null;
+  return window.__HERMES_WEBUI_DESKTOP_COMPANION_STATUS__||null;
+}
+
+function _getDesktopCompanionExtensionStatus(status){
+  return Array.isArray(status&&status.extensions)
+    ? status.extensions.find(ext=>String(ext&&ext.id||'')===DESKTOP_COMPANION_EXTENSION_ID)||null
+    : null;
+}
+
+function _petSlashCommandArgs(rawCommandText){
+  const parsed=parseCommand(String(rawCommandText||'').trim());
+  return parsed&&parsed.name==='pet' ? parsed.args : String(rawCommandText||'').trim().replace(/^\/pet\b\s*/i,'').trim();
+}
+
+function _desktopCompanionMissingMessage(){
+  return `${DESKTOP_COMPANION_NAME} is not installed yet.
+
+Install it from ${DESKTOP_COMPANION_INSTALL_PATH}, then follow the setup guide: ${DESKTOP_COMPANION_SETUP_GUIDE_URL}.
+
+The guide also shows how to start the ${DESKTOP_COMPANION_LOCAL_APP_LABEL}.`;
+}
+
+function _desktopCompanionDisabledMessage(){
+  return `${DESKTOP_COMPANION_NAME} is installed but disabled.
+
+Enable it in Settings -> Extensions, then reload WebUI if you just changed that and start the ${DESKTOP_COMPANION_LOCAL_APP_LABEL}.
+
+Setup guide: ${DESKTOP_COMPANION_SETUP_GUIDE_URL}`;
+}
+
+function _desktopCompanionReloadMessage(){
+  return `${DESKTOP_COMPANION_NAME} is enabled, but the adapter status is not loaded yet.
+
+Reload WebUI if you just enabled it, then start the ${DESKTOP_COMPANION_LOCAL_APP_LABEL}.`;
+}
+
+function _desktopCompanionConnectMessage(){
+  return `${DESKTOP_COMPANION_NAME} is enabled, but the local app is not connected yet.
+
+Start or connect the ${DESKTOP_COMPANION_LOCAL_APP_LABEL}, then retry /pet.
+
+Setup guide: ${DESKTOP_COMPANION_SETUP_GUIDE_URL}`;
+}
+
+function _desktopCompanionStatusUnavailableMessage(){
+  return `${DESKTOP_COMPANION_NAME} status is unavailable right now.
+
+Reload WebUI or check your connection, then retry /pet.`;
+}
+
+function _desktopCompanionUnavailableMessage(){
+  return `${DESKTOP_COMPANION_NAME} is installed and connected, but /pet is not available yet in this Desktop Companion version.
+
+Update the ${DESKTOP_COMPANION_LOCAL_APP_LABEL}, then follow the setup guide: ${DESKTOP_COMPANION_SETUP_GUIDE_URL}.`;
+}
+
+function _desktopCompanionHookErrorMessage(){
+  return `${DESKTOP_COMPANION_NAME} is installed and connected, but it hit an error while handling /pet.
+
+Check the browser console and the ${DESKTOP_COMPANION_LOCAL_APP_LABEL}, then retry /pet.`;
+}
+
+async function handlePetSlashCommand(rawCommandText,meta){
+  const command=String(rawCommandText||'');
+  const commandName=String((meta&&meta.name)||'pet').trim()||'pet';
+  const args=_petSlashCommandArgs(command);
+  let status;
+  try{
+    status=await api('/api/extensions/status');
+  }catch(_e){
+    return {handled:false,message:_desktopCompanionStatusUnavailableMessage()};
+  }
+  const companion=_getDesktopCompanionExtensionStatus(status);
+  if(!companion){
+    return {handled:false,message:_desktopCompanionMissingMessage()};
+  }
+  if(companion.effective_enabled!==true){
+    return {handled:false,message:_desktopCompanionDisabledMessage()};
+  }
+  const companionStatus=_getDesktopCompanionStatusGlobal();
+  if(!companionStatus){
+    return {handled:false,message:_desktopCompanionReloadMessage()};
+  }
+  if(companionStatus.connected!==true){
+    return {handled:false,message:_desktopCompanionConnectMessage()};
+  }
+  const hook=typeof window!=='undefined'&&window.__hermesHandlePetSlashCommand;
+  if(typeof hook==='function'){
+    try{
+      const result=await hook({
+        command,
+        args,
+        source:'webui-slash-command',
+        metadata:{name:commandName},
+      });
+      if(result){
+        return {
+          handled:true,
+          message:result&&typeof result==='object'&&'message' in result
+            ? String(result.message??'')
+            : '',
+        };
+      }
+    }catch(_e){
+      if(typeof console!=='undefined'&&console.error){
+        console.error('[hermes] Desktop Companion /pet hook error:',_e);
+      }
+      return {handled:false,message:_desktopCompanionHookErrorMessage()};
+    }
+  }
+  return {handled:false,message:_desktopCompanionUnavailableMessage()};
+}
+
+function executeCommand(text){
+  const parsed=parseCommand(text);
+  if(!parsed)return null;
+  const cmd=COMMANDS.find(c=>c.name===parsed.name);
+  if(!cmd)return null;
+  // A handler may return `false` to opt out of interception — e.g. /reasoning
+  // with an effort level falls through so the agent's own handler sees it,
+  // preserving the pre-existing pass-through behaviour for that subcommand.
+  if(cmd.fn(parsed.args)===false)return null;
+  // Return noEcho flag so send() knows whether to echo the command as a user message (#840).
+  return {noEcho:!!cmd.noEcho};
+}
+
+// Agent-registry slash commands that the WebUI actually dispatches when
+// submitted. The autocomplete must not advertise anything outside this set:
+// a non-dispatchable registry command (e.g. /agents) would otherwise fall
+// through send() to the ordinary chat path and trigger an unintended
+// model/API request.
+//
+// This set holds canonical registry names only. getMatchingCommands() matches
+// cmd.name (the canonical metadata name), so alias/underscore forms such as
+// /reload_mcp are covered implicitly: typing one resolves through
+// getAgentCommandMetadata() at dispatch time and the canonical name is what
+// gets tested against the dispatcher allowlist (#6951).
+//
+// Keep this in sync with _AGENT_COMMANDS_RUN_ON_WEBUI in messages.js and
+// _ALLOWED_AGENT_COMMANDS in api/commands.py -- the announced list is a
+// subset of the dispatched list (fail-closed), never a superset.
+// Plugin-category commands are always dispatchable via the plugin exec
+// transport. #6951.
+
+function _isWebuiDispatchableAgentCommand(cmd){
+  const name=String(cmd&&cmd.name||'').trim().toLowerCase();
+  if(_WEBUI_DISPATCHABLE_AGENT_COMMANDS.has(name))return true;
+  // Plugin-registered commands execute via the /api/commands/exec plugin transport.
+  return String(cmd&&cmd.category||'').trim()==='Plugin';
+}
+
+function getMatchingCommands(prefix){
+  const q=prefix.toLowerCase();
+  const matches=COMMANDS.filter(c=>c.name.startsWith(q)).map(c=>({...c,source:'builtin'}));
+  const seen=new Set(matches.map(c=>c.name));
+  const reserved=_getReservedSlashCommandSlugs();
+  const bundleSlugs=new Set(_bundleCommandCache.map(bundle=>bundle.name));
+  for(const [name, spec] of Object.entries(SLASH_SUBARG_SOURCES)){
+    if(!name.startsWith(q)||seen.has(name))continue;
+    matches.push({
+      name,
+      desc:spec.desc,
+      arg:'name',
+      source:'subarg-command',
+    });
+    seen.add(name);
+  }
+  if('pet'.startsWith(q)&&!seen.has('pet')){
+    const petMeta=Array.isArray(_agentCommandCache)
+      ? _agentCommandCache.find(cmd=>String(cmd&&cmd.name||'').toLowerCase()==='pet')
+      : null;
+    matches.push({
+      name:'pet',
+      desc:String((petMeta&&petMeta.description)||'Desktop Companion command').trim()||'Desktop Companion command',
+      source:'agent',
+    });
+    seen.add('pet');
+  }
+  // Include agent/plugin commands from /api/commands metadata
+  for(const cmd of (_agentCommandCache||[])){
+    const name=String(cmd&&cmd.name||'').toLowerCase();
+    if(!name.startsWith(q)||seen.has(name))continue;
+    if(cmd.cli_only&&name!=='pet')continue;
+    // #6951: only announce commands send() actually dispatches -- anything
+    // else would silently fall through to the normal chat path as plain text.
+    if(!_isWebuiDispatchableAgentCommand(cmd))continue;
+    matches.push({
+      name,
+      desc:String(cmd&&cmd.description||'').trim()||'Agent command',
+      // Surface the registry's argument hint on the autocomplete row (#6951).
+      arg:String(cmd&&cmd.args_hint||'').trim()||undefined,
+      source:cmd.category==='Plugin'?'plugin':'agent',
+    });
+    seen.add(name);
+  }
+  if(_agentCommandCacheReady){
+    for(const bundle of _bundleCommandCache){
+      if(!bundle.name.startsWith(q)||seen.has(bundle.name)||reserved.has(bundle.name))continue;
+      matches.push(bundle);
+      seen.add(bundle.name);
+    }
+  }
+  // A same-slug bundle owns dispatch. Hold plain skills until the independent
+  // bundle metadata request settles so a slow bundle response cannot briefly
+  // expose a selectable, shadowed skill.
+  if(!_bundleCommandCacheReady)return matches;
+  for(const skill of _skillCommandCache){
+    const name=String(skill&&skill.name||'').toLowerCase();
+    const description=String(skill&&skill.desc||'').toLowerCase();
+    if((!name.includes(q)&&!description.includes(q))||seen.has(name)||reserved.has(name)||bundleSlugs.has(name))continue;
+    matches.push(skill);
+    seen.add(name);
+  }
+  return matches;
+}
+
+let _forcedSkillDirectivePending=null;
+let _slashModelCache=null;
+let _slashModelCachePromise=null;
+let _slashPersonalityCache=null;
+let _slashPersonalityCachePromise=null;
+let _bundleCommandCache=[];
+let _bundleCommandLoadPromise=null;
+let _bundleCommandCacheReady=false;
+// Bumped by invalidateSlashSkillCaches(). The two skill-cache loaders below capture
+// it when they issue /api/skills and refuse to commit when it moved while their
+// response was in flight: a reply generated for the previous profile would otherwise
+// land after a profile switch and repopulate the caches with that profile's
+// disabled-filtered payload, keeping a skill that is enabled in the new profile
+// hidden (#7509).
+let _slashSkillCache=null;
+let _slashSkillCachePromise=null;
+let _slashSkillCacheGen=0;
+let _agentCommandCache=null;
+let _agentCommandCachePromise=null;
+
+// Invalidate the /api/models slash-suggestion cache. Called by panels.js
+// after a provider is added or removed so the next /model autocomplete
+// rebuilds from a fresh /api/models response (#1539). Returning a function
+// rather than letting callers poke the module-local lets/promises directly
+// keeps the cache shape encapsulated to this module.
+function _invalidateSlashModelCache(){
+  _slashModelCache=null;
+  _slashModelCachePromise=null;
+}
+// Expose on window when available. Guarded by typeof so the module is
+// importable in headless test contexts (vm.runInContext) that don't
+// define a window global — see tests/test_cli_only_slash_commands.py.
+if(typeof window!=='undefined'){
+  window._invalidateSlashModelCache=_invalidateSlashModelCache;
+  window.invalidateSlashSkillCaches=invalidateSlashSkillCaches;
+}
+
+function _normalizeSlashSubArg(value){
+  return String(value||'').trim();
+}
+
+function _getSlashModelSubArgsFromDom(){
+  const sel=$('modelSelect');
+  if(!sel) return [];
+  const values=[];
+  for(const opt of Array.from(sel.options||[])){
+    const value=_normalizeSlashSubArg(opt.value||opt.textContent||'');
+    if(value) values.push(value);
+  }
+  return Array.from(new Set(values)).sort((a,b)=>a.localeCompare(b));
+}
+
+async function _loadSlashModelSubArgs(force=false){
+  const domValues=_getSlashModelSubArgsFromDom();
+  if(domValues.length&&!force){
+    _slashModelCache=domValues;
+    return domValues;
+  }
+  if(_slashModelCache&&!force) return _slashModelCache;
+  if(_slashModelCachePromise&&!force) return _slashModelCachePromise;
+  _slashModelCachePromise=(async()=>{
+    try{
+      const data=await api('/api/models');
+      const values=[];
+      for(const group of (data&&data.groups)||[]){
+        for(const model of (group&&group.models)||[]){
+          const id=_normalizeSlashSubArg(model&&model.id);
+          if(id) values.push(id);
+        }
+        // Include extra_models (the catalog tail that doesn't render as
+        // <option> entries when the picker is capped) so /model autocomplete
+        // covers the full catalog. The trimming is purely a dropdown
+        // scannability concern — the slash command exists precisely so
+        // power users can reach any model by typing its name. #1567.
+        for(const model of (group&&group.extra_models)||[]){
+          const id=_normalizeSlashSubArg(model&&model.id);
+          if(id) values.push(id);
+        }
+      }
+      const deduped=Array.from(new Set(values)).sort((a,b)=>a.localeCompare(b));
+      _slashModelCache=deduped;
+      return deduped;
+    }catch(_){
+      _slashModelCache=domValues;
+      return domValues;
+    }finally{
+      _slashModelCachePromise=null;
+    }
+  })();
+  return _slashModelCachePromise;
+}
+
+async function _loadSlashPersonalitySubArgs(force=false){
+  if(_slashPersonalityCache&&!force) return _slashPersonalityCache;
+  if(_slashPersonalityCachePromise&&!force) return _slashPersonalityCachePromise;
+  _slashPersonalityCachePromise=(async()=>{
+    try{
+      const data=await api('/api/personalities');
+      const values=['none'];
+      for(const p of (data&&data.personalities)||[]){
+        const name=_normalizeSlashSubArg(p&&p.name);
+        if(name) values.push(name);
+      }
+      const deduped=Array.from(new Set(values)).sort((a,b)=>a.localeCompare(b));
+      _slashPersonalityCache=deduped;
+      return deduped;
+    }catch(_){
+      _slashPersonalityCache=['none'];
+      return _slashPersonalityCache;
+    }finally{
+      _slashPersonalityCachePromise=null;
+    }
+  })();
+  return _slashPersonalityCachePromise;
+}
+
+// Disabled skills are excluded from the backend skill-command map, so the slash
+// picker surfaces must agree. Single gate for every place that turns /api/skills
+// entries into selectable completions.
+function _isSkillDisabled(skill){
+  return !!(skill&&skill.disabled);
+}
+
+async function _loadSlashSkillSubArgs(force=false){
+  if(_slashSkillCache&&!force) return _slashSkillCache;
+  if(_slashSkillCachePromise&&!force) return _slashSkillCachePromise;
+  const gen=_slashSkillCacheGen;
+  _slashSkillCachePromise=(async()=>{
+    try{
+      const data=await api('/api/skills');
+      const values=[];
+      for(const skill of (data&&data.skills)||[]){
+        if(_isSkillDisabled(skill)) continue;
+        const name=_normalizeSlashSubArg(skill&&skill.name);
+        if(name) values.push(name);
+      }
+      const deduped=Array.from(new Set(values)).sort((a,b)=>a.localeCompare(b));
+      // A profile switch during the request bumped the generation: this payload
+      // belongs to the previous profile, so leave the cache empty for the fresh
+      // read instead of publishing stale names (#7509).
+      if(gen!==_slashSkillCacheGen) return _slashSkillCache||[];
+      _slashSkillCache=deduped;
+      return deduped;
+    }catch(_){
+      if(gen===_slashSkillCacheGen) _slashSkillCache=null;
+      return [];
+    }finally{
+      if(gen===_slashSkillCacheGen) _slashSkillCachePromise=null;
+    }
+  })();
+  return _slashSkillCachePromise;
+}
+
+function invalidateSlashSkillCaches(){
+  // Bump before dropping the caches: an /api/skills response still in flight was
+  // generated for the previous profile and must not commit once it lands (#7509).
+  _slashSkillCacheGen++;
+  _slashSkillCache=null;
+  _slashSkillCachePromise=null;
+  _skillCommandCache=[];
+  _skillCommandCacheReady=false;
+  _skillCommandLoadPromise=null;
+}
+
+function _getSlashSubArgOptions(spec){
+  if(Array.isArray(spec)) return Promise.resolve(spec.slice());
+  if(spec==='models') return _loadSlashModelSubArgs();
+  if(spec==='personalities') return _loadSlashPersonalitySubArgs();
+  if(spec==='skills') return _loadSlashSkillSubArgs();
+  return Promise.resolve([]);
+}
+
+let _agentCommandCacheReady=false;
+async function loadAgentCommandMetadata(force=false){
+  if(_agentCommandCacheReady&&!force)return _agentCommandCache||[];
+  if(_agentCommandCachePromise&&!force)return _agentCommandCachePromise;
+  _agentCommandCachePromise=(async()=>{
+    try{
+      const data=await api('/api/commands');
+      _agentCommandCache=Array.isArray(data&&data.commands)?data.commands:[];
+    }catch(_){
+      _agentCommandCache=[];
+    }finally{
+      _agentCommandCacheReady=true;
+      _agentCommandCachePromise=null;
+    }
+    return _agentCommandCache;
+  })();
+  return _agentCommandCachePromise;
+}
+
+async function getAgentCommandMetadata(name){
+  const needle=String(name||'').trim().toLowerCase();
+  if(!needle) return null;
+  const commands=await loadAgentCommandMetadata();
+  return commands.find(cmd=>{
+    if(String(cmd&&cmd.name||'').toLowerCase()===needle) return true;
+    return Array.isArray(cmd&&cmd.aliases)&&cmd.aliases.some(a=>String(a||'').toLowerCase()===needle);
+  })||null;
+}
+
+function cliOnlyCommandResponse(cmdName, meta){
+  const name=String((meta&&meta.name)||cmdName||'').trim();
+  const desc=String((meta&&meta.description)||'').trim();
+  const detail=desc?`\n\n${desc}`:'';
+  let extra='';
+  if(name==='browser'){
+    extra='\n\nBrowser tools in WebUI must be configured server-side with the agent/browser environment. Once configured, ask the model to use browser tools directly; `/browser` itself only works in `hermes chat`.';
+  }
+  return `\`/${name}\` is a Hermes CLI-only command and cannot run inside the WebUI.${detail}${extra}`;
+}
+
+async function executeAgentCommand(text,_meta){
+  return _runAgentCommandTransport(text,_meta);
+}
+
+async function executeAgentPluginCommand(text,_meta){
+  return _runAgentCommandTransport(text,_meta);
+}
+
+async function _runAgentCommandTransport(text,_meta){
+  const command=String(text||'').trim();
+  if(!command) throw new Error('command is required');
+  const data=await api('/api/commands/exec',{
+    method:'POST',
+    body:JSON.stringify({command})
+  });
+  return String(data&&data.output||'(no output)');
+}
+
+async function resolveBundleCommand(text,_meta){
+  const command=String(text||'').trim();
+  if(!command) throw new Error('command is required');
+  return api('/api/commands/bundles/resolve',{
+    method:'POST',
+    body:JSON.stringify({command})
+  });
+}
+
+function _activeSlashCommandOffset(text){
+  // Find the offset of the slash that begins the active command token.
+  // A command token starts with / at the beginning of the line or after
+  // whitespace.  Excludes ~/ path tokens and mid-word slashes (URLs,
+  // provider/model IDs like openrouter/deepseek).
+  if(!text||text.indexOf('\n')!==-1) return -1;
+  // Scan for / at a token-initial position
+  for(let i=0;i<text.length;i++){
+    if(text[i]==='/'){
+      // Start of line = token-initial
+      if(i===0) return i;
+      // After whitespace = token-initial
+      if(/\s/.test(text[i-1])){
+        // Exclude ~/ path tokens
+        if(i+1<text.length&&text[i+1]==='~') continue;
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+function _parseSlashAutocomplete(text){
+  const slashIdx=_activeSlashCommandOffset(text);
+  if(slashIdx<0) return null;
+  const raw=text.slice(slashIdx+1);
+  const hasSpace=/\s/.test(raw);
+  const parts=raw.split(/\s+/);
+  const cmdName=(parts[0]||'').toLowerCase();
+  const command=COMMANDS.find(c=>c.name===cmdName);
+  const subArgSource=(command&&command.subArgs)?command:SLASH_SUBARG_SOURCES[cmdName];
+  if(!hasSpace||!subArgSource){
+    return {kind:'commands', query:raw};
+  }
+  const argText=raw.slice(cmdName.length).replace(/^\s+/,'');
+  return {kind:'subargs', command:{name:cmdName, desc:subArgSource.desc, subArgs:subArgSource.subArgs}, query:argText.toLowerCase(), rawQuery:argText};
+}
+
+async function getSlashAutocompleteMatches(text){
+  const parsed=_parseSlashAutocomplete(text);
+  if(!parsed) return [];
+  if(parsed.kind==='commands') return getMatchingCommands(parsed.query);
+  const options=await _getSlashSubArgOptions(parsed.command.subArgs);
+  return options
+    .filter(opt=>String(opt).toLowerCase().startsWith(parsed.query))
+    .map(opt=>({
+      name:parsed.command.name,
+      value:String(opt),
+      desc:parsed.command.desc,
+      source:'subarg',
+      parent:parsed.command.name,
+    }));
+}
+
+function _findComposerPathToken(text,cursor){
+  const value=String(text||'');
+  const rawCursor=Number(cursor);
+  const pos=Number.isFinite(rawCursor)?Math.max(0,Math.min(rawCursor,value.length)):value.length;
+  let start=pos;
+  while(start>0&&!/\s/.test(value.charAt(start-1))) start-=1;
+  let end=pos;
+  while(end<value.length&&!/\s/.test(value.charAt(end))) end+=1;
+  const prefix=value.slice(start,pos);
+  if(!prefix.startsWith('~/')) return null;
+  return {start,end,prefix};
+}
+
+async function getComposerPathAutocompleteMatches(text,cursor){
+  const token=_findComposerPathToken(text,cursor);
+  if(!token||typeof api!=='function') return [];
+  const qs=new URLSearchParams({prefix:token.prefix}).toString();
+  const data=await api(`/api/workspaces/suggest?${qs}`);
+  const needle=token.prefix.toLowerCase();
+  return ((data&&data.suggestions)||[])
+    .map(path=>String(path||''))
+    .filter(path=>path&&path.toLowerCase().startsWith(needle))
+    .map(path=>({
+      name:path,
+      value:path,
+      desc:'Workspace path',
+      source:'path',
+      tokenStart:token.start,
+      tokenEnd:token.end,
+    }));
+}
+
+function _compressionAnchorMessageKey(m){
+  if(!m||!m.role||m.role==='tool') return null;
+  let content='';
+  try{
+    content=typeof msgContent==='function' ? String(msgContent(m)||'') : String(m.content||'');
+  }catch(_){
+    content=String(m.content||'');
+  }
+  const norm=content.replace(/\s+/g,' ').trim().slice(0,160);
+  const ts=m._ts||m.timestamp||null;
+  const attachments=Array.isArray(m.attachments)?m.attachments.length:0;
+  if(!norm && !attachments && !ts) return null;
+  return {role:String(m.role||''), ts, text:norm, attachments};
+}
+
+// ── Command handlers ────────────────────────────────────────────────────────
+
+function cmdHelp(){
+  const lines=COMMANDS.map(c=>{
+    const usage=c.arg ? (String(c.arg).startsWith('[') ? ` ${c.arg}` : ` <${c.arg}>`) : '';
+    return `  /${c.name}${usage} — ${c.desc}`;
+  });
+  const msg={role:'assistant',content:t('available_commands')+'\n'+lines.join('\n')};
+  S.messages.push(msg);
+  renderMessages();
+  showToast(t('type_slash'));
+}
+
+function cmdClear(){
+  if(!S.session)return;
+  S.messages=[];S.toolCalls=[];
+  clearLiveToolCards();
+  if(typeof clearCompressionUi==='function') clearCompressionUi();
+  renderMessages();
+  $('emptyState').style.display='';
+  showToast(t('conversation_cleared'));
+}
+
+// Find the best matching model <option> for a slash-command query.
+// Returns an exact id/label match if present, otherwise the shortest option
+// whose value or label contains the query. Preferring the shortest match keeps
+// a specific query like "mimo-v2.5" from being shadowed by a longer variant
+// such as "mimo-v2.5-pro". See issue #3368.
+//
+// #3368 follow-up: a COMPLETE versioned query (ends in a digit, e.g.
+// "mimo-v2.5") must not match a variant/tier suffix (e.g. "mimo-v2.5-pro") via
+// substring — that silently upgrades the user to a different (paid) tier they
+// did not ask for. Such a candidate is only accepted when the query also
+// matches the option's visible label as a *whole word*, or when the extra text
+// continues a version number. Otherwise the longer tier is rejected here and
+// surfaced as a suggestion instead.
+function _looksLikeVersionedModel(query){
+  // e.g. "mimo-v2.5", "gpt-5.5", "claude-opus-4.6" — ends in a digit.
+  return /\d$/.test(String(query||''));
+}
+// Build the full /model candidate set from the catalog groups returned by
+// /api/models: featured `models` PLUS the truncated `extra_models` tail. Large
+// provider catalogs (e.g. a Nous Portal subscription with >25 models) only
+// render a "featured" subset as <option> entries — the rest live in
+// extra_models and never become <select> options (see _build_nous_featured_set
+// in api/config.py). The slash command exists precisely so power users can reach
+// ANY catalog model by name, the same way the CLI/autocomplete can, so /model
+// must resolve against this full list — not just the rendered picker options.
+// Falls back to the live <select> options when the catalog fetch failed.
+// Each entry mimics the <option> shape (value + textContent) so it can be passed
+// straight to _bestModelMatch / _nearestModelSuggestion. Also returns a
+// value->provider_id map so an extras-only winner can be injected with the right
+// provider. (#3368)
+function _buildModelCandidates(sel,groups){
+  const options=[];
+  const providerMap={};
+  if(Array.isArray(groups)&&groups.length){
+    for(const g of groups){
+      const pid=(g&&g.provider_id)||'';
+      const push=m=>{
+        if(!m||!m.id) return;
+        options.push({value:m.id,textContent:m.label||m.id});
+        if(pid&&!(m.id in providerMap)) providerMap[m.id]=pid;
+      };
+      for(const m of (Array.isArray(g.models)?g.models:[])) push(m);
+      for(const m of (Array.isArray(g.extra_models)?g.extra_models:[])) push(m);
+    }
+  }
+  if(!options.length&&sel){
+    for(const o of Array.from(sel.options||[])) options.push({value:o.value,textContent:o.textContent});
+  }
+  return {options,providerMap};
+}
+// Configured aliases are routing instructions, not fuzzy search terms. Hermes
+// encodes them as `provider/model`, while duplicate-provider picker rows use
+// `@provider:model`. Preserve that provider across the representation boundary;
+// if the model is not currently catalogued, keep the explicit routed value so
+// the eventual provider error is visible rather than silently choosing a
+// same-named model from another provider.
+function _resolveModelAliasTarget(options,providerMap,target){
+  if(target&&typeof target==='object'){
+    const model=String(target.model||'').trim();
+    const routeProvider=String(target.route_provider||'').trim();
+    if(model&&routeProvider){
+      return {value:`@${routeProvider}:${model}`,provider:routeProvider};
+    }
+    return null;
+  }
+  const raw=String(target||'').trim();
+  const slash=raw.indexOf('/');
+  if(slash<=0||slash===raw.length-1) return null;
+  const provider=raw.slice(0,slash);
+  const model=raw.slice(slash+1);
+  const routedPrefix=`@${provider}:`;
+  for(const option of (options||[])){
+    const value=String(option&&option.value!==undefined?option.value:option);
+    let optionProvider=String((providerMap&&providerMap[value])||'');
+    if(!optionProvider&&typeof _providerFromModelValue==='function'){
+      optionProvider=String(_providerFromModelValue(value)||'');
+    }
+    if(optionProvider.toLowerCase()!==provider.toLowerCase()) continue;
+    const nativeModel=value.toLowerCase().startsWith(routedPrefix.toLowerCase())
+      ?value.slice(routedPrefix.length)
+      :value;
+    if(nativeModel.toLowerCase()===model.toLowerCase()) return {value,provider};
+  }
+  return {value:`${routedPrefix}${model}`,provider};
+}
+function _bestModelMatch(options,query){
+  let best=null;
+  const versioned=_looksLikeVersionedModel(query);
+  for(const opt of options){
+    const value=opt.value.toLowerCase();
+    const text=opt.textContent.toLowerCase();
+    if(value===query||text===query) return opt.value;
+    if(value.includes(query)||text.includes(query)){
+      if(versioned){
+        // Reject a longer variant where the query is immediately followed by a
+        // tier/variant suffix ("-pro", "-flash", " pro", etc.) rather than a
+        // version continuation. Tested on the option value (canonical id).
+        const idx=value.indexOf(query);
+        const after=idx>=0?value.charAt(idx+query.length):'';
+        // after === '' → query is a suffix of value (exact-ish, allow)
+        // after is a digit or '.' → version continuation (allow, e.g. v2 → v2.5)
+        // after is '-' or other → variant/tier suffix (reject)
+        if(after && after!=='.' && !/\d/.test(after)) continue;
+      }
+      if(best===null||opt.value.length<best.length) best=opt.value;
+    }
+  }
+  return best;
+}
+
+// When a versioned query has no clean match, find the closest catalog option
+// (a longer variant that the query is a prefix of) to offer as a suggestion,
+// e.g. "mimo-v2.5" → "mimo-v2.5-pro". Returns the suggested option value, or ''.
+function _nearestModelSuggestion(options,query){
+  let suggestion='';
+  for(const opt of options){
+    const value=opt.value.toLowerCase();
+    if(value.includes(query)){
+      const cand=opt.value;
+      if(!suggestion||cand.length<suggestion.length) suggestion=cand;
+    }
+  }
+  return suggestion;
+}
+
+async function cmdModel(args){
+  if(!args){showToast(t('model_usage'));return;}
+  const sel=$('modelSelect');
+  if(!sel)return;
+  let q=args.toLowerCase();
+  // Fetch /api/models once: it carries both the alias map AND the full catalog
+  // groups (featured `models` + truncated `extra_models`). Resolve aliases, then
+  // build the full candidate set so /model can reach ANY catalog model by name —
+  // not just the subset rendered as <option> entries. On large provider catalogs
+  // (e.g. a Nous Portal subscription) the picker only renders ~25 "featured"
+  // models; the rest live in extra_models and are absent from sel.options. The
+  // CLI resolves against the full catalog, so /model must too. (#3368)
+  let modelsData=null;
+  let aliasTarget=null;
+  try {
+    const resp=await fetch(new URL('api/models',document.baseURI||location.href).href);
+    if(resp.ok){
+      modelsData=await resp.json();
+      let routedAliasMatched=false;
+      const routedAliases=modelsData.model_alias_routes||{};
+      for(const [alias,target] of Object.entries(routedAliases)){
+        if(alias.toLowerCase()===q){
+          routedAliasMatched=true;
+          aliasTarget=target;
+          q=String(target&&typeof target==='object'?target.model:target).toLowerCase();
+          break;
+        }
+      }
+      if(!routedAliasMatched){
+        const aliases=modelsData.aliases||{};
+        for(const [alias,modelId] of Object.entries(aliases)){
+          if(alias.toLowerCase()===q){
+            aliasTarget=modelId;
+            q=String(modelId||'').toLowerCase();
+            break;
+          }
+        }
+      }
+    }
+  } catch(_){/* non-critical, fall through to fuzzy match */}
+  const {options:candidates,providerMap}=_buildModelCandidates(sel,modelsData&&modelsData.groups);
+  const aliasRoute=aliasTarget?_resolveModelAliasTarget(candidates,providerMap,aliasTarget):null;
+  // A provider-qualified alias is authoritative. For ordinary text, first try an
+  // exact match within the active provider's optgroup, then retain the existing
+  // fuzzy lookup behavior.
+  const preferred=(aliasRoute&&aliasRoute.provider)||(S&&S.session&&S.session.model_provider)||window._activeProvider||null;
+  let match=aliasRoute
+    ?aliasRoute.value
+    :(typeof _findModelInDropdown==='function'?_findModelInDropdown(q,sel,preferred):null);
+  // Fallback: fuzzy match across the FULL catalog (featured + extras), so an
+  // exact bare model living in the extras tail (e.g. "mimo-v2.5" alongside the
+  // featured "mimo-v2.5-pro") still wins — exact/shortest-match in _bestModelMatch.
+  if(!match){
+    match=_bestModelMatch(candidates,q);
+  }
+  // Fallback: if q has provider/ prefix (e.g. "deepseek/deepseek-v4-flash"),
+  // try the bare model name (which is how options appear for the active provider)
+  if(!match && q.includes('/')){
+    const bare=q.slice(q.lastIndexOf('/')+1);
+    match=_bestModelMatch(candidates,bare);
+    // #3368: a versioned slash-qualified query whose only near catalog entry is a
+    // rejected tier variant (e.g. "xiaomi/mimo-v2.5" when only "xiaomi/mimo-v2.5-pro"
+    // exists) must NOT silently direct-update to the invalid name — fall through to
+    // the no-match/"did you mean?" toast instead. The cross-provider direct-update
+    // path below is only for genuinely off-catalog providers with no near variant.
+    const nearSuggestion=_nearestModelSuggestion(candidates,q)||_nearestModelSuggestion(candidates,bare);
+    const versionedNoSnap=_looksLikeVersionedModel(bare)&&nearSuggestion;
+    // Cross-provider fallback: if still no match, the model is from a
+    // different provider not in the dropdown. Call /api/session/update directly.
+    if(!match && !versionedNoSnap && S&&S.session&&S.session.session_id){
+      const provider=q.slice(0,q.indexOf('/'));
+      try{
+        const resp=await fetch(new URL('api/session/update',document.baseURI||location.href).href,{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({
+            session_id:S.session.session_id,
+            model:q,
+            model_provider:provider,
+          }),
+        });
+        if(resp.ok){
+          S.session.model=q;
+          S.session.model_provider=provider;
+          if(typeof syncTopbar==='function') syncTopbar();
+          showToast(t('switched_to')+q);
+          return;
+        }
+      }catch(_){/* fall through to "no model match" */}
+    }
+  }
+  if(!match){
+    // #3368: when a complete versioned name (e.g. "mimo-v2.5") doesn't match
+    // because only a longer tier variant exists ("mimo-v2.5-pro"), don't snap
+    // to it — say no-match and suggest the near variant so the user can opt in.
+    // no_model_match already ends with an opening quote, so close it with args+".
+    let msg=t('no_model_match')+`${args}"`;
+    const suggestion=_nearestModelSuggestion(candidates,q);
+    if(suggestion){
+      // model_did_you_mean is a placeholder template; t() invokes it with the
+      // suggestion as its arg. (Calling t() without the arg renders "undefined".)
+      msg+=t('model_did_you_mean', suggestion);
+    }
+    showToast(msg);
+    return;
+  }
+  // The winning model may live in the extras tail (not a rendered <option>), so
+  // a bare `sel.value=match` would silently no-op. Inject the option with its
+  // provider before selecting so onchange() persists the correct model+provider
+  // end-to-end. _ensureModelOptionInDropdown reuses the existing option when one
+  // is already rendered. (#3368)
+  const hasOption=Array.from(sel.options||[]).some(o=>o.value===match);
+  const matchProvider=(aliasRoute&&aliasRoute.provider)||providerMap[match]||null;
+  if((aliasRoute||!hasOption) && typeof _ensureModelOptionInDropdown==='function'){
+    _ensureModelOptionInDropdown(match,sel,matchProvider);
+  }else{
+    sel.value=match;
+  }
+  await sel.onchange();
+  showToast(t('switched_to')+match);
+}
+
+async function cmdWorkspace(args){
+  if(!args){showToast(t('workspace_usage'));return;}
+  try{
+    const data=await api('/api/workspaces');
+    const q=args.toLowerCase();
+    const ws=(data.workspaces||[]).find(w=>
+      (w.name||'').toLowerCase().includes(q)||w.path.toLowerCase().includes(q)
+    );
+    if(!ws){showToast(t('no_workspace_match')+`"${args}"`);return;}
+    if(typeof switchToWorkspace==='function') await switchToWorkspace(ws.path, ws.name||ws.path);
+    else showToast(t('switched_workspace')+(ws.name||ws.path));
+  }catch(e){showToast(t('workspace_switch_failed')+e.message);}
+}
+
+async function cmdTerminal(){
+  let data=null;
+  try{
+    data=await api('/api/workspaces');
+    if(typeof syncTerminalBackendState==='function') syncTerminalBackendState(data);
+    if(data&&data.terminal_remote_backend){
+      const msg=typeof _terminalRemoteBackendUnsupportedMessage==='function'
+        ? _terminalRemoteBackendUnsupportedMessage()
+        : 'Embedded terminal is only supported for local terminal backends.';
+      showToast(msg,3200,'warning');
+      if(typeof syncTerminalButton==='function') syncTerminalButton();
+      return;
+    }
+  }catch(_){}
+  if(!S.session&&typeof newSession==='function'){
+    if(!S._profileSwitchWorkspace&&!S._profileDefaultWorkspace){
+      const first=(data&&data.workspaces||[])[0];
+      S._profileSwitchWorkspace=(data&&data.last)||(first&&first.path)||null;
+    }
+    // System-minted session (#6022): opening the terminal auto-creates a
+    // session — explicit worktree:false so the config default can't leak.
+    await newSession(false, {worktree: false});
+  }
+  if(!S.session||!S.session.workspace){
+    showToast(t('terminal_no_workspace_title'),2600,'warning');
+    if(typeof syncTerminalButton==='function') syncTerminalButton();
+    return;
+  }
+  if(typeof toggleComposerTerminal==='function') await toggleComposerTerminal(true);
+}
+
+async function cmdNew(){
+  if(typeof clearCompressionUi==='function') clearCompressionUi();
+  // newSession() refreshes the sidebar itself; a second awaited render only
+  // queued another full list read in front of the focus (#7996).
+  await newSession();
+  $('msg').focus();
+  showToast(t('new_session'));
+}
+
+function _manualCompressionVisibleMessages(){
+  return (S.messages||[]).filter(m=>{
+    if(!m||!m.role||m.role==='tool') return false;
+    if(m.role==='assistant'){
+      const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
+      const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
+      if(hasTc||hasTu|| (typeof _messageHasReasoningPayload==='function' && _messageHasReasoningPayload(m))) return true;
+    }
+    return typeof msgContent==='function' ? !!msgContent(m) || !!m.attachments?.length : !!m.content || !!m.attachments?.length;
+  });
+}
+
+function _manualCompressionSleep(ms){
+  return new Promise(resolve=>setTimeout(resolve, ms));
+}
+
+async function _pollManualCompressionResult(sid){
+  let delay=700;
+  while(true){
+    const data=await api(`/api/session/compress/status?session_id=${encodeURIComponent(sid)}`);
+    if(data&&data.status==='done') return data;
+    if(data&&data.status==='error'){
+      const err=new Error(data.error||'Compression failed');
+      err.status=data.error_status||400;
+      throw err;
+    }
+    if(data&&data.status==='idle') throw new Error('Compression job is no longer available');
+    await _manualCompressionSleep(delay);
+    delay=Math.min(2000, delay+300);
+  }
+}
+
+async function _applyManualCompressionResult(data, focusTopic, visibleCount, commandText){
+  if(data&&data.session){
+    const currentSid=S.session&&S.session.session_id;
+    if(data.session.session_id&&data.session.session_id!==currentSid){
+      await loadSession(data.session.session_id);
+    }else{
+      S.session=data.session;
+      S.messages=data.session.messages||[];
+      S.toolCalls=data.session.tool_calls||[];
+      clearLiveToolCards();
+      try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
+      if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
+      // Restore paging signals from the (possibly full) transcript response.
+      // A successful /compress returns the full transcript, so the bounded
+      // preflight's _messagesTruncated/_oldestIdx must be reset before render
+      // (#7628). Same restore-before-render ordering as the settle/cancel paths.
+      if(typeof _messagesTruncated!=='undefined') _messagesTruncated=!!data.session._messages_truncated;
+      if(typeof _oldestIdx!=='undefined') _oldestIdx=data.session._messages_offset||0;
+      syncTopbar();
+      renderMessages();
+      await renderSessionList();
+      updateQueueBadge(S.session.session_id);
+    }
+  }
+  const summary=data&&data.summary;
+  if(typeof setCompressionUi==='function'&&S.session){
+    const referenceMsg=(S.messages||[]).find(m=>typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(m));
+    const messageRef=referenceMsg?msgContent(referenceMsg)||String(referenceMsg.content||''):'';
+    const summaryRef=summary&&typeof summary.reference_message==='string' ? String(summary.reference_message||'').trim() : '';
+    // Prefer the persisted compaction handoff when it already exists in session state.
+    // The short summary fallback is only for environments where that message is unavailable.
+    const referenceText=messageRef || summaryRef;
+    const effectiveFocus=(data&&data.focus_topic)||focusTopic||'';
+    setCompressionUi({
+      sessionId:S.session.session_id,
+      phase:'done',
+      focusTopic:effectiveFocus,
+      commandText:effectiveFocus?`/compress ${effectiveFocus}`:(commandText||'/compress'),
+      beforeCount:visibleCount,
+      summary:summary||null,
+      referenceText,
+      anchorVisibleIdx: data?.session?.compression_anchor_visible_idx,
+      anchorMessageKey: data?.session?.compression_anchor_message_key||null,
+    });
+  }
+  if(typeof setComposerStatus==='function') setComposerStatus('');
+  renderMessages();
+  if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
+}
+
+async function resumeManualCompressionForSession(sid){
+  if(!sid) return;
+  try{
+    const status=await api(`/api/session/compress/status?session_id=${encodeURIComponent(sid)}`);
+    if(!status||status.status!=='running') return;
+    const visibleMessages=_manualCompressionVisibleMessages();
+    const visibleCount=visibleMessages.length;
+    const anchorMessageKey=_compressionAnchorMessageKey(visibleMessages[visibleMessages.length-1]||null);
+    if(typeof setBusy==='function') setBusy(true);
+    if(typeof setComposerStatus==='function') setComposerStatus(t('compressing'));
+    if(typeof setCompressionUi==='function'){
+      setCompressionUi({
+        sessionId:sid,
+        phase:'running',
+        focusTopic:status.focus_topic||'',
+        commandText:status.focus_topic?`/compress ${status.focus_topic}`:'/compress',
+        beforeCount:visibleCount,
+        anchorVisibleIdx:Math.max(0, visibleCount-1),
+        anchorMessageKey,
+      });
+    }
+    renderMessages();
+    const done=await _pollManualCompressionResult(sid);
+    if(!S.session||S.session.session_id!==sid) return;
+    await _applyManualCompressionResult(done, status.focus_topic||'', visibleCount, status.focus_topic?`/compress ${status.focus_topic}`:'/compress');
+  }catch(e){
+    // No active compression job or transient server error — not a real failure.
+    // 404: route missed or session gone; 5xx: backend exception during status check.
+    if(e&&(!e.status||e.status===404||e.status>=500)) return;
+    // #7710: a cross-profile refusal now arrives as 409
+    // (``session_profile_mismatch``) where it used to be a 404 that hit the
+    // benign early-return above. It is not a compression failure, so do not
+    // render the error state or locally settle the compression UI.
+    if(e&&e.status===409&&typeof _sessionProfileMismatchFromError==='function'
+       &&_sessionProfileMismatchFromError(e)) return;
+    if(S.session&&S.session.session_id===sid&&typeof setCompressionUi==='function'){
+      const visibleMessages=_manualCompressionVisibleMessages();
+      setCompressionUi({
+        sessionId:sid,
+        phase:'error',
+        focusTopic:'',
+        commandText:'/compress',
+        beforeCount:visibleMessages.length,
+        errorText:`Compression failed: ${e.message}`,
+        anchorVisibleIdx:Math.max(0, visibleMessages.length-1),
+        anchorMessageKey:null,
+      });
+      renderMessages();
+    }
+  }finally{
+    if(S.session&&S.session.session_id===sid){
+      if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
+      if(typeof setBusy==='function') setBusy(false);
+      if(typeof setComposerStatus==='function') setComposerStatus('');
+    }
+  }
+}
+
+async function _runManualCompression(focusTopic){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  let visibleCount=0;
+  try{
+    const sid=S.session.session_id;
+    // Preflight: verify the viewed session still exists before compressing.
+    // This avoids a confusing "not found" toast when the UI is stale.
+    try{
+      // Bounded tail: a bare preflight used to pull and re-redact the whole
+      // transcript before every manual compression (#7310/#7625). Session
+      // existence + the current tail is all this preflight needs.
+      const live=await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=30&expand_renderable=1`);
+      if(!live||!live.session||live.session.session_id!==sid){
+        throw new Error('session no longer available');
+      }
+      S.session=live.session;
+      S.messages=live.session.messages||[];
+      S.toolCalls=live.session.tool_calls||[];
+      if(typeof _messagesTruncated!=='undefined') _messagesTruncated=!!(live.session._messages_truncated);
+      if(typeof _oldestIdx!=='undefined') _oldestIdx=live.session._messages_offset||0;
+    }catch(preflightErr){
+      if(typeof clearCompressionUi==='function') clearCompressionUi();
+      if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
+      if(typeof setBusy==='function') setBusy(false);
+      if(typeof setComposerStatus==='function') setComposerStatus('');
+      renderMessages();
+      showToast('Compression failed: '+(preflightErr.message||'session no longer available'));
+      return;
+    }
+    if(typeof setBusy==='function') setBusy(true);
+    const body={session_id:sid};
+    if(focusTopic) body.focus_topic=focusTopic;
+    const visibleMessages=_manualCompressionVisibleMessages();
+    visibleCount=visibleMessages.length;
+    const anchorVisibleIdx=Math.max(0, visibleCount - 1);
+    const anchorMessageKey=_compressionAnchorMessageKey(visibleMessages[visibleMessages.length-1]||null);
+    const commandText=focusTopic?`/compress ${focusTopic}`:'/compress';
+    if(typeof setCompressionUi==='function'){
+      setCompressionUi({
+        sessionId:S.session.session_id,
+        phase:'running',
+        focusTopic:focusTopic||'',
+        commandText,
+        beforeCount:visibleCount,
+        anchorVisibleIdx,
+        anchorMessageKey,
+      });
+    }
+    if(typeof setComposerStatus==='function') setComposerStatus(t('compressing'));
+    renderMessages();
+    const started=await api('/api/session/compress/start',{method:'POST',body:JSON.stringify(body)});
+    if(started&&started.status==='error'){
+      const err=new Error(started.error||'Compression failed');
+      err.status=started.error_status||400;
+      throw err;
+    }
+    const data=(started&&started.status==='done')?started:await _pollManualCompressionResult(sid);
+    await _applyManualCompressionResult(data, focusTopic, visibleCount, commandText);
+  }catch(e){
+    if(typeof setCompressionUi==='function'){
+      const currentSid=S.session&&S.session.session_id;
+      setCompressionUi({
+        sessionId:currentSid||'',
+        phase:'error',
+        focusTopic:(focusTopic||'').trim(),
+        commandText:focusTopic?`/compress ${focusTopic}`:'/compress',
+        beforeCount:(S.messages||[]).filter(m=>m&&m.role&&m.role!=='tool').length,
+        errorText:`Compression failed: ${e.message}`,
+        anchorVisibleIdx: Math.max(0, visibleCount - 1),
+        anchorMessageKey:null,
+      });
+    }
+    if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
+    if(typeof setBusy==='function') setBusy(false);
+    if(typeof setComposerStatus==='function') setComposerStatus('');
+    renderMessages();
+    showToast('Compression failed: '+e.message);
+    return;
+  }
+  if(typeof setBusy==='function') setBusy(false);
+}
+
+async function cmdCompress(args){
+  await _runManualCompression((args||'').trim());
+}
+
+async function cmdCompact(args){
+  await _runManualCompression((args||'').trim());
+}
+
+async function cmdUsage(){
+  const next=!window._showTokenUsage;
+  window._showTokenUsage=next;
+  try{
+    await api('/api/settings',{method:'POST',body:JSON.stringify({show_token_usage:next})});
+  }catch(e){}
+  // Update the settings checkbox if the panel is open
+  const cb=$('settingsShowTokenUsage');
+  if(cb) cb.checked=next;
+  renderMessages();
+  showToast(next?t('token_usage_on'):t('token_usage_off'));
+}
+
+async function cmdTheme(args){
+  const themes=['system','dark','light'];
+  const skins=(_SKINS||[]).map(s=>(s.value||s.name).toLowerCase());
+  const legacyThemes=Object.keys(_LEGACY_THEME_MAP||{});
+  const val=(args||'').toLowerCase().trim();
+  // Check if it's a theme
+  if(themes.includes(val)||legacyThemes.includes(val)){
+    const appearance=_normalizeAppearance(
+      val,
+      legacyThemes.includes(val)?null:localStorage.getItem('hermes-skin')
+    );
+    localStorage.setItem('hermes-theme',appearance.theme);
+    localStorage.setItem('hermes-skin',appearance.skin);
+    _applyTheme(appearance.theme);
+    _applySkin(appearance.skin);
+    try{await api('/api/settings',{method:'POST',body:JSON.stringify({theme:appearance.theme,skin:appearance.skin})});}catch(e){}
+    const sel=$('settingsTheme');
+    if(sel)sel.value=appearance.theme;
+    const skinSel=$('settingsSkin');
+    if(skinSel)skinSel.value=appearance.skin;
+    if(typeof _syncThemePicker==='function') _syncThemePicker(appearance.theme);
+    if(typeof _syncSkinPicker==='function') _syncSkinPicker(appearance.skin);
+    showToast(t('theme_set')+appearance.theme+(legacyThemes.includes(val)?` + ${appearance.skin}`:''));
+    return;
+  }
+  // Check if it's a skin
+  if(skins.includes(val)){
+    const appearance=_normalizeAppearance(localStorage.getItem('hermes-theme'),val);
+    localStorage.setItem('hermes-theme',appearance.theme);
+    localStorage.setItem('hermes-skin',appearance.skin);
+    _applyTheme(appearance.theme);
+    _applySkin(appearance.skin);
+    try{await api('/api/settings',{method:'POST',body:JSON.stringify({theme:appearance.theme,skin:appearance.skin})});}catch(e){}
+    const sel=$('settingsSkin');
+    if(sel)sel.value=appearance.skin;
+    const themeSel=$('settingsTheme');
+    if(themeSel)themeSel.value=appearance.theme;
+    if(typeof _syncThemePicker==='function') _syncThemePicker(appearance.theme);
+    if(typeof _syncSkinPicker==='function') _syncSkinPicker(appearance.skin);
+    showToast(t('theme_set')+appearance.skin);
+    return;
+  }
+  showToast(t('theme_usage')+themes.join('|')+' | '+skins.join('|')+' | legacy:'+legacyThemes.join('|'));
+}
+
+// Subcommands owned by the agent's own /skills write-approval handler
+// (hermes_cli/write_approval_commands.py via gateway/slash_commands.py) — these must
+// fall through to the normal send path rather than be swallowed by the local search below.
+// Includes every alias that handler accepts: approve/apply, reject/deny/drop, approval/mode.
+// Keep in sync with handle_pending_subcommand() — a missing alias is silently swallowed here.
+const SKILLS_AGENT_SUBCOMMANDS=['pending','approve','apply','reject','deny','drop','diff','approval','mode'];
+
+function cmdSkills(args){
+  const sub=(args||'').trim().split(/\s+/)[0].toLowerCase();
+  if(SKILLS_AGENT_SUBCOMMANDS.includes(sub)) return false;
+  (async()=>{
+    try{
+      const data = await api('/api/skills');
+      let skills = data.skills || [];
+      if(args){
+        const q = args.toLowerCase();
+        skills = skills.filter(s =>
+          (s.name||'').toLowerCase().includes(q) ||
+          (s.description||'').toLowerCase().includes(q) ||
+          (s.category||'').toLowerCase().includes(q)
+        );
+      }
+      if(!skills.length){
+        const msg = {role:'assistant', content: args ? `No skills matching "${args}".` : 'No skills found.'};
+        S.messages.push(msg); renderMessages(); return;
+      }
+      // Group by category
+      const byCategory = {};
+      skills.forEach(s => {
+        const cat = s.category || 'General';
+        if(!byCategory[cat]) byCategory[cat] = [];
+        byCategory[cat].push(s);
+      });
+      const lines = [];
+      for(const [cat, items] of Object.entries(byCategory).sort()){
+        lines.push(`**${cat}**`);
+        items.forEach(s => {
+          const desc = s.description ? ` — ${s.description.slice(0,80)}${s.description.length>80?'...':''}` : '';
+          lines.push(`  \`${s.name}\`${desc}`);
+        });
+        lines.push('');
+      }
+      const header = args
+        ? `Skills matching "${args}" (${skills.length}):\n\n`
+        : `Available skills (${skills.length}):\n\n`;
+      S.messages.push({role:'assistant', content: header + lines.join('\n')});
+      renderMessages();
+      showToast(t('type_slash'));
+    }catch(e){
+      showToast('Failed to load skills: '+e.message);
+    }
+  })();
+  return true;
+}
+
+async function cmdUse(args){
+  if(!args){
+    S.messages.push({role:'assistant',content:'Usage: `/use <skill-name>` — forces the agent to consult that skill before its next response.'});
+    renderMessages();
+    return;
+  }
+  let resolve;
+  const pending = {sessionId:S.session&&S.session.session_id||null,promise:null};
+  pending.promise = new Promise(r => { resolve = r; });
+  _forcedSkillDirectivePending = pending;
+  const isCurrentSession = () => !pending.sessionId || (S.session&&S.session.session_id)===pending.sessionId;
+  try{
+    const data = await api('/api/skills');
+    const skills = data.skills || [];
+    const match = skills.find(s => (s.name||'').toLowerCase() === args.toLowerCase());
+    if(!match){
+      resolve(null);
+      if(_forcedSkillDirectivePending===pending)_forcedSkillDirectivePending = null;
+      if(isCurrentSession()){
+        const msg = {role:'assistant', content:`No skill named \`${args}\`. Use \`/skills\` to see available skills.`};
+        S.messages.push(msg); renderMessages();
+      }
+      return;
+    }
+    const detail = await api(`/api/skills/content?name=${encodeURIComponent(match.name)}`);
+    const skillContent = detail&&typeof detail.content==='string' ? detail.content.trim() : '';
+    if(!skillContent) throw new Error(`Skill \`${match.name}\` has no readable content.`);
+    const directive = `[USER OVERRIDE] You MUST follow the skill '${match.name}' content provided below before responding to the next message.`;
+    resolve({name:match.name,directive,content:skillContent});
+    if(isCurrentSession()){
+      S.messages.push({role:'assistant', content:`Next turn: skill \`${match.name}\` will be forced.`});
+      renderMessages();
+    }
+    showToast(`Skill \`${match.name}\` will be used for next turn.`);
+  }catch(e){
+    resolve(null);
+    if(_forcedSkillDirectivePending===pending)_forcedSkillDirectivePending = null;
+    showToast('Failed to load skills: '+e.message);
+  }
+}
+
+async function cmdPersonality(args){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  if(!args){
+    // List available personalities
+    try{
+      const data=await api('/api/personalities');
+      if(!data.personalities||!data.personalities.length){
+        showToast(t('no_personalities'));
+        return;
+      }
+      const list=data.personalities.map(p=>`  **${p.name}**${p.description?' — '+p.description:''}`).join('\n');
+      S.messages.push({role:'assistant',content:t('available_personalities')+'\n\n'+list+t('personality_switch_hint')});
+      renderMessages();
+    }catch(e){showToast(t('personalities_load_failed'));}
+    return;
+  }
+  const name=args.trim();
+  if(name.toLowerCase()==='none'||name.toLowerCase()==='default'||name.toLowerCase()==='clear'){
+    try{
+      await api('/api/personality/set',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,name:''})});
+      showToast(t('personality_cleared'));
+    }catch(e){showToast(t('failed_colon')+e.message);}
+    return;
+  }
+  try{
+    const res=await api('/api/personality/set',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,name})});
+    S.messages.push({role:'assistant',content:t('personality_set')+`**${name}**`});
+    renderMessages();
+    showToast(t('personality_set')+name);
+  }catch(e){showToast(t('failed_colon')+e.message);}
+}
+
+async function cmdStop(){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  if(!S.activeStreamId){showToast(t('no_active_task'));return;}
+  if(typeof cancelStream==='function'){
+    if(await cancelStream('slash-stop')) showToast(t('stream_stopped'));
+    else showToast(t('cancel_failed'),null,'error');
+  }
+  else showToast(t('cancel_unavailable'));
+}
+
+async function cmdGoal(args){
+  if(!S.session){await newSession();}
+  if(!S.session||!S.session.session_id){showToast(t('no_active_session'));return;}
+  const activeSid=S.session.session_id;
+  try{
+    // #6703: re-assert the explicit-pick marker on /api/goal the same way
+    // /api/chat/start does. Without it the server's model resolver treats a
+    // persisted cross-provider pick as stale and silently reverts the session
+    // to the profile default mid-session (e.g. while /goal is running).
+    const _goalModel=S.session.model||($('modelSelect')&&$('modelSelect').value)||'';
+    const _goalProvider=S.session.model_provider||null;
+    const _pendingPick=(typeof _readPendingSessionModel==='function')
+      ? _readPendingSessionModel(activeSid)
+      : null;
+    const _pendingPickMatch=_pendingPick
+      && _pendingPick.model===_goalModel
+      && String(_pendingPick.model_provider||'')===String(_goalProvider||'');
+    const _defaultModel=(typeof window!=='undefined' && window._defaultModel)||'';
+    const _activeProvider=(typeof window!=='undefined' && window._activeProvider)||null;
+    const _isCrossProviderPick=_goalModel
+      && _goalProvider
+      && _defaultModel
+      && _activeProvider
+      && _goalModel !== _defaultModel
+      && String(_goalProvider||'') !== String(_activeProvider||'');
+    const _explicitPick=(_pendingPickMatch||_isCrossProviderPick)||undefined;
+    // Do NOT consume the pending explicit-pick marker here: a control-only
+    // invocation (e.g. /goal status) skips server-side model resolution, so a
+    // pre-request clear would drop the pick without using it. Consume it below,
+    // only after a successful kickoff (r.stream_id), re-checking that the stored
+    // marker still matches the model/provider captured for this kickoff (#6705).
+    const r=await api('/api/goal',{method:'POST',body:JSON.stringify({
+      session_id:activeSid,
+      args:args||'',
+      workspace:S.session.workspace,
+      model:_goalModel,
+      model_provider:_goalProvider,
+      explicit_model_pick:_explicitPick,
+      profile:S.activeProfile||S.session.profile||'default',
+    })});
+    const msg = (() => {
+      const raw = String((r && r.message) || '').trim();
+      const key = String((r && r.message_key) || '').trim();
+      const args = Array.isArray(r && r.message_args) ? r.message_args : [];
+      if (raw.includes('\n')) return raw;
+      if (key && typeof t === 'function') {
+        const translated = String(t(key, ...args));
+        if (translated && translated !== key) return translated;
+      }
+      return raw;
+    })();
+    if(msg){
+      S.messages.push({role:'assistant',content:msg,_ts:Date.now()/1000,_goalStatus:true,_transient:true});
+      renderMessages({preserveScroll:true});
+      showToast(msg.split('\n')[0],2600);
+    }
+    if(!r||!r.stream_id)return;
+    // #6705: consume the one-shot pending explicit-pick marker only after a
+    // successful kickoff. Re-read the stored marker and clear it only if it
+    // still matches the model/provider captured above — a control command (no
+    // stream_id) must leave the marker intact for the next real send, and a
+    // marker re-recorded mid-flight (newer onchange) must not be clobbered.
+    if(_pendingPickMatch && typeof _readPendingSessionModel==='function' && typeof _clearPendingSessionModel==='function'){
+      const _stillPending=_readPendingSessionModel(activeSid);
+      if(_stillPending
+        && _stillPending.model===_goalModel
+        && String(_stillPending.model_provider||'')===String(_goalProvider||'')){
+        _clearPendingSessionModel(activeSid);
+      }
+    }
+    S.toolCalls=[];
+    if(typeof clearLiveToolCards==='function')clearLiveToolCards();
+    appendThinking();setBusy(true);
+    setComposerStatus(t('goal_working_toward'));
+    S.activeStreamId=r.stream_id;
+    if(S.session&&S.session.session_id===activeSid){
+      S.session.active_stream_id=r.stream_id;
+      if(typeof r.pending_started_at==='number')S.session.pending_started_at=r.pending_started_at;
+      if(r.effective_model)S.session.model=r.effective_model;
+      if(r.effective_model_provider)S.session.model_provider=r.effective_model_provider;
+    }
+    INFLIGHT[activeSid]={messages:[...S.messages],uploaded:[],toolCalls:[]};
+    if(typeof markInflight==='function')markInflight(activeSid,r.stream_id);
+    if(typeof saveInflightState==='function')saveInflightState(activeSid,{streamId:r.stream_id,messages:INFLIGHT[activeSid].messages,uploaded:[],toolCalls:[]});
+    startApprovalPolling(activeSid);
+    startClarifyPolling(activeSid);
+    if(typeof _fetchYoloState==='function')_fetchYoloState(activeSid);
+    attachLiveStream(activeSid,r.stream_id,[]);
+    if(typeof renderSessionList==='function')void renderSessionList();
+  }catch(e){
+    const err=String((e&&e.message)||e||'Goal command failed');
+    S.messages.push({role:'assistant',content:`**Goal command failed:** ${err}`,_ts:Date.now()/1000,_error:true});
+    renderMessages({preserveScroll:true});
+    showToast(err,3000);
+  }
+}
+
+// ── Busy-input mode commands ──────────────────────────────────────────────
+// These commands let users override the default message mode setting for a
+// specific message.  They are only meaningful while the agent is running.
+
+/**
+ * /queue <message> — Explicitly queue a message for the next turn.
+ * Works regardless of the default message mode setting.
+ */
+async function cmdQueue(args){
+  const msg=(args||'').trim();
+  if(!msg){showToast(t('cmd_queue_no_msg'));return;}
+  // If nothing is running, /queue <msg> just sends like a normal message
+  if(!S.busy){
+    const inp=$('msg');
+    if(inp){inp.value=msg;}
+    if(typeof send==='function'){await send();}
+    return;
+  }
+  if(!S.session){showToast(t('no_active_session'));return;}
+  queueSessionMessage(S.session.session_id,{text:msg,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+  updateQueueBadge(S.session.session_id);
+  S.pendingFiles=[];renderTray();
+  showToast(t('cmd_queue_confirm'),2000);
+}
+
+/**
+ * /interrupt <message> — Cancel the current turn and send a new message.
+ * Calls cancelStream() then queues the message so the drain picks it up.
+ */
+async function cmdInterrupt(args){
+  const msg=(args||'').trim();
+  if(!msg){showToast(t('cmd_interrupt_no_msg'));return;}
+  // If nothing is running, /interrupt <msg> just sends like a normal message
+  if(!S.busy||!S.activeStreamId){
+    const inp=$('msg');
+    if(inp){inp.value=msg;}
+    if(typeof send==='function'){await send();}
+    return;
+  }
+  if(!S.session){showToast(t('no_active_session'));return;}
+  // Queue the message first (before cancel sets busy=false and drains)
+  queueSessionMessage(S.session.session_id,{text:msg,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+  updateQueueBadge(S.session.session_id);
+  S.pendingFiles=[];renderTray();
+  // Cancel the active stream; setBusy(false) will drain the queue
+  if(typeof cancelStream==='function'){
+    if(await cancelStream('slash-interrupt')) showToast(t('cmd_interrupt_confirm'),2000);
+    else showToast(t('cancel_failed'),null,'error');
+  }
+}
+
+/**
+ * /steer <message> — Inject a steering hint mid-task without interrupting.
+ *
+ * Calls POST /api/chat/steer which looks up the cached AIAgent for this
+ * session and calls agent.steer(text). The agent's run loop appends the
+ * steer text to the next tool-result message so the model sees it on its
+ * next iteration — same pathway as the CLI's /steer command.
+ *
+ * Leaves the active stream alone when the agent isn't running, isn't cached,
+ * or doesn't support steer (older hermes-agent versions). The failed steer text
+ * is restored to the composer so the user can choose Queue or Interrupt
+ * explicitly instead of WebUI silently cancelling the current run.
+ */
+async function cmdSteer(args){
+  const msg=(args||'').trim();
+  const hasPendingFiles=typeof S!=='undefined'&&Array.isArray(S.pendingFiles)&&S.pendingFiles.length>0;
+  if(!msg&&!hasPendingFiles){showToast(t('cmd_steer_no_msg'));return;}
+  // If nothing is running, /steer <msg> just sends like a normal message
+  if(!S.busy||!S.activeStreamId){
+    const inp=$('msg');
+    if(inp){inp.value=msg;}
+    if(typeof send==='function'){await send();}
+    return;
+  }
+  if(!S.session){showToast(t('no_active_session'));return;}
+  await _trySteer(msg, /*explicitSteer=*/true);
+}
+
+function _steerFailureMessageKey(fallback) {
+  if(fallback==='gateway_steer_queued')return 'steer_fail_no_cached_agent';
+  const key = 'steer_fail_' + (fallback || 'unknown');
+  return (typeof LOCALES !== 'undefined' && LOCALES.en && LOCALES.en[key])
+    ? key : 'steer_fail_unknown';
+}
+
+function _showSteerIndicator(text){
+  const inner=document.getElementById('msgInner');
+  if(!inner) return;
+  // Remove any existing steer indicator
+  const old=inner.querySelector('.steer-indicator');
+  if(old) old.remove();
+  const el=document.createElement('div');
+  el.className='steer-indicator';
+  const badge=document.createElement('span');
+  badge.className='steer-badge';
+  badge.textContent='Steer';
+  const body=document.createElement('span');
+  body.className='steer-body';
+  body.textContent=text.length>120?text.slice(0,117)+'…':text;
+  el.appendChild(badge);
+  el.appendChild(body);
+  inner.appendChild(el);
+  if(typeof scrollToBottom==='function') scrollToBottom();
+}
+
+function _showSteerRecovery(msg, explicitSteer, fallback) {
+  const inner = document.getElementById('msgInner');
+  if (!inner) return;
+  const old = inner.querySelector('.steer-recovery');
+  if (old) old.remove();
+  const el = document.createElement('div');
+  el.className = 'steer-recovery';
+  const label = document.createElement('span');
+  label.className = 'steer-recovery-label';
+  label.textContent = t(_steerFailureMessageKey(fallback));
+  el.appendChild(label);
+  const retryBtn = document.createElement('button');
+  retryBtn.className = 'steer-recovery-retry';
+  retryBtn.textContent = t(_steerFallbackIsDeadRun(fallback)?'clarify_send':'steer_recovery_retry');
+  retryBtn.addEventListener('click', () => {
+    el.remove();
+    if(_steerFallbackIsDeadRun(fallback)&&typeof send==='function'){
+      if(explicitSteer){
+        const inp=$('msg');
+        if(inp){
+          inp.value=String(msg||'').trim();
+          if(typeof autoResize==='function')autoResize();
+        }
+      }
+      void send({literalSlash:true}).catch(console.error);
+    }else{
+      void _trySteer(msg, explicitSteer).catch(console.error);
+    }
+  });
+  el.appendChild(retryBtn);
+  const dismissBtn = document.createElement('button');
+  dismissBtn.className = 'steer-recovery-dismiss';
+  dismissBtn.textContent = t('steer_recovery_dismiss');
+  dismissBtn.addEventListener('click', () => el.remove());
+  el.appendChild(dismissBtn);
+  inner.appendChild(el);
+  if (typeof scrollToBottom === 'function') scrollToBottom();
+}
+
+/**
+ * Shared implementation for /steer and the default_message_mode='steer' path.
+ *
+ * Tries the real steer endpoint first. On any non-accept response (no cached
+ * agent, agent lacks steer, stream dead, etc.) it restores the draft and keeps
+ * the active stream running. Steer belongs to the active run; a failed Steer
+ * must not be silently upgraded into Queue, Interrupt, or Stop-and-send.
+ *
+ * @param {string} msg - The steer text.
+ * @param {boolean} explicitSteer - True if the user explicitly invoked /steer
+ *   (vs the busy-mode auto-fallback). Affects draft restore prefix only;
+ *   toast wording is determined by the failure reason code.
+ * @returns {Promise<boolean>} true when the steer was delivered, false when the
+ *   draft was restored and the active stream was left untouched.
+ */
+function _steerUploadedAttachmentPaths(uploaded){
+  if(!Array.isArray(uploaded))return[];
+  return uploaded.map(u=>{
+    if(!u)return'';
+    if(typeof u==='string')return u;
+    return u.path||u.name||u.filename||'';
+  }).map(v=>String(v||'').trim()).filter(Boolean);
+}
+
+function _steerOwnerIsCurrent(ownerSid){
+  return !!(ownerSid&&typeof S!=='undefined'&&S.session&&S.session.session_id===ownerSid);
+}
+
+function _steerFallbackIsDeadRun(fallback){
+  return fallback==='stream_dead';
+}
+
+function _steerOwnerStreamIsCurrent(ownerSid, ownerStreamId){
+  if(!_steerOwnerIsCurrent(ownerSid)||typeof S==='undefined'||!ownerStreamId)return false;
+  const activeIds=[S.activeStreamId,S.session&&S.session.active_stream_id].filter(Boolean).map(String);
+  return activeIds.length>0&&activeIds.every(id=>id===String(ownerStreamId));
+}
+
+function _steerClearCurrentOwnerDeadRun(ownerSid, ownerStreamId){
+  if(!_steerOwnerStreamIsCurrent(ownerSid,ownerStreamId))return false;
+  let changed=false;
+  if(S.busy){S.busy=false;changed=true;}
+  if(S.activeStreamId){S.activeStreamId=null;changed=true;}
+  if(S.session&&S.session.active_stream_id){S.session.active_stream_id=null;changed=true;}
+  if(typeof INFLIGHT!=='undefined'&&INFLIGHT&&INFLIGHT[ownerSid]){
+    delete INFLIGHT[ownerSid];
+    changed=true;
+  }
+  if(changed&&typeof clearInflightState==='function')clearInflightState(ownerSid);
+  if(changed){
+    // Finish the stale-busy cleanup idiom the rest of the app uses so a recovered
+    // dead run leaves no lingering status line, elapsed timer, or streaming badge
+    // (#5744 UX-gate). Deliberately does NOT call setBusy(false): its queue-drain
+    // would clobber the draft text this recovery path restores.
+    if(typeof setStatus==='function')setStatus('');
+    if(typeof setComposerStatus==='function')setComposerStatus('');
+    if(typeof _clearActivityElapsedTimer==='function')_clearActivityElapsedTimer();
+    if(typeof clearOptimisticSessionStreaming==='function')clearOptimisticSessionStreaming(ownerSid);
+  }
+  if(changed&&typeof updateSendBtn==='function')updateSendBtn();
+  return changed;
+}
+
+function _steerSetComposerStatusForOwner(ownerSid,text){
+  if(_steerOwnerIsCurrent(ownerSid)&&typeof setComposerStatus==='function')setComposerStatus(text);
+}
+
+function _steerRestoreText(originalMsg, explicitSteer){
+  return explicitSteer?`/steer ${originalMsg}`:originalMsg;
+}
+
+function _steerIndicatorText(originalMsg, filesSnapshot){
+  const text=String(originalMsg||'').trim();
+  if(text)return text;
+  const names=(Array.isArray(filesSnapshot)?filesSnapshot:[])
+    .map(f=>f&&(f.name||f.filename||f.path||''))
+    .map(v=>String(v||'').trim())
+    .filter(Boolean);
+  return names.length?`Attached files: ${names.join(', ')}`:'Attached files';
+}
+
+async function _steerPersistDraftForOwner(ownerSid, originalMsg, explicitSteer, filesSnapshot){
+  if(!ownerSid||typeof _saveComposerDraftNow!=='function') return false;
+  const persistedText = _steerRestoreText(originalMsg,explicitSteer);
+  const persistedFiles = Array.isArray(filesSnapshot) ? [...filesSnapshot] : [];
+  try{
+    const result = _saveComposerDraftNow(ownerSid,persistedText,persistedFiles);
+    if(result&&typeof result.catch==='function'){
+      return result.catch((error)=>_handleComposerDraftPostFailure(error,ownerSid,persistedText,persistedFiles));
+    }
+    return result;
+  }catch(error){
+    _handleComposerDraftPostFailure(error,ownerSid,persistedText,persistedFiles);
+    return false;
+  }
+}
+
+// #5459 gate: cache successful steer uploads by owner session so a failed-steer
+// RETRY reuses the uploaded paths instead of re-uploading the same File objects.
+// Keyed by ownerSid; invalidated when the staged file set changes or on accepted
+// steer (see _steerUploadCacheMatches / clearing below).
+let _steerUploadCache = null; // { sid, sig, paths }
+// Gateway steers whose outcome is unknown, by owner session, so a later
+// pending_steer_leftover carrying this submission can mark them delivered.
+// owned = the exact draft {text, files} this steer restored for its owner.
+// Several may be outstanding per session: each keeps its own record.
+const _steerUncertainBySid = new Map(); // sid -> Set<{ text, delivered, settled, ended, owned, rev }>
+// Steers the Gateway accepted for the owner's current run. A leftover joins
+// pending submissions with "\n", so these claim their lines before an uncertain
+// steer may match (an accepted steer's lines are not proof for another one).
+const _steerAcceptedBySid = new Map(); // sid -> [text]
+// Owned drafts whose compare-and-clear is still in flight; never restore them.
+const _steerRetiringBySid = new Map(); // sid -> { text, files }
+
+function _steerOwnedPayloadMatches(owned, text, files){
+  if(!owned)return false;
+  if(typeof _composerDraftPayloadSignature!=='function')return false;
+  return _composerDraftPayloadSignature(text,files)===_composerDraftPayloadSignature(owned.text,owned.files);
+}
+
+// True only for the exact retiring payload (text AND files): a newer draft with
+// the same text but other attachments is not owned by the retiring steer.
+// A draft saved after retirement began (revision bump) is newer, never retiring.
+function _steerDraftIsRetiring(sid, text, files){
+  const owned=_steerRetiringBySid.get(sid);
+  return !!owned&&owned.rev===_steerDraftRevision(sid)&&_steerOwnedPayloadMatches(owned,text,files);
+}
+
+function _steerUncertainDrop(sid, entry){
+  const set=_steerUncertainBySid.get(sid);
+  if(!set||!set.delete(entry))return false;
+  if(!set.size)_steerUncertainBySid.delete(sid);
+  return true;
+}
+
+function _steerLines(text){
+  return String(text||'').trim().split('\n').map(x=>x.trim());
+}
+
+// The Agent joins its unconsumed steers with "\n", so a leftover is a sequence
+// of whole submitted bodies (each at most once) plus text this tab never sent.
+// Text was delivered only if explaining the leftover with it leaves strictly
+// fewer unexplained lines than every explanation without it. Every other
+// submission takes part (no recency cut-off): an omitted body could be the
+// real explanation. Iterative forward DP over reachable (line, used-bodies)
+// states, so line count never touches the call stack. Past the body/state
+// budget nothing is proven: recovery is kept.
+const _STEER_MATCH_MAX_RELEVANT_BODIES = 24;
+const _STEER_MATCH_MAX_STATES = 200000;
+function _steerFewestUnexplained(lines, bodies){
+  const n=lines.length;
+  const starts=bodies.map(b=>{
+    const at=new Set();
+    for(let pos=0;pos+b.length<=n;pos++){
+      let ok=true;
+      for(let k=0;k<b.length;k++)if(lines[pos+k]!==b[k]){ok=false;break;}
+      if(ok)at.add(pos);
+    }
+    return at;
+  });
+  // dp[pos]: Map(mask -> fewest unexplained lines before pos).
+  const dp=new Array(n+1);
+  dp[0]=new Map([[0,0]]);
+  let states=0;
+  for(let pos=0;pos<n;pos++){
+    const cur=dp[pos];
+    if(!cur)continue;
+    dp[pos]=null;
+    for(const [mask,cost] of cur){
+      if(++states>_STEER_MATCH_MAX_STATES)return null;
+      const put=(p,m,c)=>{const d=dp[p]||(dp[p]=new Map());if(!(d.get(m)<=c))d.set(m,c);};
+      put(pos+1,mask,cost+1);
+      for(let i=0;i<bodies.length;i++){
+        if(mask&(1<<i)||!starts[i].has(pos))continue;
+        put(pos+bodies[i].length,mask|(1<<i),cost);
+      }
+    }
+  }
+  return dp[n]||new Map();
+}
+function _steerLeftoverContains(leftover, text, others){
+  const lines=_steerLines(leftover);
+  const want=_steerLines(text);
+  const has=b=>{
+    for(let pos=0;pos+b.length<=lines.length;pos++){
+      let ok=true;
+      for(let k=0;k<b.length;k++)if(lines[pos+k]!==b[k]){ok=false;break;}
+      if(ok)return true;
+    }
+    return false;
+  };
+  if(!has(want))return false;
+  // A body absent from the leftover cannot explain any of it.
+  const relevant=(Array.isArray(others)?others:[]).map(_steerLines).filter(has);
+  if(relevant.length+1>_STEER_MATCH_MAX_RELEVANT_BODIES)return false;
+  const withWant=_steerFewestUnexplained(lines,[want].concat(relevant));
+  if(!withWant)return false;
+  let bestWith=Infinity,bestWithout=Infinity;
+  for(const [mask,cost] of withWant){
+    if(mask&1)bestWith=Math.min(bestWith,cost);
+    else bestWithout=Math.min(bestWithout,cost);
+  }
+  return bestWith<bestWithout;
+}
+
+function _steerDraftRevision(sid){
+  return typeof _composerDraftRevision==='function'?_composerDraftRevision(sid):0;
+}
+
+// The owner's run ended (done/cancel/apperror): any leftover was emitted before
+// this, so an undelivered settled record can never reconcile. Drop it.
+function _steerSettleTerminal(sid){
+  _steerAcceptedBySid.delete(sid);
+  for(const entry of [...(_steerUncertainBySid.get(sid)||[])]){
+    if(entry.settled)_steerUncertainDrop(sid,entry);
+    else entry.ended=true;
+  }
+}
+
+// Retire only the draft this steer restored: the visible composer when it still
+// shows exactly that payload (text and staged files), and the owner's saved
+// draft via compare-and-clear. Newer text/files and other sessions' composers
+// are left alone.
+function _steerClearVisibleOwned(sid, owned){
+  if(!_steerOwnerIsCurrent(sid))return;
+  const inp=$('msg');
+  const staged=typeof S!=='undefined'&&Array.isArray(S.pendingFiles)?S.pendingFiles:[];
+  if(inp&&owned.rev===_steerDraftRevision(sid)&&_steerOwnedPayloadMatches(owned,inp.value,staged)){
+    inp.value='';
+    if(typeof _noteComposerDraftPayload==='function')_noteComposerDraftPayload(sid,'',[]);
+    if(typeof autoResize==='function')autoResize();
+    if(staged.length){
+      S.pendingFiles=[];
+      if(typeof renderTray==='function')renderTray();
+    }
+  }
+  const bar=document.getElementById('msgInner');
+  const rec=bar&&bar.querySelector('.steer-recovery');
+  if(rec)rec.remove();
+}
+
+// owned.rev is the draft revision the recovery restored; a draft saved since
+// then (even an identical retype) is newer and is never cleared or cancelled.
+function _steerRetireOwnedDraft(sid, owned){
+  if(!owned)return Promise.resolve();
+  const retiring={text:owned.text,files:owned.files,rev:owned.rev};
+  if(retiring.rev!==_steerDraftRevision(sid)){
+    _steerClearVisibleOwned(sid,retiring);  // removes only the recovery chip
+    return Promise.resolve();
+  }
+  _steerRetiringBySid.set(sid,retiring);
+  _steerClearVisibleOwned(sid,retiring);
+  const settle=cleared=>{
+    if(_steerRetiringBySid.get(sid)!==retiring)return;
+    _steerRetiringBySid.delete(sid);
+    // Server removed exactly this payload: drop it from view if it was shown
+    // meanwhile; a mismatch means a newer draft won and stays visible.
+    if(cleared===true&&retiring.rev===_steerDraftRevision(sid))_steerClearVisibleOwned(sid,retiring);
+  };
+  const clear=typeof _clearComposerDraftIfUnchanged==='function'?_clearComposerDraftIfUnchanged(sid,owned.text,owned.files,retiring.rev):null;
+  return Promise.resolve(clear).then(settle,()=>settle(false));
+}
+
+// Called by the pending_steer_leftover handler. A leftover matching an in-flight
+// or uncertain steer means it was delivered. Before the response: mark it so the
+// response settles. After the response: retire the restored draft and settle.
+function _steerReconcileLeftover(sid, text){
+  const entries=[...(_steerUncertainBySid.get(sid)||[])];
+  const accepted=_steerAcceptedBySid.get(sid)||[];
+  const proven=entries.filter(entry=>_steerLeftoverContains(text,entry.text,
+    accepted.concat(entries.filter(o=>o!==entry).map(o=>o.text))));
+  for(const entry of proven){
+    entry.delivered=true;
+    if(!entry.settled)continue;
+    _steerUncertainDrop(sid,entry);
+    _steerRetireOwnedDraft(sid,entry.owned);
+  }
+  return proven.length>0;
+}
+function _steerFilesSignature(files){
+  try{
+    return (Array.isArray(files)?files:[]).map(f=>f&&(f.name+':'+(f.size||0)+':'+(f.lastModified||0))).join('|');
+  }catch(_){return String(Date.now());}
+}
+
+async function _steerTextWithPendingFiles(msg, ownerSid, filesSnapshot){
+  const base=String(msg||'').trim();
+  const pendingFiles=Array.isArray(filesSnapshot)?filesSnapshot.filter(Boolean):[];
+  if(!pendingFiles.length)return base;
+  if(typeof uploadPendingFiles!=='function')return base;
+  const sig=_steerFilesSignature(pendingFiles);
+  // Reuse a prior successful upload for the same session + identical staged file
+  // set (a steer that failed and is being retried) — don't upload twice.
+  let paths=null;
+  if(_steerUploadCache&&_steerUploadCache.sid===ownerSid&&_steerUploadCache.sig===sig&&Array.isArray(_steerUploadCache.paths)&&_steerUploadCache.paths.length){
+    paths=_steerUploadCache.paths;
+  }else{
+    _steerSetComposerStatusForOwner(ownerSid,t('uploading')||'Uploading…');
+    let uploaded=[];
+    try{
+      // Keep File objects staged until /api/chat/steer confirms acceptance. If
+      // steer falls back, the draft and chips stay available for Queue/Interrupt.
+      uploaded=await uploadPendingFiles({clearPending:false,sessionId:ownerSid,files:pendingFiles});
+    }finally{
+      _steerSetComposerStatusForOwner(ownerSid,'');
+    }
+    paths=_steerUploadedAttachmentPaths(uploaded);
+    if(paths.length) _steerUploadCache={sid:ownerSid,sig,paths};
+  }
+  if(!paths||!paths.length)return base;
+  const note=`[Attached files for this steer: ${paths.join(', ')}]\nUse the file tools/read_file to inspect these documents if needed.`;
+  return base?`${base}\n\n${note}`:note;
+}
+
+async function _trySteer(msg, explicitSteer){
+  let result=null;
+  const originalMsg=String(msg||'').trim();
+  const ownerSid=(typeof S!=='undefined'&&S.session&&S.session.session_id)||null;
+  const ownerStreamId=(typeof S!=='undefined'&&(S.activeStreamId||(S.session&&S.session.active_stream_id)))||null;
+  const pendingFilesSnapshot=typeof S!=='undefined'&&Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];
+  const ownerProfile=typeof S!=='undefined'&&(S.activeProfile||'default');
+  const ownerModelState=typeof _chatPayloadModelState==='function'
+    ? _chatPayloadModelState()
+    : {model:(typeof S!=='undefined'&&S.session&&S.session.model)||'',model_provider:(typeof S!=='undefined'&&S.session&&S.session.model_provider)||''};
+  if(!ownerSid){showToast(t('no_active_session'));return false;}
+  let steerText=originalMsg;
+  try{
+    steerText=await _steerTextWithPendingFiles(originalMsg,ownerSid,pendingFilesSnapshot);
+  }catch(e){
+    if(_steerOwnerIsCurrent(ownerSid)){
+      const inp=$('msg');
+      if(inp){
+        inp.value=_steerRestoreText(originalMsg,explicitSteer);
+        if(typeof autoResize==='function')autoResize();
+      }
+      if(typeof renderTray==='function')renderTray();
+    }else{
+      await _steerPersistDraftForOwner(ownerSid,originalMsg,explicitSteer,pendingFilesSnapshot);
+    }
+    _steerSetComposerStatusForOwner(ownerSid,'');
+    showToast(`${t('upload_failed')}${e&&e.message?e.message:e}`,3500);
+    return false;
+  }
+  if(!steerText){
+    if(_steerOwnerIsCurrent(ownerSid)){
+      const inp=$('msg');
+      if(inp){
+        inp.value=_steerRestoreText(originalMsg,explicitSteer);
+        if(typeof autoResize==='function')autoResize();
+      }
+      if(typeof renderTray==='function')renderTray();
+    }else{
+      await _steerPersistDraftForOwner(ownerSid,originalMsg,explicitSteer,pendingFilesSnapshot);
+    }
+    showToast(t('cmd_steer_no_msg'));
+    return false;
+  }
+  const inflight={text:steerText,delivered:false,settled:false,ended:false,owned:null,rev:_steerDraftRevision(ownerSid)};
+  if(!_steerUncertainBySid.has(ownerSid))_steerUncertainBySid.set(ownerSid,new Set());
+  _steerUncertainBySid.get(ownerSid).add(inflight);
+  try{
+    // Steering is not idempotent: never resend it automatically.
+    result=await api('/api/chat/steer',{
+      method:'POST',
+      retries:0,
+      body:JSON.stringify({session_id:ownerSid,text:steerText}),
+    });
+  }catch(e){
+    // Keep the active stream running and restore the draft. With no HTTP reply
+    // (connection dropped, timeout) the server may already have delivered the
+    // steer: keep it as an uncertain record so a later leftover can settle it.
+    result={accepted:false, fallback:'network_error', uncertain:!(e&&e.status)};
+  }
+  const uncertain=!!(result&&(result.fallback==='gateway_steer_uncertain'||result.uncertain===true));
+  if(!uncertain)_steerUncertainDrop(ownerSid,inflight);
+  if(uncertain&&inflight.delivered){
+    // The Gateway already handed this text back as a queued leftover: it was
+    // delivered. Nothing was restored; clear the saved draft only if it is still
+    // the submitted text, so a draft typed during the await survives.
+    _steerUncertainDrop(ownerSid,inflight);
+    _steerUploadCache=null;
+    if(_steerDraftRevision(ownerSid)===inflight.rev){
+      // No draft saved since submit: clear like an accepted steer (also drops a
+      // debounced prefix of the submitted text).
+      if(typeof _clearComposerDraft==='function') _clearComposerDraft(ownerSid,_steerRestoreText(originalMsg,explicitSteer),pendingFilesSnapshot);
+    }else{
+      _steerRetireOwnedDraft(ownerSid,{text:_steerRestoreText(originalMsg,explicitSteer),files:pendingFilesSnapshot,rev:_steerDraftRevision(ownerSid)});
+    }
+    return true;
+  }
+  if(result&&result.accepted){
+    // The captured files+text were delivered to ownerSid — clear that session's
+    // draft (it may not be the live session anymore if the user switched during
+    // the upload/API await, which is fine: we're clearing the OWNER's draft).
+    _steerUploadCache=null; // delivered — invalidate the retry cache
+    // A reply that arrives after the run ended (done/cancel/apperror) belongs
+    // to that run: never let it explain a later run's leftover.
+    if(ownerSid&&!inflight.ended){
+      const acc=_steerAcceptedBySid.get(ownerSid)||[];
+      acc.push(steerText);
+      _steerAcceptedBySid.set(ownerSid,acc);
+    }
+    if(ownerSid&&typeof _clearComposerDraft==='function') _clearComposerDraft(ownerSid,_steerRestoreText(originalMsg,explicitSteer),pendingFilesSnapshot);
+    // Show a transient steer indicator in the chat (NOT in S.messages — it must
+    // survive the done event's S.messages=d.session.messages replacement).
+    // The indicator self-removes when the turn completes (done/cancel/error
+    // all call renderMessages which rebuilds msgInner). Only mutate the visible
+    // tray/DOM if the user is still looking at the owning session.
+    if(_steerOwnerIsCurrent(ownerSid)){
+      // Remove ONLY the files we captured+delivered, by object identity, so any
+      // files staged during the upload/API await are preserved (#5459 gate).
+      if(typeof S!=='undefined'&&Array.isArray(S.pendingFiles)&&S.pendingFiles.length&&pendingFilesSnapshot.length){
+        const _delivered=new Set(pendingFilesSnapshot);
+        const _remaining=S.pendingFiles.filter(f=>!_delivered.has(f));
+        if(_remaining.length!==S.pendingFiles.length){S.pendingFiles=_remaining;if(typeof renderTray==='function')renderTray();}
+      }
+      _showSteerIndicator(_steerIndicatorText(originalMsg,pendingFilesSnapshot));
+    }
+    showToast(t('cmd_steer_delivered'),2500);
+    return true;
+  }
+  if(result&&result.fallback==='gateway_steer_queued'&&typeof queueSessionMessage==='function'){
+    _steerUploadCache=null;
+    queueSessionMessage(ownerSid,{
+      text:originalMsg,
+      files:pendingFilesSnapshot,
+      model:ownerModelState.model,
+      model_provider:ownerModelState.model_provider,
+      profile:ownerProfile,
+    });
+    if(typeof updateQueueBadge==='function')updateQueueBadge(ownerSid);
+    if(ownerSid&&typeof _clearComposerDraft==='function') _clearComposerDraft(ownerSid,_steerRestoreText(originalMsg,explicitSteer),pendingFilesSnapshot);
+    if(_steerOwnerIsCurrent(ownerSid)&&typeof S!=='undefined'&&Array.isArray(S.pendingFiles)&&S.pendingFiles.length&&pendingFilesSnapshot.length){
+      const _queued=new Set(pendingFilesSnapshot);
+      const _remaining=S.pendingFiles.filter(f=>!_queued.has(f));
+      if(_remaining.length!==S.pendingFiles.length){S.pendingFiles=_remaining;if(typeof renderTray==='function')renderTray();}
+    }
+    showToast(t('steer_leftover_queued'),3000);
+    return true;
+  }
+  // Do not fall back to interrupt: Steer failure is not permission to cancel
+  // the active run. Restore the draft so the user can explicitly Queue or
+  // Interrupt if that is what they want next. Pending files remain staged.
+  const fallbackCode = result && result.fallback;
+  const deadRunFallback = _steerFallbackIsDeadRun(fallbackCode);
+  const applyCurrentFailure = !deadRunFallback||_steerOwnerStreamIsCurrent(ownerSid,ownerStreamId);
+  const restoreText=_steerRestoreText(originalMsg,explicitSteer);
+  // A draft saved or typed during the request is newer than the steer: keep it.
+  let restored=_steerDraftRevision(ownerSid)===inflight.rev;
+  if(_steerOwnerIsCurrent(ownerSid)&&applyCurrentFailure){
+    const inp=$('msg');
+    if(inp&&inp.value&&inp.value!==restoreText)restored=false;
+    if(inp&&restored){
+      inp.value=restoreText;
+      if(typeof _noteComposerDraftPayload==='function')_noteComposerDraftPayload(ownerSid,restoreText,pendingFilesSnapshot);
+      if(typeof autoResize==='function')autoResize();
+    }
+    if(typeof renderTray==='function')renderTray();
+  }else if(restored){
+    await _steerPersistDraftForOwner(ownerSid,originalMsg,explicitSteer,pendingFilesSnapshot);
+  }
+  if(uncertain){
+    // rev identifies the restored draft itself; later saves are newer drafts.
+    inflight.owned=restored?{text:restoreText,files:pendingFilesSnapshot,rev:_steerDraftRevision(ownerSid)}:null;
+    inflight.settled=true;
+    // A leftover or run end may have arrived during the draft persist above.
+    if((inflight.delivered||inflight.ended)&&_steerUncertainDrop(ownerSid,inflight)){
+      if(inflight.delivered)_steerRetireOwnedDraft(ownerSid,inflight.owned);
+    }
+  }
+  const clearedDeadRun=deadRunFallback&&_steerClearCurrentOwnerDeadRun(ownerSid,ownerStreamId);
+  if(!deadRunFallback||applyCurrentFailure)showToast(t(_steerFailureMessageKey(fallbackCode)), 3500);
+  if(_steerOwnerIsCurrent(ownerSid)&&(!deadRunFallback||clearedDeadRun)) _showSteerRecovery(originalMsg, explicitSteer, fallbackCode);
+  return false;
+}
+
+async function cmdTitle(args){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  const name=(args||'').trim();
+  if(!name){
+    S.messages.push({role:'assistant',content:`${t('title_current')}: **${S.session.title||t('untitled')}**\n\n${t('title_change_hint')}`});
+    renderMessages();return;
+  }
+  try{
+    const r=await api('/api/session/rename',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,title:name})});
+    if(r&&r.error){showToast(r.error);return;}
+    S.session.title=(r&&r.session&&r.session.title)||name;
+    if(typeof syncTopbar==='function')syncTopbar();
+    if(typeof renderSessionList==='function')renderSessionList();
+    showToast(`${t('title_set')} "${S.session.title}"`);
+    S.messages.push({role:'assistant',content:`${t('title_set')} **${S.session.title}**`});
+    renderMessages();
+  }catch(e){showToast(t('failed_colon')+e.message);}
+}
+async function cmdRetry(){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  if(S.session.is_cli_session){showToast(t('cmd_webui_only_session'));return;}
+  const activeSid=S.session.session_id;
+  // #5924: honor a genuine deliberate model pick across a recovery /retry without
+  // forcing explicit_model_pick when there is no real pick. The single-shot marker
+  // is already consumed by the failed send (messages.js clears it before
+  // /api/chat/start regardless of outcome), so we can't read it back. Instead
+  // derive the deliberate-pick signal the SAME way send()'s persistent path does:
+  // the session's own model is a non-default pick vs the profile default. This is
+  // NOT provider inference (no false positive) and survives marker consumption (no
+  // false negative for an already-applied pick). Captured pre-await, scoped to
+  // activeSid. No non-default pick → no re-arm → server compatible-model resolution runs.
+  const _recoveryPick=_deliberateSessionModelPick(activeSid);
+  try{
+    const r=await api('/api/session/retry',{method:'POST',body:JSON.stringify({session_id:activeSid})});
+    if(r&&r.error){showToast(r.error);return;}
+    if(!S.session||S.session.session_id!==activeSid)return;
+    // Bounded tail: a bare reload used to pull and re-redact the whole
+    // transcript on every /retry recovery (#7310/#7625).
+    const data=await api('/api/session?session_id='+encodeURIComponent(activeSid)+'&messages=1&resolve_model=0&msg_limit=30&expand_renderable=1');
+    // #5924 SILENT-race guard: a session switch during the GET await must not let
+    // this recovery apply session A's intent to whatever session is now visible.
+    if(!S.session||S.session.session_id!==activeSid)return;
+    if(data&&data.session){S.messages=data.session.messages||[];S.toolCalls=[];if(typeof clearLiveToolCards==='function')clearLiveToolCards();if(typeof _messagesTruncated!=='undefined')_messagesTruncated=!!(data.session._messages_truncated);if(typeof _oldestIdx!=='undefined')_oldestIdx=data.session._messages_offset||0;renderMessages();}
+    $('msg').value=r.last_user_text||'';if(typeof autoResize==='function')autoResize();
+    // Re-arm the single-shot explicit-pick marker from the captured non-default
+    // pick — but only if it's still safe at fire time (session unchanged, current
+    // model still matches the pick, and no newer onchange marker to clobber). See
+    // _reArmRecoveryPick. Scoped to activeSid so it can't leak to another session.
+    _reArmRecoveryPick(activeSid, _recoveryPick);
+    await send();
+  }catch(e){showToast(t('retry_failed')+e.message);}
+}
+async function cmdUndo(){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  if(S.session.is_cli_session){showToast(t('cmd_webui_only_session'));return;}
+  const activeSid=S.session.session_id;
+  try{
+    const r=await api('/api/session/undo',{method:'POST',body:JSON.stringify({session_id:activeSid})});
+    if(r&&r.error){showToast(r.error);return;}
+    if(!S.session||S.session.session_id!==activeSid)return;
+    // Bounded tail: a bare reload used to pull and re-redact the whole
+    // transcript on every /undo recovery (#7310/#7625).
+    const data=await api('/api/session?session_id='+encodeURIComponent(activeSid)+'&messages=1&resolve_model=0&msg_limit=30&expand_renderable=1');
+    if(data&&data.session){S.messages=data.session.messages||[];S.toolCalls=[];if(typeof clearLiveToolCards==='function')clearLiveToolCards();if(typeof _messagesTruncated!=='undefined')_messagesTruncated=!!(data.session._messages_truncated);if(typeof _oldestIdx!=='undefined')_oldestIdx=data.session._messages_offset||0;renderMessages();}
+    showToast(`↩ ${t('undid_n_messages')} ${r.removed_count} ${t('undid_messages_suffix')}`);
+  }catch(e){showToast(t('undo_failed')+e.message);}
+}
+async function undoLastExchange(){await cmdUndo();}
+async function cmdBtw(args){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  const question=(args||'').trim();
+  if(!question){showToast(t('cmd_btw_usage'));return;}
+  showToast(t('btw_asking'));
+  const activeSid=S.session.session_id;
+  try{
+    const r=await api('/api/btw',{method:'POST',body:JSON.stringify({session_id:activeSid,question})});
+    if(r&&r.error){showToast(r.error);return;}
+    // Connect to the ephemeral SSE stream
+    const streamId=r.stream_id;
+    const parentSid=r.parent_session_id;
+    if(typeof attachBtwStream==='function') attachBtwStream(parentSid,streamId,question);
+  }catch(e){showToast(t('btw_failed')+e.message);}
+}
+async function cmdBackground(args){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  const prompt=(args||'').trim();
+  if(!prompt){showToast(t('cmd_background_usage'));return;}
+  showToast(t('bg_running'));
+  const activeSid=S.session.session_id;
+  try{
+    const r=await api('/api/background',{method:'POST',body:JSON.stringify({session_id:activeSid,prompt})});
+    if(r&&r.error){showToast(r.error);return;}
+    // Show background badge and start polling
+    if(typeof showBackgroundBadge==='function') showBackgroundBadge(r.task_id);
+    if(typeof startBackgroundPolling==='function') startBackgroundPolling(activeSid,r.task_id,prompt);
+  }catch(e){showToast(t('bg_failed')+e.message);}
+}
+function _formatStatusTimestamp(value){
+  if(value===undefined||value===null||value==='') return t('status_unknown');
+  let date;
+  if(typeof value==='number') date=new Date(value < 1000000000000 ? value*1000 : value);
+  else date=new Date(value);
+  if(Number.isNaN(date.getTime())) return t('status_unknown');
+  return date.toLocaleString();
+}
+function _formatStatusTokens(s){
+  const lastUsage=(typeof S!=='undefined'&&(S.lastUsage||s.last_usage))||{};
+  const input=Number(s.input_tokens??lastUsage.input_tokens??0)||0;
+  const output=Number(s.output_tokens??lastUsage.output_tokens??0)||0;
+  const total=Number(s.total_tokens??lastUsage.total_tokens??(input+output))||0;
+  const cost=Number(s.estimated_cost??lastUsage.estimated_cost??0)||0;
+  if(!total&&!cost) return t('status_no_tokens');
+  const fmtNum=n=>Number(n||0).toLocaleString();
+  return `${fmtNum(input)} in / ${fmtNum(output)} out${cost?` (~$${cost.toFixed(4)})`:''}`;
+}
+function _statusProviderForSession(s){
+  if(s.model_provider) return String(s.model_provider);
+  if(window._activeProvider) return String(window._activeProvider);
+  const model=String(s.model||'');
+  return model.includes('/') ? model.split('/')[0] : '';
+}
+function _statusCardFromSession(s){
+  const provider=_statusProviderForSession(s);
+  const model=s.model||(($('modelSelect')&&$('modelSelect').value)||t('usage_default_model'));
+  const running=!!(s.active_stream_id||S.activeStreamId||S.busy);
+  const profile=s.profile||S.activeProfile||'default';
+  const workspace=s.workspace||S.currentDir||t('status_unknown');
+  // #visible-vs-total: `visible_message_count` is the human transcript count with
+  // hidden internal rows (quiet-delegation wakeups) removed; `message_count` is the
+  // raw persisted length. Surface BOTH whenever they differ so the user can see the
+  // true size of the conversation instead of only the filtered count. Context
+  // compression does not shrink either value — it rewrites the model-facing
+  // `context_messages` array, not the persisted transcript — so this total is the
+  // pre-compaction size too.
+  const _visibleStatusMessages=(typeof s.visible_message_count==='number'&&s.visible_message_count>=0)
+    ? s.visible_message_count
+    : (s.message_count??(S.messages||[]).filter(m=>m&&m.role&&m.role!=='tool'&&m._source!=='delegation_wakeup').length);
+  const _totalStatusMessages=(typeof s.message_count==='number'&&s.message_count>=0)
+    ? s.message_count
+    : _visibleStatusMessages;
+  const rows=[
+    {label:t('status_session_id'), value:s.session_id||t('status_unknown')},
+    {label:t('status_title'), value:s.title||t('untitled')},
+    {label:t('status_model'), value:model},
+    {label:t('status_provider'), value:provider||t('status_unknown')},
+    {label:t('status_profile'), value:profile},
+    {label:t('status_workspace'), value:workspace},
+    {label:t('status_personality'), value:s.personality||t('usage_personality_none')},
+    {label:t('status_started'), value:_formatStatusTimestamp(s.created_at)},
+    {label:t('status_updated'), value:_formatStatusTimestamp(s.updated_at||s.last_message_at)},
+    {label:t('status_tokens'), value:_formatStatusTokens(s)},
+    {label:t('status_messages'), value:String(_visibleStatusMessages)},
+    ...(_totalStatusMessages>_visibleStatusMessages?[{label:t('status_messages_total'), value:String(_totalStatusMessages)}]:[]),
+    {label:t('status_agent_running'), value:running?t('status_yes'):t('status_no')},
+  ];
+  return {
+    title:t('status_heading'),
+    subtitle:t('status_ephemeral'),
+    sessionId:s.session_id||'',
+    rows,
+  };
+}
+function cmdStatus(){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  S.messages.push({
+    role:'assistant',
+    content:'',
+    _ephemeral:true,
+    _statusCard:_statusCardFromSession(S.session),
+    _ts:Date.now()/1000,
+  });
+  renderMessages();
+}
+function cmdReasoning(args){
+  const arg=(args||'').trim().toLowerCase();
+  const BRAIN='\uD83E\uDDE0';
+  // Matches hermes_constants.VALID_REASONING_EFFORTS + 'none' (CLI parity).
+  // Keep this WebUI effort list in sync with hermes-agent#29248.
+  const EFFORTS=['none','minimal','low','medium','high','xhigh','max'];
+  // Shared status renderer used by the no-args branch and as a fallback.
+  function _fmtStatus(st){
+    const vis=(st && st.show_reasoning===false)?'off':'on';
+    const eff=(st && st.reasoning_effort)||'default';
+    return BRAIN+' Reasoning effort: '+eff+' \u00B7 display: '+vis
+      +'  |  /reasoning show|hide|none|minimal|low|medium|high|xhigh|max';
+  }
+  if(!arg){
+    // Status — read from the same config.yaml keys the CLI uses.
+    const q=(typeof _reasoningEffortQuery==='function')?_reasoningEffortQuery():'';
+    api('/api/reasoning'+q).then(function(st){showToast(_fmtStatus(st));})
+      .catch(function(){showToast(BRAIN+' /reasoning — status unavailable');});
+    return true;
+  }
+  if(arg==='show'||arg==='on'||arg==='hide'||arg==='off'){
+    const on=(arg==='show'||arg==='on');
+    // Update the UI render gate immediately for responsiveness.
+    window._showThinking=on;
+    if(!on&&typeof removeThinking==='function') removeThinking();
+    if(typeof renderMessages==='function') renderMessages();
+    // Persist via /api/reasoning → config.yaml display.show_reasoning
+    // (CLI reads the same key).  Also mirror into WebUI settings.json
+    // show_thinking so boot.js picks it up on reload without hitting
+    // /api/reasoning on every page load.
+    api('/api/reasoning',{method:'POST',body:JSON.stringify({display:arg})}).catch(function(){});
+    api('/api/settings',{method:'POST',body:JSON.stringify({show_thinking:on})}).catch(function(){});
+    showToast(BRAIN+' Thinking blocks: '+(on?'on':'off')+' (saved)');
+    return true;
+  }
+  if(EFFORTS.includes(arg)){
+    // Persist via /api/reasoning → config.yaml agent.reasoning_effort.
+    // Takes effect on the NEXT session/turn (agent re-reads config at
+    // construction time), matching CLI semantics where `/reasoning high`
+    // also forces an agent re-init.
+    api('/api/reasoning',{method:'POST',body:JSON.stringify({effort:arg})})
+      .then(function(st){
+        const eff=(st && st.reasoning_effort)||arg;
+        showToast(BRAIN+' Reasoning effort: '+eff+' (saved; applies to next turn)');
+        if(typeof _applyReasoningChip==='function') _applyReasoningChip(eff, st||{});
+      })
+      .catch(function(e){
+        showToast(BRAIN+' Failed to set effort: '+(e && e.message ? e.message : arg));
+      });
+    return true;
+  }
+  showToast('Unknown argument: '+arg+' \u2014 use show|hide|'+EFFORTS.join('|'));
+  return true;
+}
+function cmdVoice(){
+  const mic=document.getElementById('btnMic');
+  const micVisible=!!(
+    mic
+    && mic.style.display!=='none'
+    && !mic.disabled
+    && !mic.classList.contains('composer-control-hidden')
+    && mic.getAttribute('aria-hidden')!=='true'
+    && (!window.getComputedStyle||window.getComputedStyle(mic).display!=='none')
+  );
+  if(micVisible){try{mic.click();return;}catch(_){}}
+  showToast(t('cmd_voice_use_mic'));
+}
+
+// ── YOLO mode toggle ──
+// Session-scoped: skips all approval prompts for the current session.
+// Toggles on/off; state is not persisted across page reloads.
+async function cmdYolo(){
+  const sid=S.session&&S.session.session_id;
+  if(!sid){showToast(t('yolo_no_session'));return;}
+  const generation=_loadSessionGeneration;
+  const viewIsCurrent=()=>!!(
+    S.session&&S.session.session_id===sid&&_loadSessionGeneration===generation
+  );
+  let approvalOwner=null;
+  try{
+    // Check current state first to toggle.
+    const status=await api('/api/session/yolo?session_id='+encodeURIComponent(sid));
+    if(!viewIsCurrent())return;
+    const enable=!status.yolo_enabled;
+    // A visible approval must belong to this exact session load before any
+    // command handler may POST through it. Otherwise fail closed.
+    const card=$('approvalCard');
+    if(card&&card.classList.contains('visible')){
+      approvalOwner=typeof _captureApprovalResponseOwner==='function'
+        ?_captureApprovalResponseOwner()
+        :null;
+      if(!approvalOwner)return;
+      if(enable&&typeof toggleYoloFromApproval==='function'){
+        await toggleYoloFromApproval();
+        return;
+      }
+    }
+    const result=await api('/api/session/yolo',{
+      method:'POST',
+      body:JSON.stringify({session_id:sid,enabled:enable}),
+    });
+    if(!viewIsCurrent()||(approvalOwner&&!_approvalResponseOwnerIsCurrent(approvalOwner)))return;
+    const settled=(result&&typeof result.yolo_enabled==='boolean')?result.yolo_enabled:enable;
+    _yoloEnabled=settled;
+    _updateYoloPill();
+    showToast(settled?t('yolo_enabled'):t('yolo_disabled'));
+  }catch(e){
+    if(!viewIsCurrent()||(approvalOwner&&!_approvalResponseOwnerIsCurrent(approvalOwner)))return;
+    let errorPayload=null;
+    if(e&&typeof e.body==='string'){
+      try{errorPayload=JSON.parse(e.body);}catch(_){}
+    }
+    if(errorPayload&&typeof errorPayload.yolo_enabled==='boolean'){
+      _yoloEnabled=errorPayload.yolo_enabled;
+      _updateYoloPill();
+    }
+    showToast('YOLO: '+((errorPayload&&(errorPayload.error||errorPayload.message))||e.message));
+  }
+}
+
+// ── Branch / fork command ──
+// Forks the current conversation into a new session (#465).
+// /branch           → full history copy
+// /branch My Name   → full history copy with custom title
+async function cmdBranch(args){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  const readOnlySession=typeof _isReadOnlySession==='function'
+    ? _isReadOnlySession(S.session)
+    : !!(S.session&&(S.session.read_only||S.session.is_read_only));
+  const branchableReadOnlySession=typeof _isBranchableReadOnlySession==='function'
+    ? _isBranchableReadOnlySession(S.session)
+    : false;
+  if(readOnlySession&&!branchableReadOnlySession){showToast('Read-only sessions cannot be forked.',3000);return;}
+  const customTitle=(args||'').trim()||null;
+  try{
+    const data=await api('/api/session/branch',{
+      method:'POST',
+      body:JSON.stringify({
+        session_id:S.session.session_id,
+        title:customTitle||undefined,
+      }),
+    });
+    if(data&&data.session_id){
+      await loadSession(data.session_id);
+      if(typeof renderSessionList==='function') await renderSessionList();
+      showToast(t('branch_forked'));
+    }
+  }catch(e){showToast(t('branch_failed')+e.message);}
+}
+
+// ── Fork from a specific message point ──
+// Called from the "Fork from here" button on message hover actions.
+// msgIdx is 1-based within the currently loaded tail window (rawIdx+1).
+// When the session is truncated (_oldestIdx > 0), msgIdx alone would be
+// a local-window count, but the backend expects an absolute message count
+// from the beginning of the full transcript.  We capture the absolute
+// count (_oldestIdx + msgIdx) BEFORE awaiting _ensureAllMessagesLoaded,
+// which resets _oldestIdx to 0 after its wholesale replace.  See #2184.
+async function forkFromMessage(msgIdx, btn){
+  if(!S.session)return;
+  // The button bakes its 1-based index at render time; re-read it from the row,
+  // since loading full history (e.g. the outline) re-bases indices without a
+  // re-render (#2184).
+  const forkRow=btn&&btn.closest?btn.closest('[data-msg-idx]'):null;
+  if(forkRow&&typeof _rowCurrentRawIdx==='function') msgIdx=_rowCurrentRawIdx(forkRow,msgIdx-1)+1;
+  // During streaming, only block fork if the clicked message is the
+  // currently-streaming (live) message itself.  Past messages that are
+  // already committed server-side can be forked immediately without
+  // waiting for the stream to finish.
+  if(S.busy){
+    const _msg=(Array.isArray(S.messages)&&S.messages[msgIdx-1])||null;
+    const _isLastMsg=msgIdx>=(Array.isArray(S.messages)?S.messages.length:0);
+    if((_msg&&(_msg._live||_msg._pending))||_isLastMsg){
+      showToast('Cannot fork a message still being generated.',3000);
+      return;
+    }
+  }
+  const readOnlySession=typeof _isReadOnlySession==='function'
+    ? _isReadOnlySession(S.session)
+    : !!(S.session&&(S.session.read_only||S.session.is_read_only));
+  const branchableReadOnlySession=typeof _isBranchableReadOnlySession==='function'
+    ? _isBranchableReadOnlySession(S.session)
+    : false;
+  if(readOnlySession&&!branchableReadOnlySession){showToast('Read-only sessions cannot be forked.',3000);return;}
+  const initialSid = S.session.session_id;
+  // Capture the absolute keep_count before any async work that may
+  // reset _oldestIdx.  _oldestIdx is 0 when the full transcript is
+  // already loaded, so short/already-full sessions send msgIdx unchanged.
+  const absoluteKeepCount = _oldestIdx + msgIdx;
+  // Ensure the full transcript is loaded so the forked session renders
+  // correctly and subsequent operations see the complete history.
+  // Skip during streaming to avoid visual flicker — the fork data
+  // (absoluteKeepCount) was already captured above and is unaffected.
+  if(!S.busy && typeof _ensureAllMessagesLoaded==='function'){
+    await _ensureAllMessagesLoaded();
+  }
+  if(!S.session || S.session.session_id !== initialSid) return;
+  try{
+    const data=await api('/api/session/branch',{
+      method:'POST',
+      body:JSON.stringify({
+        session_id:initialSid,
+        keep_count:absoluteKeepCount,
+      }),
+    });
+    if(data&&data.session_id){
+      await loadSession(data.session_id);
+      if(typeof _ensureAllMessagesLoaded==='function') await _ensureAllMessagesLoaded();
+      if(typeof renderSessionList==='function') await renderSessionList();
+      showToast(t('branch_forked'));
+    }
+  }catch(e){showToast(t('branch_failed')+e.message);}
+}
+
+let _skillCommandCache=[];
+let _skillCommandLoadPromise=null;
+let _skillCommandCacheReady=false;
+function _skillCommandSlug(name){
+  const raw=String(name||'').trim().toLowerCase();
+  if(!raw)return'';
+  return raw.replace(/[\s_]+/g,'-').replace(/[^a-z0-9-]/g,'').replace(/-{2,}/g,'-').replace(/^-+|-+$/g,'');
+}
+function _getReservedSlashCommandSlugs(){
+  const reserved=new Set(COMMANDS.map(c=>String(c&&c.name||'').trim().toLowerCase()).filter(Boolean));
+  for(const cmd of (_agentCommandCache||[])){
+    const names=[cmd.name].concat(Array.isArray(cmd&&cmd.aliases)?cmd.aliases:[]);
+    for(const name of names){
+      const slug=_skillCommandSlug(name);
+      if(slug) reserved.add(slug);
+    }
+  }
+  return reserved;
+}
+function _buildSkillCommandEntry(skill){
+  if(_isSkillDisabled(skill))return null;
+  const skillName=String(skill&&skill.name||'').trim();
+  const slug=_skillCommandSlug(skillName);
+  if(!slug)return null;
+  if(_getReservedSlashCommandSlugs().has(slug)) return null;
+  return{name:slug,desc:String(skill&&skill.description||'').trim()||t('slash_skill_desc'),source:'skill',skillName};
+}
+function _buildBundleCommandEntry(bundle){
+  const slug=_skillCommandSlug(bundle&&bundle.name);
+  if(!slug)return null;
+  if(_getReservedSlashCommandSlugs().has(slug)) return null;
+  const skillCount=Number(bundle&&bundle.skill_count||0);
+  return{
+    name:slug,
+    desc:String(bundle&&bundle.description||'').trim()||'Skill bundle',
+    source:'bundle',
+    skillCount:Number.isFinite(skillCount)?skillCount:0,
+  };
+}
+async function loadSkillCommands(force=false){
+  if(_skillCommandCacheReady&&!force)return _skillCommandCache;
+  if(_skillCommandLoadPromise&&!force)return _skillCommandLoadPromise;
+  const gen=_slashSkillCacheGen;
+  let _committed=false;
+  _skillCommandLoadPromise=(async()=>{
+    try{
+      const data=await api('/api/skills');
+      const deduped=new Map();
+      for(const skill of (data&&data.skills)||[]){const entry=_buildSkillCommandEntry(skill);if(entry&&!deduped.has(entry.name))deduped.set(entry.name,entry);}
+      // Bumped by a profile switch while we were awaiting: keep the cache empty
+      // (and not "ready") so the composer's next pass loads the new profile (#7509).
+      if(gen!==_slashSkillCacheGen) return _skillCommandCache;
+      _skillCommandCache=Array.from(deduped.values()).sort((a,b)=>a.name.localeCompare(b.name));
+      _committed=true;
+    }catch(_){
+      if(gen===_slashSkillCacheGen)_skillCommandCache=[];
+    }
+    finally{
+      // Only publish the cache as "ready" after a SUCCESSFUL current-generation
+      // commit. Marking it ready in the failure path (what master does
+      // unconditionally) permanently wedges the picker: a single transient
+      // /api/skills rejection leaves ready=true + cache=[], and
+      // ensureSkillCommandsLoadedForAutocomplete() only retries when
+      // !ready && !promise — so skill commands stay missing until a page
+      // reload even after the API recovers. Clear the promise either way so the
+      // next picker pass can retry.
+      if(gen===_slashSkillCacheGen){_skillCommandCacheReady=_committed;_skillCommandLoadPromise=null;}
+    }
+    return _skillCommandCache;
+  })();
+  return _skillCommandLoadPromise;
+}
+async function loadBundleCommands(force=false){
+  if(_bundleCommandCacheReady&&!force)return _bundleCommandCache;
+  if(_bundleCommandLoadPromise&&!force)return _bundleCommandLoadPromise;
+  _bundleCommandLoadPromise=(async()=>{
+    try{
+      await loadAgentCommandMetadata();
+      const data=await api('/api/commands/bundles');
+      const deduped=new Map();
+      for(const bundle of (data&&data.bundles)||[]){const entry=_buildBundleCommandEntry(bundle);if(entry&&!deduped.has(entry.name))deduped.set(entry.name,entry);}
+      _bundleCommandCache=Array.from(deduped.values()).sort((a,b)=>a.name.localeCompare(b.name));
+    }catch(_){_bundleCommandCache=[];}
+    finally{_bundleCommandCacheReady=true;_bundleCommandLoadPromise=null;}
+    return _bundleCommandCache;
+  })();
+  return _bundleCommandLoadPromise;
+}
+async function getBundleCommandMetadata(name){
+  const needle=String(name||'').trim().toLowerCase();
+  if(!needle) return null;
+  const bundles=await loadBundleCommands();
+  return bundles.find(bundle=>String(bundle&&bundle.name||'').toLowerCase()===needle)||null;
+}
+// The composer text the user last closed the list on, by picking a command or pressing
+// Escape. A refresh that was not caused by typing (a slash-command loader landing late,
+// or a lookup still in flight) must not re-open the list for that same text; any edit
+// clears it. Without this, a failing /api/skills (agent-free server) is retried on every
+// keystroke and its late refresh re-opened the list after `/new` was taken, so the next
+// Enter picked again instead of sending (#8050). Closing because nothing matched is not
+// a dismissal: a loader that lands later may still have matches to show.
+let _slashDismissedText=null;
+function markSlashDropdownDismissed(){
+  const ta=$('msg');
+  _slashDismissedText=ta?String(ta.value||''):null;
+}
+function clearSlashDropdownDismissed(){ _slashDismissedText=null; }
+function slashDropdownDismissedFor(text){
+  return _slashDismissedText!==null&&_slashDismissedText===String(text||'');
+}
+function refreshSlashCommandDropdown(){
+  const ta=$('msg');if(!ta)return;
+  const text=ta.value||'';
+  if(text.indexOf('\n')!==-1||_activeSlashCommandOffset(text)<0){hideCmdDropdown();return;}
+  if(slashDropdownDismissedFor(text)) return;
+  getSlashAutocompleteMatches(text).then(matches=>{
+    if(($('msg').value||'')!==text) return;
+    if(slashDropdownDismissedFor(text)) return;
+    if(matches.length)showCmdDropdown(matches);else hideCmdDropdown();
+  });
+}
+function ensureSkillCommandsLoadedForAutocomplete(){
+  if(!_skillCommandCacheReady&&!_skillCommandLoadPromise){
+    loadSkillCommands().then(()=>{refreshSlashCommandDropdown();});
+  }
+  if(!_bundleCommandCacheReady&&!_bundleCommandLoadPromise){
+    loadBundleCommands().then(()=>{refreshSlashCommandDropdown();});
+  }
+  // Also preload agent/plugin command metadata for autocomplete
+  if(!_agentCommandCacheReady&&!_agentCommandCachePromise){
+    loadAgentCommandMetadata().then(()=>{refreshSlashCommandDropdown();});
+  }
+}
+
+// ── Autocomplete dropdown ───────────────────────────────────────────────────
+
+let _cmdSelectedIdx=-1;
+
+function showCmdDropdown(matches){
+  const dd=$('cmdDropdown');
+  if(!dd)return;
+  dd.innerHTML='';
+  _cmdSelectedIdx=matches.length?0:-1;
+  for(let i=0;i<matches.length;i++){
+    const c=matches[i];
+    const el=document.createElement('div');
+    el.className='cmd-item';
+    if(i===_cmdSelectedIdx) el.classList.add('selected');
+    el.dataset.idx=i;
+    const isSubArg=c.source==='subarg';
+    const isPath=c.source==='path';
+    const usage=(!isSubArg&&c.arg)?` <span class="cmd-item-arg">${esc(c.arg)}</span>`:'';
+    const badge=c.source==='skill'
+      ? ` <span class="cmd-item-badge cmd-item-badge-skill">${esc(t('slash_skill_badge'))}</span>`
+      : c.source==='bundle'
+      ? ' <span class="cmd-item-badge">Bundle</span>'
+      : '';
+    if(c.source==='skill') el.classList.add('cmd-item-skill');
+    if(isPath) el.classList.add('cmd-item-path');
+    const nameHtml=isPath
+      ? `<div class="cmd-item-name"><span class="cmd-item-path-value">${esc(c.value)}</span></div>`
+      : isSubArg
+      ? `<div class="cmd-item-name"><span class="cmd-item-parent">/${esc(c.parent)}</span> <span class="cmd-item-subarg">${esc(c.value)}</span></div>`
+      : `<div class="cmd-item-name">/${esc(c.name)}${usage}${badge}</div>`;
+    const descHtml=`<div class="cmd-item-desc">${esc(c.desc)}</div>`;
+    el.innerHTML=`${nameHtml}${descHtml}`;
+    el.onmousedown=(e)=>{
+      e.preventDefault();
+      if(isPath){
+        const ta=$('msg');
+        if(!ta){hideCmdDropdown();return;}
+        const start=Number.isFinite(Number(c.tokenStart))?Number(c.tokenStart):ta.selectionStart;
+        const end=Number.isFinite(Number(c.tokenEnd))?Number(c.tokenEnd):ta.selectionEnd;
+        const nextPath=String(c.value||'').endsWith('/')?String(c.value||''):`${String(c.value||'')}/`;
+        const current=String(ta.value||'');
+        const safeStart=Math.max(0,Math.min(start,current.length));
+        const safeEnd=Math.max(safeStart,Math.min(end,current.length));
+        ta.value=current.slice(0,safeStart)+nextPath+current.slice(safeEnd);
+        const pos=safeStart+nextPath.length;
+        ta.focus();
+        ta.setSelectionRange(pos,pos);
+        ta.dispatchEvent(new Event('input',{bubbles:true}));
+        hideCmdDropdown();
+        return;
+      }
+      const _ta=$('msg');
+      const _cur=String(_ta&&_ta.value||'');
+      const _slashIdx=_activeSlashCommandOffset(_cur);
+      const _prefix=_slashIdx>=0?_cur.slice(0,_slashIdx):'';
+      const nextValue=_prefix+(isSubArg?('/'+c.parent+' '+c.value):('/'+c.name+(c.arg?' ':'')));
+      if(_ta)_ta.value=nextValue;
+      if(_ta)_ta.focus();
+      if(!isSubArg&&c.source!=='skill'&&c.source!=='bundle'&&nextValue.endsWith(' ')&&typeof getSlashAutocompleteMatches==='function'){
+        getSlashAutocompleteMatches(nextValue).then(matches=>{
+          if(($('msg').value||'')!==nextValue) return;
+          if(matches.length) showCmdDropdown(matches);
+          else hideCmdDropdown();
+        });
+      }else{
+        hideCmdDropdown();
+        markSlashDropdownDismissed();
+      }
+    };
+    dd.appendChild(el);
+  }
+  dd.classList.add('open');
+}
+
+function hideCmdDropdown(){
+  const dd=$('cmdDropdown');
+  if(dd)dd.classList.remove('open');
+  _cmdSelectedIdx=-1;
+}
+
+function navigateCmdDropdown(dir){
+  const dd=$('cmdDropdown');
+  if(!dd)return;
+  const items=dd.querySelectorAll('.cmd-item');
+  if(!items.length)return;
+  items.forEach(el=>el.classList.remove('selected'));
+  _cmdSelectedIdx+=dir;
+  if(_cmdSelectedIdx<0)_cmdSelectedIdx=items.length-1;
+  if(_cmdSelectedIdx>=items.length)_cmdSelectedIdx=0;
+  items[_cmdSelectedIdx].classList.add('selected');
+  // Scroll the newly highlighted item into view so it stays visible when the
+  // dropdown overflows and the user navigates with keyboard (#838).
+  items[_cmdSelectedIdx].scrollIntoView({block:'nearest'});
+}
+
+function selectCmdDropdownItem(){
+  const dd=$('cmdDropdown');
+  if(!dd)return;
+  const items=dd.querySelectorAll('.cmd-item');
+  if(_cmdSelectedIdx>=0&&_cmdSelectedIdx<items.length){
+    items[_cmdSelectedIdx].onmousedown({preventDefault:()=>{}});
+  } else if(items.length===1){
+    items[0].onmousedown({preventDefault:()=>{}});
+  } else {
+    hideCmdDropdown();
+    markSlashDropdownDismissed();
+    return;
+  }
+  hideCmdDropdown();
+}
+
+// ── Handler aliases (for test-discoverable command registration) ──────────────
+// The COMMANDS array above is the authoritative dispatch table. These aliases
+// allow tooling and tests to discover command handlers by name independently.
+const HANDLERS = {};
+HANDLERS.skills = cmdSkills;

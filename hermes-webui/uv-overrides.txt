@@ -1,0 +1,4 @@
+pynacl>=1.6,<1.7
+cryptography==50.0.2
+Pillow==13.0.0
+spacy-curated-transformers; sys_platform == 'never'

@@ -1,0 +1,16128 @@
+"""Hermes Web UI -- Session model and in-memory session store."""
+import collections
+import contextvars
+import copy
+import datetime
+import hashlib
+import inspect
+import json
+import logging
+import math
+import os
+import re
+import sqlite3
+import threading
+import time
+import uuid
+from contextlib import closing, contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, cast, overload
+
+try:  # pragma: no cover - platform-specific imports.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover
+    _fcntl = None
+
+try:  # pragma: no cover - platform-specific imports.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover
+    _msvcrt = None
+
+import api.config as _cfg
+from api.compression_anchor import is_context_compression_marker
+from api.config import (
+    SESSION_DIR, SESSION_INDEX_FILE, SESSIONS, SESSIONS_MAX,
+    LOCK, STREAMS, STREAMS_LOCK, DEFAULT_WORKSPACE, DEFAULT_MODEL, PROJECTS_FILE, HOME,
+    get_effective_default_model, _get_session_agent_lock,
+)
+from api.workspace import get_last_workspace, _resolve_path, profile_home_resolve_cache_scope
+from api.usage import prompt_cache_hit_percent
+from api.agent_sessions import (
+    _is_continuation_session,
+    is_cli_session_row,
+    normalize_agent_session_source,
+    open_state_db_readonly,
+    read_assigned_project_row_counts,
+    read_importable_agent_session_rows,
+    read_session_lineage_metadata,
+)
+from api.process_event_utils import (
+    stamp_message_source,
+    is_hidden_transcript_row,
+    attach_wakeup_display_meta,
+)
+
+logger = logging.getLogger(__name__)
+# Size of the interactive sidebar recency window. Also bounds how many
+# delegated subagent children can be rendered at once, since a child only
+# nests when it wins a slot in this window. Resolved in api.config before
+# profile init; override with HERMES_WEBUI_VISIBLE_SESSION_LIMIT (clamped 1–200).
+CLI_VISIBLE_SESSION_LIMIT = _cfg.CLI_VISIBLE_SESSION_LIMIT
+# Project chips must remain able to reveal older assigned CLI/TUI sessions even
+# after newer unassigned rows fill the normal sidebar window (#6659).
+#
+# The bound is PER PROJECT and counts LOGICAL conversations (after lineage and
+# sidecar dedup), not raw state.db rows. Per project, because a single global
+# budget re-creates the bug this fixes — one busy project would evict another
+# project's whole history. Logical conversations, because compression segments
+# are not separately addressable and must not spend a project's budget.
+PROJECT_ASSIGNED_CLI_LIMIT = 200
+# Hard ceiling on the assigned-recovery QUERY so the per-project budget cannot
+# multiply into an unbounded scan on a profile with dozens of projects. Past
+# this, every project's share of the recovery pass shrinks to
+# PROJECT_ASSIGNED_CLI_SCAN_CEILING // len(projects) instead of any one project
+# eating the whole window; project-filtered server pagination is still the real
+# fix for profiles that large.
+PROJECT_ASSIGNED_CLI_SCAN_CEILING = 2000
+# The project-scoped follow-up below is deliberately NOT capped by project
+# count: any fixed cap would recreate the starvation it repairs — every starved
+# project past the cap stays unreachable on every rebuild (greptile P1 on
+# #6659). Its work is bounded by construction instead: it fires only when the
+# global assigned query is logically saturated OR its final raw candidate window
+# was exhausted while projection stayed short; each scoped query is limited to
+# one project's remaining budget; and the sum of those budgets across every
+# starved project is at most effective_limit * len(projects), which the scan
+# ceiling above already caps. Worst case per build: 1 global query + 1 GROUP BY
+# probe + one small project-scoped query per starved project, plus the pass's
+# single widening budget (query_limit, see `widening_budget`) shared by the
+# compression-heavy retries — a retry is NOT granted the global allowance per
+# project, which would make a build scale with the number of starved projects
+# (greptile P1 on #6659).
+#
+# --- Bounds for the UNASSIGNED refill pass (see _load_cli_sessions_uncached).
+# The SQL 'unassigned' filter reads state.db.project_id, but a WebUI-side move
+# records the assignment on the session's sidecar ONLY, so that filter hands back
+# conversations this projection classifies as ASSIGNED. How many is not knowable
+# before the query runs, so the refill re-classifies its own result and widens
+# again while the window is still short. These two constants are what keep that
+# loop finite. Both bound ONE profile context: get_cli_sessions(
+# all_profiles=1) runs the whole loader once per context, so an N-profile sidebar
+# pays N times the numbers below.
+#
+# At most this many unassigned queries per profile context (the first included).
+# The widening below is geometric and proportional, not one row at a time, so 4
+# covers both moves spread through the history and moves clustered just under the
+# window edge; the last of the four abandons estimating and reads the ceiling in
+# one go, which is the widest read the loop is ever allowed to pay. It is also
+# what paces the geometric growth: each widening adds at least width // queries
+# still left, so the steps get bolder as the forced ceiling read gets closer.
+UNASSIGNED_CLI_REFILL_MAX_QUERIES = 4
+# ...and no single refill query reads deeper than this many logical
+# conversations. It bounds both the I/O and the payload: a build cannot be made
+# to scan the whole of a large state.db by moving conversations into projects.
+# The unassigned window is filled whenever at least CLI_VISIBLE_SESSION_LIMIT of
+# the newest UNASSIGNED_CLI_REFILL_SCAN_CEILING state.db-unassigned conversations
+# are still unassigned once sidecars are read; past that (>180 of the newest 200
+# moved from the WebUI) the sidebar is honestly short rather than unbounded.
+UNASSIGNED_CLI_REFILL_SCAN_CEILING = 200
+# How many messageful cron sessions to surface in the project-chip layer.
+# Needs to exceed CLI_VISIBLE_SESSION_LIMIT so older cron runs stay
+# addressable even when many newer non-cron sessions dominate the default
+# sidebar window (#3172).
+CRON_PROJECT_CHIP_LIMIT = 200
+WEBHOOK_PROJECT_CHIP_LIMIT = 200
+# Kanban worker runs are internal/background like cron+webhook; keep the same
+# higher project-chip cap so project-assigned kanban rows stay addressable when
+# the toggle is on, without letting them dominate the default sidebar window.
+KANBAN_PROJECT_CHIP_LIMIT = 200
+# Sources with their own bounded project-chip pass. They are kept out of the
+# interactive CLI window and out of its recovery passes, and they keep the
+# system-chip answer wherever they are projected, so the same background row can
+# never report two different project chips.
+BACKGROUND_CLI_SOURCES = ("cron", "webhook", "kanban")
+# Sources kept out of the 20-row interactive window and its unassigned refill.
+# One-shot runs (`hermes -z`) are added on top of the background sources:
+# agents that delegate through them can start hundreds a day, which used to push
+# Desktop/TUI/CLI conversations out of the window (#8265). Unlike the background
+# sources they keep normal project chips, so a project-assigned one-shot run is
+# still recovered by the assigned pass, and an explicitly requested one resolves
+# through get_cli_session_by_id().
+INTERACTIVE_WINDOW_EXCLUDED_CLI_SOURCES = BACKGROUND_CLI_SOURCES + ("oneshot",)
+_CLI_SESSIONS_CACHE_TTL_SECONDS = 5.0
+# While a turn is actively streaming, hold the CLI/cron projection longer than
+# one poll interval (mirrors the route-level #4808 hold-down). The frontend
+# polls /api/sessions on the static/sessions.js `_streamingPollMs` cadence.
+# Pair this wider window with the stable streaming cache key below so repeated
+# polls reuse the projection instead of re-running the expensive state.db
+# CLI/cron projection. (#4842) Keep this strictly greater than
+# `_streamingPollMs`/1000 (see tests/test_streaming_cache_ttl_vs_poll.py).
+_CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 45.0
+_CLI_SESSIONS_CACHE_LOCK = threading.Lock()
+_CLI_SESSIONS_CACHE_INFLIGHT: "dict[tuple, threading.Event]" = {}
+_CLI_SESSIONS_CACHE_INVALIDATION_VERSION = 0
+# LRU-bounded (drop-oldest) so a long-lived process under churn — where the
+# state.db fingerprint advances on every streamed message and the structural
+# clear-on-mutation listener doesn't fire for every fingerprint advance — can't
+# accumulate orphaned heavy deepcopies. Each value is a copy.deepcopy() of the
+# full CLI/cron session list (the expensive projection behind #4842/#4672), so
+# the cap is deliberately small. TTL is still the primary freshness control;
+# the cap is the backstop that the plain dict previously lacked. Mirrors the
+# _CLAUDE_CODE_PARSE_CACHE / _SIDECAR_METADATA_CACHE LRU pattern.
+_CLI_SESSIONS_CACHE: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_CLI_SESSIONS_CACHE_MAX_ENTRIES = 8
+# Complete projections retained under an identity that excludes the volatile
+# state.db fingerprint. This store is independently bounded because the stable
+# identity still contains external Claude/session-index stat revisions.
+_CLI_SESSIONS_LAST_KNOWN_GOOD: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_CLI_SESSIONS_LAST_KNOWN_GOOD_MAX_ENTRIES = 8
+_CLI_SESSIONS_CACHE_WAIT_SECONDS = 0.25
+# Event waits that keep stale rows visible while a rebuild is in flight.
+_CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
+
+# Per-file parse cache for Claude Code JSONL transcripts (#4718/#4662 phase 4).
+# ``~/.claude/projects`` is a GLOBAL, profile-independent directory, but the
+# sidebar re-derives every Claude Code row from scratch on each /api/sessions
+# build — fully re-reading and JSON-parsing up to CLAUDE_CODE_MAX_FILES
+# transcripts line-by-line (hundreds of MB) just to recover a title + message
+# count. That parse dominates the cold sidebar build (~650-1000ms measured on a
+# 200-file / ~130MB tree) and it repeats on every profile switch, on the 5s
+# CLI-cache expiry, and on every sidebar poll, because the higher CLI cache is
+# keyed per active profile while the underlying transcripts never change between
+# switches. This cache memoizes the EXPENSIVE per-file parse result keyed by the
+# file's (path, mtime_ns, size, ctime_ns); a warm sidebar build then re-stats the
+# files (~4ms for 200) instead of re-parsing them. Any external edit/append to a
+# transcript changes mtime_ns/size/ctime_ns and transparently invalidates just
+# that one file's entry. Bounded so a pathological projects tree can't grow it unbounded.
+_CLAUDE_CODE_PARSE_CACHE_LOCK = threading.Lock()
+_CLAUDE_CODE_PARSE_CACHE: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_CLAUDE_CODE_PARSE_CACHE_MAX = 1000
+
+# Per-file cache for the UI-owned sidecar metadata (title + archived) that the
+# state.db sidebar projection overlays onto each CLI/cron row (#4842). The
+# projection calls _state_projection_sidecar_metadata() once per row in BOTH
+# the main visible pass AND the higher-capped (CRON_PROJECT_CHIP_LIMIT=200)
+# cron-only second pass, and each call was an uncached open() + 64KB prefix
+# read + a pure-Python JSON-key scan. On a cron-heavy profile that is up to
+# ~200 sidecar file reads per /api/sessions build — and because the enclosing
+# _CLI_SESSIONS_CACHE is keyed on a state.db content fingerprint that advances
+# on every streamed message row, that whole scan was re-paid on essentially
+# every streaming poll during a live turn (the "100% CPU / multi-second get_cli_sessions"
+# in #4842/#4808/#4672). This memoizes the parse result keyed by the sidecar's
+# (path, mtime_ns, size, ctime_ns) stat signature: a warm projection re-stats
+# each file (~1 stat) instead of re-reading+parsing it, while any genuine
+# rename/archive/edit bumps the signature and transparently invalidates just
+# that one entry. Bounded so a pathological session store can't grow it without
+# limit. Mirrors the Claude Code parse cache (#4718).
+_SIDECAR_METADATA_CACHE_LOCK = threading.Lock()
+_SIDECAR_METADATA_CACHE: "collections.OrderedDict[tuple, dict]" = collections.OrderedDict()
+_SIDECAR_METADATA_CACHE_MAX = 2000
+
+# #5854: authoritative facts for a LEGACY (pre-#5854) sidecar whose scenes
+# serialize before `messages`, so the cheap metadata-prefix read can't recover
+# its message_count or scene fingerprint. Without this, an unchanged legacy
+# large-scene session would full-parse on every poll (recreating the #4633
+# churn for legacy files) and could not be LRU-evicted. Populated once per file
+# from a full Session.load(); keyed by the sidecar's stat signature so any edit
+# invalidates it. Bounded. Value: {"message_count": int, "scene_index": dict}.
+_LEGACY_SIDECAR_FACTS_LOCK = threading.Lock()
+_LEGACY_SIDECAR_FACTS: "collections.OrderedDict[tuple, dict]" = collections.OrderedDict()
+_LEGACY_SIDECAR_FACTS_MAX = 2000
+
+# ---------------------------------------------------------------------------
+# Stale temp-file cleanup
+# ---------------------------------------------------------------------------
+# Both Session.save() and _write_session_index() use the atomic-write pattern:
+#   write to  <path>.tmp.<pid>.<tid>  →  os.replace() to final path
+# If the process crashes between write and replace the .tmp file is left
+# behind.  Because the name embeds pid + tid, leftover files can never be
+# reused by a different process/thread, so they are safe to remove on the
+# next startup.  _cleanup_stale_tmp_files() is called from the full-rebuild
+# path of _write_session_index (i.e. at first index access / startup) and
+# removes any *.tmp.* file whose mtime is older than one hour.
+# ---------------------------------------------------------------------------
+
+_STALE_TMP_AGE_SECONDS = 3600  # 1 hour
+
+
+# ---------------------------------------------------------------------------
+# Windows-safe os.replace() with retry
+# ---------------------------------------------------------------------------
+# On Windows, os.replace() raises WinError 5 (ERROR_ACCESS_DENIED) when the
+# target file is momentarily locked by another process (antivirus scanner,
+# browser polling the session JSON, etc.).  This helper retries with
+# exponential backoff on PermissionError, which is the Python exception
+# mapped from WinError 5.  On non-Windows platforms it is a thin wrapper
+# (one attempt, no delay).
+# ---------------------------------------------------------------------------
+
+_WINDOWS_REPLACE_MAX_RETRIES = 5
+_WINDOWS_REPLACE_INITIAL_DELAY = 0.05  # 50 ms
+
+
+def _safe_replace(src: Path, dst: Path) -> None:
+    """Atomic replace with retries on Windows file-locking errors."""
+    if os.name != 'nt':
+        os.replace(src, dst)
+        return
+
+    delay = _WINDOWS_REPLACE_INITIAL_DELAY
+    for attempt in range(_WINDOWS_REPLACE_MAX_RETRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _WINDOWS_REPLACE_MAX_RETRIES - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2  # 50 -> 100 -> 200 -> 400 -> 800 ms
+
+
+# In-process write generation per session sidecar (#8267). A cold
+# get_session() reads the sidecar and then publishes that object into
+# SESSIONS. If another writer replaces the sidecar in between, publishing
+# would hide that write behind the pre-write object, and the next
+# whole-session save of the cached object would undo it on disk. Stat
+# signatures cannot see two same-size saves inside one clock tick, so writers
+# count instead: once before and once after the replace, which makes any read
+# that overlaps a replace observe a change.
+_SIDECAR_WRITE_GENERATIONS: dict[str, int] = {}
+_SIDECAR_WRITE_GENERATIONS_LOCK = threading.Lock()
+_SIDECAR_WRITE_LOCAL = threading.local()
+
+
+def _note_sidecar_write(session_id) -> None:
+    sid = str(session_id or '')
+    if not sid:
+        return
+    with _SIDECAR_WRITE_GENERATIONS_LOCK:
+        _SIDECAR_WRITE_GENERATIONS[sid] = _SIDECAR_WRITE_GENERATIONS.get(sid, 0) + 1
+    own = getattr(_SIDECAR_WRITE_LOCAL, 'counts', None)
+    if own is None:
+        own = _SIDECAR_WRITE_LOCAL.counts = {}
+    own[sid] = own.get(sid, 0) + 1
+
+
+def _sidecar_write_generation(session_id) -> tuple[int, int]:
+    """Return (all writers, this thread's writes) for ``session_id``.
+
+    A loader compares the difference of the two before and after its read, so
+    its own self-heal save inside ``Session.load`` does not count as a
+    concurrent write.
+    """
+    sid = str(session_id or '')
+    with _SIDECAR_WRITE_GENERATIONS_LOCK:
+        total = _SIDECAR_WRITE_GENERATIONS.get(sid, 0)
+    own = (getattr(_SIDECAR_WRITE_LOCAL, 'counts', None) or {}).get(sid, 0)
+    return total, own
+
+
+def _replace_session_sidecar(tmp: Path, path: Path, session_id) -> None:
+    _note_sidecar_write(session_id)
+    try:
+        _safe_replace(tmp, path)
+    finally:
+        _note_sidecar_write(session_id)
+
+
+_DRAFT_LIFECYCLE_LOCK_STRIPES: "tuple[threading.Lock, ...]" = tuple(
+    threading.Lock() for _ in range(64)
+)
+_DRAFT_LIFECYCLE_LOCK_STRIPE_COUNT = len(_DRAFT_LIFECYCLE_LOCK_STRIPES)
+
+
+def _draft_lifecycle_lock_for_session_id(session_id: str) -> threading.Lock:
+    """Return the per-session lock that serializes draft save/delete operations."""
+    sid = _normalize_session_id_for_path(session_id)
+    if not sid:
+        raise ValueError(f"Unsafe session_id {session_id!r}; refusing to lock draft lifecycle")
+    sid_index = int(hashlib.sha256(sid.encode("utf-8")).hexdigest(), 16)
+    lock_index = sid_index % _DRAFT_LIFECYCLE_LOCK_STRIPE_COUNT
+    # Fixed lock striping bounds registry growth. Rare hash collisions only
+    # serialize small draft operations; increase the stripe count if measured
+    # contention warrants it.
+    return _DRAFT_LIFECYCLE_LOCK_STRIPES[lock_index]
+
+
+def _session_draft_path(session_id: str) -> Path:
+    """Return the per-session draft sidecar path.
+
+    This is deliberately separate from the full session sidecar so draft edits do
+    not force multi-MB full-session rewrites.
+    """
+    sid = _normalize_session_id_for_path(session_id)
+    if not sid:
+        raise ValueError(f"Unsafe session_id {session_id!r}; refusing to resolve draft path")
+    return _session_draft_dir() / f'{sid}.json'
+
+
+def _normalize_session_id_for_path(session_id) -> str | None:
+    sid = str(session_id or "").strip()
+    if not sid or not is_safe_session_id(sid):
+        return None
+    return sid
+
+
+def _session_draft_dir() -> Path:
+    return SESSION_DIR / ".drafts"
+
+
+def _load_session_draft(session_id: str) -> dict | None:
+    """Load a dedicated draft payload if it exists, else return None."""
+    if not _normalize_session_id_for_path(session_id):
+        return None
+    try:
+        path = _session_draft_path(session_id)
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(payload, dict):
+            return payload
+        logger.warning("Ignoring non-dict draft payload in %s", path)
+        return None
+    except json.JSONDecodeError as exc:
+        logger.warning("Ignoring malformed draft sidecar %s: %s", path, exc)
+        return None
+    except Exception as exc:
+        logger.debug("Failed to load draft sidecar %s: %s", path, exc)
+        return None
+
+
+def _apply_session_draft_overlay(data: dict, session_id: str) -> dict:
+    """Overlay dedicated draft payload onto an already-parsed session payload."""
+    if not isinstance(data, dict):
+        return data
+    draft = _load_session_draft(session_id)
+    if isinstance(draft, dict):
+        data["composer_draft"] = draft
+    return data
+
+
+def _save_session_draft(session_id: str, draft) -> None:
+    """Persist a draft payload to the dedicated per-session draft sidecar."""
+    if not _normalize_session_id_for_path(session_id):
+        raise ValueError(f"Unsafe session_id {session_id!r}; refusing to persist dedicated draft")
+    sid = _normalize_session_id_for_path(session_id)
+    lock = _draft_lifecycle_lock_for_session_id(sid)
+    with lock:
+        _session_draft_dir().mkdir(parents=True, exist_ok=True)
+        path = _session_draft_path(sid)
+        payload = draft if isinstance(draft, dict) else {}
+        tmp = path.with_name(
+            f'{path.name}.tmp.{os.getpid()}.{threading.current_thread().ident}'
+        )
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            if not (SESSION_DIR / f"{sid}.json").exists():
+                return
+            _safe_replace(tmp, path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _delete_session_draft_by_dir(session_id: str, sessions_dir: Path) -> bool:
+    """Delete the dedicated draft sidecar for session_id under sessions_dir.
+
+    Returns True when deletion succeeds or the file is already absent; False
+    when the path cannot be removed due to unexpected IO/error.
+    """
+    if not _normalize_session_id_for_path(session_id):
+        return True
+    sid = _normalize_session_id_for_path(session_id)
+    lock = _draft_lifecycle_lock_for_session_id(sid)
+    with lock:
+        try:
+            draft_path = sessions_dir / ".drafts" / f"{sid}.json"
+            draft_path.unlink(missing_ok=True)
+        except Exception:
+            logger.debug(
+                "Failed to delete draft sidecar for %s in %s",
+                session_id,
+                sessions_dir,
+                exc_info=True,
+            )
+            return False
+        return True
+
+
+def _delete_session_draft(session_id: str) -> bool:
+    """Delete the dedicated draft sidecar for *session_id*."""
+    return _delete_session_draft_by_dir(session_id, SESSION_DIR)
+
+
+# Serializes index writers so concurrent Session.save() calls cannot race on
+# stale baselines while still allowing LOCK to be released before disk I/O.
+_INDEX_WRITE_LOCK = threading.RLock()
+_SESSION_INDEX_REBUILD_LOCK = threading.Lock()
+_SESSION_INDEX_REBUILD_THREAD = None
+_SESSION_INDEX_REBUILD_THREAD_TARGET: tuple[Path, Path] | None = None
+
+# Serializes ``_record_webui_zero_message_orphan_tombstone`` /
+# ``_clear_webui_zero_message_orphan_tombstone`` so two concurrent sidebar
+# polls (or a poll racing ``Session.save`` / ``new_session`` /
+# ``import_cli_session``) cannot lose each other's load-modify-write/unlink.
+# Without this lock each operation rewrites the entire tombstone file from
+# scratch, so a concurrent recorder and clearer can land last-writer-wins and
+# silently drop each other's update — defeating the self-healing invariant
+# that ``Session.save`` clears the tombstone the same poll that re-prunes
+# would otherwise re-add the row for. ``threading.Lock`` is sufficient (the
+# WebUI sidebar polling path is single-process) but must wrap the WHOLE
+# load-modify-write/unlink sequence in both helpers.
+_WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_LOCK = threading.Lock()
+_WEBUI_DELETED_SESSION_TOMBSTONE_LOCK = threading.Lock()
+
+# Path-safety contract for session IDs.  Accept alphanumerics, underscore, and
+# hyphen so API/gateway-issued ids (``api-*``, ``reachy-voice-*``) round-trip
+# through filesystem load/save/delete/worktree paths without traversal risk.
+# Dots and slashes are rejected so the id can never name a parent directory
+# or hide an unexpected extension.
+_SAFE_SID_CHARS = frozenset(
+    '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-'
+)
+
+
+def is_safe_session_id(sid) -> bool:
+    """Return True iff ``sid`` is a non-empty path-safe session id.
+
+    Centralizes the validation previously duplicated across
+    ``Session.load``, ``Session.load_metadata_only``,
+    ``_repair_stale_pending``, ``/api/session/worktree/remove``, and
+    ``/api/session/delete`` so every call site agrees on what characters
+    are allowed.  See #3023.
+    """
+    if not sid or not isinstance(sid, str):
+        return False
+    return all(c in _SAFE_SID_CHARS for c in sid)
+
+
+def _cleanup_stale_tmp_files() -> None:
+    """Best-effort removal of stale ``*.tmp.*`` files from SESSION_DIR.
+
+    Only files whose mtime is older than ``_STALE_TMP_AGE_SECONDS`` are
+    removed so that in-flight writes from a long-running sibling process
+    are not disturbed.  Errors are logged and swallowed — this must never
+    prevent startup.
+    """
+    cutoff = time.time() - _STALE_TMP_AGE_SECONDS
+    for base in (SESSION_DIR, _session_draft_dir()):
+        try:
+            for p in base.glob('*.tmp.*'):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink(missing_ok=True)
+                        logger.debug("Cleaned up stale tmp file: %s", p)
+                except OSError:
+                    pass  # best-effort
+        except Exception:
+            pass  # SESSION_DIR may not exist yet; that's fine
+
+
+_PERSISTED_SESSION_IDS_CACHE: tuple[Path | None, int | None, frozenset[str]] = (None, None, frozenset())
+
+
+def _persisted_session_ids_snapshot() -> frozenset[str]:
+    """Return persisted session ids, caching the directory snapshot by mtime.
+
+    `/api/sessions` and incremental index writes may run every few seconds. A
+    full `SESSION_DIR.glob('*.json')` on a large session directory is expensive,
+    and doing that scan while request threads contend on LOCK makes the sidebar
+    look like it was designed by a committee of glaciers. Cache the listing until
+    the directory mtime changes, and let callers take the snapshot before
+    entering critical sections.
+    """
+    global _PERSISTED_SESSION_IDS_CACHE
+    try:
+        dir_mtime_ns = SESSION_DIR.stat().st_mtime_ns
+    except Exception:
+        dir_mtime_ns = None
+    cached_dir, cached_mtime_ns, cached_ids = _PERSISTED_SESSION_IDS_CACHE
+    if cached_dir == SESSION_DIR and cached_mtime_ns == dir_mtime_ns:
+        return cached_ids
+    try:
+        ids = frozenset(
+            p.stem
+            for p in SESSION_DIR.glob('*.json')
+            if not p.name.startswith('_')
+        )
+    except Exception:
+        ids = frozenset()
+    _PERSISTED_SESSION_IDS_CACHE = (SESSION_DIR, dir_mtime_ns, ids)
+    return ids
+
+
+def _session_dir_has_persisted_session_files() -> bool:
+    """Return True when the current session dir has at least one session JSON file."""
+    try:
+        return any(not p.name.startswith('_') for p in SESSION_DIR.glob('*.json'))
+    except Exception:
+        return False
+
+
+def _rebuild_session_index_background(expected_session_dir: Path, expected_index_file: Path) -> None:
+    global _SESSION_INDEX_REBUILD_THREAD, _SESSION_INDEX_REBUILD_THREAD_TARGET
+    current_thread = threading.current_thread()
+    try:
+        with _SESSION_INDEX_REBUILD_LOCK:
+            if SESSION_DIR != expected_session_dir or SESSION_INDEX_FILE != expected_index_file:
+                return
+        _write_session_index(
+            updates=None,
+            session_dir=expected_session_dir,
+            session_index_file=expected_index_file,
+        )
+    except Exception:
+        logger.debug("Background session-index rebuild failed", exc_info=True)
+    finally:
+        with _SESSION_INDEX_REBUILD_LOCK:
+            if _SESSION_INDEX_REBUILD_THREAD is current_thread and _SESSION_INDEX_REBUILD_THREAD_TARGET == (
+                expected_session_dir,
+                expected_index_file,
+            ):
+                _SESSION_INDEX_REBUILD_THREAD = None
+                _SESSION_INDEX_REBUILD_THREAD_TARGET = None
+
+
+def _start_session_index_rebuild_thread() -> None:
+    """Start one background full-index rebuild if the index is missing."""
+    global _SESSION_INDEX_REBUILD_THREAD, _SESSION_INDEX_REBUILD_THREAD_TARGET
+    target = (SESSION_DIR, SESSION_INDEX_FILE)
+    with _SESSION_INDEX_REBUILD_LOCK:
+        if SESSION_INDEX_FILE.exists():
+            return
+        if (
+            _SESSION_INDEX_REBUILD_THREAD is not None
+            and _SESSION_INDEX_REBUILD_THREAD.is_alive()
+            and _SESSION_INDEX_REBUILD_THREAD_TARGET == target
+        ):
+            return
+        _SESSION_INDEX_REBUILD_THREAD_TARGET = target
+        _SESSION_INDEX_REBUILD_THREAD = threading.Thread(
+            target=_rebuild_session_index_background,
+            args=target,
+            name="session-index-rebuild",
+            daemon=True,
+        )
+        _SESSION_INDEX_REBUILD_THREAD.start()
+
+
+def _index_entry_exists(session_id: str, in_memory_ids=None) -> bool:
+    """Return True if an index entry still has backing state.
+
+    A session can legitimately exist either as a persisted JSON file or as an
+    in-memory Session object that has not been flushed yet.  This helper is used
+    to prune stale `_index.json` rows left behind after session-id rotation or
+    file removal.
+    """
+    if not session_id:
+        return False
+    if in_memory_ids is None:
+        with LOCK:
+            in_memory_ids = set(SESSIONS.keys())
+    if session_id in in_memory_ids:
+        return True
+    p = SESSION_DIR / f'{session_id}.json'
+    return p.exists()
+
+
+def _write_session_index(updates=None, *, session_dir: Path | None = None, session_index_file: Path | None = None):
+    """Update the session index file.
+
+    When *updates* is provided (a list of Session objects whose compact
+    entries should be refreshed), this does a targeted in-place update of
+    the existing index — O(1) for single-session changes.  When *updates*
+    is None, a full rebuild is performed (used on startup / first call).
+
+    LOCK protects only in-memory session snapshots.  JSON parsing, payload
+    construction, and disk I/O run outside LOCK so active-stream saves do not
+    block ordinary session reads longer than necessary.  The on-disk index
+    read-modify-write is NOT unsynchronized: it stays fully serialized by
+    ``_INDEX_WRITE_LOCK`` (held across this whole function), so narrowing LOCK
+    cannot introduce a lost-update or index-corruption race between writers.
+    """
+    session_dir = session_dir or SESSION_DIR
+    session_index_file = session_index_file or SESSION_INDEX_FILE
+    _tmp = session_index_file.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
+
+    with _INDEX_WRITE_LOCK:
+        # Lazy full-rebuild path — used when index doesn't exist yet.
+        if updates is None or not session_index_file.exists():
+            _cleanup_stale_tmp_files()  # best-effort sweep on startup / first call
+            entry_map: dict[str, dict] = {}
+            for p in session_dir.glob('*.json'):
+                if p.name.startswith('_'):
+                    continue
+                try:
+                    s = _load_session_from_path(p)
+                    if s:
+                        c = s.compact()
+                        sid = c.get('session_id')
+                        if sid:
+                            # Dedup by session_id: prefer entry with more messages
+                            # (handles old-format session_xxx.json files alongside
+                            #  WebUI-format xxx.json with the same session_id)
+                            existing = entry_map.get(sid)
+                            if existing is None or (
+                                c.get('message_count', 0) > existing.get('message_count', 0)
+                            ):
+                                entry_map[sid] = c
+                except Exception:
+                    logger.debug("Failed to load session from %s", p)
+            entries = list(entry_map.values())
+
+            existing_ids = set(entry_map.keys())
+            with LOCK:
+                in_memory_entries = [
+                    s.compact()
+                    for s in SESSIONS.values()
+                    if s.session_id not in existing_ids
+                ]
+            entries.extend(in_memory_entries)
+            entries.sort(key=lambda s: s.get('updated_at', 0), reverse=True)
+            _payload = json.dumps(entries, ensure_ascii=False, indent=2)
+
+            try:
+                with open(_tmp, 'w', encoding='utf-8') as f:
+                    f.write(_payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                _safe_replace(_tmp, session_index_file)
+            except Exception:
+                # Best-effort cleanup of stale tmp on failure
+                try:
+                    _tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+            return
+
+        # Fast path: patch existing index with updated sessions.
+        # This avoids loading every session file on every single save().
+        _fallback = False
+        try:
+            # Avoid N filesystem exists() checks under LOCK by collecting
+            # on-disk IDs once before entering the critical section.
+            on_disk_ids = _persisted_session_ids_snapshot()
+            existing = json.loads(session_index_file.read_bytes())
+            if not isinstance(existing, list):
+                raise ValueError("session index must be a list")
+            with LOCK:
+                in_memory_ids = set(SESSIONS.keys())
+                updated_map = {s.session_id: s.compact() for s in updates}
+
+            existing = [
+                e for e in existing
+                if (e.get('session_id') in in_memory_ids or e.get('session_id') in on_disk_ids)
+            ]
+
+            existing_ids = {e.get('session_id') for e in existing}
+            # Add any updated entries not yet in the index.
+            for sid, entry in updated_map.items():
+                if sid not in existing_ids:
+                    existing.append(entry)
+            # Replace matching entries in-place.
+            for i, e in enumerate(existing):
+                sid = e.get('session_id')
+                if sid in updated_map:
+                    existing[i] = updated_map[sid]
+            existing.sort(key=lambda s: s.get('updated_at', 0), reverse=True)
+            _payload = json.dumps(existing, ensure_ascii=False, indent=2)
+
+            try:
+                with open(_tmp, 'w', encoding='utf-8') as f:
+                    f.write(_payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                _safe_replace(_tmp, session_index_file)
+            except Exception:
+                try:
+                    _tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+        except Exception:
+            _fallback = True
+
+    if _fallback:
+        # Corrupt or missing index — fall back to full rebuild (called outside LOCK to avoid deadlock).
+        # Propagate the resolved target so a rebuild scoped to a specific session dir
+        # (the background rebuild thread) falls back to rebuilding THAT dir's index,
+        # not the global SESSION_DIR (Opus advisor, stage-344 — defensive; today the
+        # only kwargs-caller passes updates=None and never reaches the fast path).
+        _write_session_index(
+            updates=None,
+            session_dir=session_dir,
+            session_index_file=session_index_file,
+        )
+
+
+def prune_session_from_index(session_id: str) -> None:
+    """Remove one session row from the persisted sidebar index if present."""
+    sid = str(session_id or "")
+    if not sid or not SESSION_INDEX_FILE.exists():
+        return
+    _tmp = SESSION_INDEX_FILE.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
+
+    _fallback = False
+    with _INDEX_WRITE_LOCK:
+        try:
+            with LOCK:
+                existing = json.loads(SESSION_INDEX_FILE.read_bytes())
+                if not isinstance(existing, list):
+                    raise ValueError("session index must be a list")
+                pruned = [e for e in existing if e.get('session_id') != sid]
+                if len(pruned) == len(existing):
+                    return
+                _payload = json.dumps(pruned, ensure_ascii=False, indent=2)
+
+            try:
+                with open(_tmp, 'w', encoding='utf-8') as f:
+                    f.write(_payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                _safe_replace(_tmp, SESSION_INDEX_FILE)
+            except Exception:
+                try:
+                    _tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+        except Exception:
+            _fallback = True
+
+    if _fallback:
+        _write_session_index(updates=None)
+
+
+# ---------------------------------------------------------------------------
+# #4985 webui zero-message orphan tombstone
+# ---------------------------------------------------------------------------
+# ``prune_session_from_index()`` only removes a row from SESSION_INDEX_FILE —
+# the on-disk sidecar at ``SESSION_DIR / f"{sid}.json"`` is intentionally
+# kept (it may hold legitimate WebUI-owned metadata a future code path wants
+# to recover). On the next ``/api/sessions`` poll, ``all_sessions()``'s
+# ``recover_missing_index_sidecars`` pass (``missing_persisted_ids``) sees
+# the orphaned sidecar, re-loads it via ``Session.load_metadata_only()``,
+# and writes it back to SESSION_INDEX_FILE — undoing the prune.
+#
+# For #4985 zero-message webui orphans, that round-trip would also re-add
+# the row to the sidebar (it survives #1171 because it is titled or has a
+# stale positive message_count), so the next prune fires again. N orphans
+# therefore cost 2N fsync'd index writes + N state.db probes per poll,
+# forever. The fix is a small, dedicated tombstone set written alongside
+# the prune: any sid in the tombstone is skipped by
+# ``recover_missing_index_sidecars`` (no re-add to index) and is therefore
+# never re-presented to the prune batch.
+#
+# The file lives in SESSION_DIR (sibling of _index.json) so it is
+# profile-local and survives across processes, and is intentionally NOT
+# itself listed as a session sidecar — it is excluded from
+# ``_persisted_session_ids_snapshot()`` via the same ``name.startswith('_')``
+# convention (its name starts with ``.``, a dot — but we add a dedicated
+# check below for paranoia). Bounded size keeps the file from growing
+# without limit on long-running installs.
+# ---------------------------------------------------------------------------
+
+WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_CAP = 500
+WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_VERSION = 1
+WEBUI_DELETED_SESSION_TOMBSTONE_CAP = 1000
+WEBUI_DELETED_SESSION_TOMBSTONE_VERSION = 1
+
+
+def _webui_zero_message_orphan_tombstone_file() -> "Path":
+    """Return the current tombstone file path.
+
+    Resolved at call time (not module load) so tests that monkeypatch
+    ``SESSION_DIR`` (e.g. ``_real_pipeline``) get a per-test path without
+    having to also rewrite the module-level constant. Mirrors how
+    ``SESSION_INDEX_FILE`` is computed but resolved at call time so the
+    real path tracks the live ``SESSION_DIR``.
+    """
+    return SESSION_DIR / "_pruned_webui_orphans.json"
+
+
+def _load_webui_zero_message_orphan_tombstone() -> frozenset[str]:
+    """Return sids we've explicitly pruned as webui zero-message orphans.
+
+    Degrades to ``frozenset()`` on any read error, missing file, version
+    mismatch, or schema mismatch so the recovery path never accidentally
+    admits a row that should stay tombstoned.
+    """
+    p = _webui_zero_message_orphan_tombstone_file()
+    if not p.exists():
+        return frozenset()
+    try:
+        raw = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        logger.debug(
+            "Failed to load webui zero-message orphan tombstone",
+            exc_info=True,
+        )
+        return frozenset()
+    if not isinstance(raw, dict):
+        return frozenset()
+    try:
+        if int(raw.get("version", 0)) != WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_VERSION:
+            return frozenset()
+    except (TypeError, ValueError):
+        return frozenset()
+    ids = raw.get("ids", [])
+    if not isinstance(ids, list):
+        return frozenset()
+    return frozenset(
+        str(sid).strip() for sid in ids if str(sid or "").strip()
+    )
+
+
+def _save_webui_zero_message_orphan_tombstone(ids) -> None:
+    """Persist the tombstone set with a bounded size cap (lexicographically-first N entries).
+
+    Sorts + dedupes so the on-disk file is deterministic and diff-friendly.
+    Atomic write via ``.tmp.<pid>.<tid>`` + ``os.replace`` mirrors
+    ``_write_session_index`` and ``Session.save`` so a crash mid-write does
+    not leave a half-written tombstone file.
+
+    Note on eviction order: ``sorted_ids[:WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_CAP]``
+    keeps the lexicographically-FIRST ``N`` sids (sorted ascending), not the
+    last-pruned ``N``. Session ids are random UUIDs (``uuid.uuid4().hex[:12]``),
+    so the eviction is effectively random across installs; the cap exists to
+    keep the file bounded on long-running installs, not to implement FIFO
+    pruning. If true FIFO is ever needed, switch the slice to ``[-N:]`` and
+    keep an insertion-ordered data structure.
+    """
+    try:
+        sorted_ids = sorted(set(
+            str(sid).strip() for sid in (ids or []) if str(sid or "").strip()
+        ))
+    except TypeError:
+        return
+    if len(sorted_ids) > WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_CAP:
+        sorted_ids = sorted_ids[-WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_CAP:]
+    payload = {
+        "version": WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_VERSION,
+        "ids": sorted_ids,
+    }
+    p = _webui_zero_message_orphan_tombstone_file()
+    _tmp = None
+    try:
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        _tmp = p.with_suffix(
+            f'.tmp.{os.getpid()}.{threading.current_thread().ident}'
+        )
+        with open(_tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, p)
+    except Exception:
+        logger.debug(
+            "Failed to save webui zero-message orphan tombstone",
+            exc_info=True,
+        )
+        if _tmp is not None:
+            try:
+                _tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _record_webui_zero_message_orphan_tombstone(sid: str) -> None:
+    """Add ``sid`` to the tombstone.
+
+    No-op if already present (avoids re-sorting and re-fsync'ing on every
+    redundant prune). Called from the ``#4985`` prune helper in
+    ``api.routes`` immediately after ``prune_session_from_index``.
+
+    Wraps the entire load-modify-write in ``_WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_LOCK``
+    so two concurrent sidebar polls (or a poll racing ``Session.save`` /
+    ``new_session`` / ``import_cli_session``) cannot lose each other's
+    writes. Without the lock each operation rewrites the entire tombstone
+    file from scratch, so a concurrent recorder and clearer can land
+    last-writer-wins and silently drop each other's update — defeating the
+    self-healing invariant that ``Session.save`` clears the tombstone the
+    same poll that the prune helper re-prunes would otherwise re-add the
+    row for.
+    """
+    sid = str(sid or "").strip()
+    if not sid:
+        return
+    with _WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_LOCK:
+        current = set(_load_webui_zero_message_orphan_tombstone())
+        if sid in current:
+            return
+        current.add(sid)
+        _save_webui_zero_message_orphan_tombstone(current)
+
+
+def _clear_webui_zero_message_orphan_tombstone(sid: str) -> None:
+    """Remove ``sid`` from the tombstone.
+
+    Called when a new Session is created with an explicit sid (e.g.
+    ``new_session()`` / ``import_cli_session()``) and belt-and-suspenders
+    whenever ``Session.save`` writes a real conversation (a save with
+    ``len(messages) > 0`` proves the row is alive, so the tombstone entry
+    must drop). Safe to call with an unknown sid (no-op). If the tombstone
+    becomes empty as a result, the file is removed entirely so an empty
+    poll-time load stays free.
+
+    Wraps the entire load-modify-write/unlink in
+    ``_WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_LOCK`` so concurrent
+    recorders/clearers cannot lose each other's writes — see the docstring
+    on ``_record_webui_zero_message_orphan_tombstone``.
+    """
+    sid = str(sid or "").strip()
+    if not sid:
+        return
+    with _WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_LOCK:
+        current = set(_load_webui_zero_message_orphan_tombstone())
+        if sid not in current:
+            return
+        current.discard(sid)
+        if current:
+            _save_webui_zero_message_orphan_tombstone(current)
+            return
+        try:
+            _webui_zero_message_orphan_tombstone_file().unlink(missing_ok=True)
+        except Exception:
+            logger.debug(
+                "Failed to remove empty webui zero-message orphan tombstone",
+                exc_info=True,
+            )
+
+
+def _webui_deleted_session_tombstone_file() -> "Path":
+    return SESSION_DIR / "_deleted_webui_sessions.json"
+
+
+def _load_webui_deleted_session_tombstone() -> frozenset[str]:
+    p = _webui_deleted_session_tombstone_file()
+    if not p.exists():
+        return frozenset()
+    try:
+        raw = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        logger.debug("Failed to load webui deleted-session tombstone", exc_info=True)
+        return frozenset()
+    if not isinstance(raw, dict):
+        return frozenset()
+    try:
+        if int(raw.get("version", 0)) != WEBUI_DELETED_SESSION_TOMBSTONE_VERSION:
+            return frozenset()
+    except (TypeError, ValueError):
+        return frozenset()
+    ids = raw.get("ids", [])
+    if not isinstance(ids, list):
+        return frozenset()
+    return frozenset(
+        str(sid).strip() for sid in ids if str(sid or "").strip()
+    )
+
+
+def _save_webui_deleted_session_tombstone(ids) -> None:
+    try:
+        sorted_ids = sorted(set(
+            str(sid).strip() for sid in (ids or []) if str(sid or "").strip()
+        ))
+    except TypeError:
+        return
+    if len(sorted_ids) > WEBUI_DELETED_SESSION_TOMBSTONE_CAP:
+        sorted_ids = sorted_ids[-WEBUI_DELETED_SESSION_TOMBSTONE_CAP:]
+    payload = {
+        "version": WEBUI_DELETED_SESSION_TOMBSTONE_VERSION,
+        "ids": sorted_ids,
+    }
+    p = _webui_deleted_session_tombstone_file()
+    _tmp = None
+    try:
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        _tmp = p.with_suffix(
+            f'.tmp.{os.getpid()}.{threading.current_thread().ident}'
+        )
+        with open(_tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, p)
+    except Exception:
+        logger.debug("Failed to save webui deleted-session tombstone", exc_info=True)
+        if _tmp is not None:
+            try:
+                _tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _record_webui_deleted_session_tombstone(sid: str) -> None:
+    sid = str(sid or "").strip()
+    if not sid:
+        return
+    with _WEBUI_DELETED_SESSION_TOMBSTONE_LOCK:
+        current = set(_load_webui_deleted_session_tombstone())
+        if sid in current:
+            return
+        current.add(sid)
+        _save_webui_deleted_session_tombstone(current)
+
+
+def _clear_webui_deleted_session_tombstone(sid: str) -> None:
+    sid = str(sid or "").strip()
+    if not sid:
+        return
+    with _WEBUI_DELETED_SESSION_TOMBSTONE_LOCK:
+        current = set(_load_webui_deleted_session_tombstone())
+        if sid not in current:
+            return
+        current.discard(sid)
+        if current:
+            _save_webui_deleted_session_tombstone(current)
+            return
+        try:
+            _webui_deleted_session_tombstone_file().unlink(missing_ok=True)
+        except Exception:
+            logger.debug("Failed to remove empty webui deleted-session tombstone", exc_info=True)
+
+
+def _content_has_reasoning_only_parts(content) -> bool:
+    if not isinstance(content, list) or not content:
+        return False
+    saw_reasoning = False
+    for part in content:
+        if not isinstance(part, dict):
+            if str(part or '').strip():
+                return False
+            continue
+        part_type = str(part.get('type') or '').lower()
+        if part_type in {'thinking', 'reasoning'}:
+            text = part.get('thinking') or part.get('reasoning') or part.get('text') or ''
+            if str(text).strip():
+                saw_reasoning = True
+            continue
+        if part_type == 'text' and str(part.get('text') or part.get('content') or '').strip():
+            return False
+        if part_type not in {'text', 'thinking', 'reasoning'}:
+            return False
+    return saw_reasoning
+
+
+def _active_stream_ids():
+    with STREAMS_LOCK:
+        active_ids = set(STREAMS.keys())
+    # STREAMS tracks the browser/SSE observation path. A worker can still be
+    # running after the SSE stream entry disappears (for example while a request
+    # is blocked in the provider, unwinding after cancel, or otherwise detached
+    # from the client). Treat ACTIVE_RUNS as authoritative for worker liveness so
+    # stale-pending repair does not append a misleading restart/interrupted
+    # marker while the agent turn is still in flight.
+    with _cfg.ACTIVE_RUNS_LOCK:
+        active_ids.update(_cfg.ACTIVE_RUNS.keys())
+    return active_ids
+
+
+def _recovered_model_context_projection(message: dict) -> dict | None:
+    if not isinstance(message, dict) or message.get('_recovered_display_only') is True:
+        return None
+    projected = dict(message)
+    projected.pop('reasoning', None)
+    if projected.get('_error'):
+        return None
+    if _content_has_reasoning_only_parts(projected.get('content')):
+        if projected.get('tool_calls'):
+            projected['content'] = ''
+        else:
+            return None
+    projected_text = _normalize_journal_recovery_text(projected.get('content'))
+    if not projected_text and not projected.get('tool_call_id') and not projected.get('tool_calls'):
+        return None
+    return projected
+
+
+def _append_recovered_context_projection(
+    session,
+    context_messages: list,
+    recovered: dict,
+) -> None:
+    recovered_text = _normalize_journal_recovery_text(recovered.get('content'))
+    if recovered_text:
+        if recovered.get('role') == 'user':
+            if _message_matches_pending_checkpoint(
+                context_messages[-1] if context_messages else None,
+                recovered.get('content'),
+                recovered.get('timestamp'),
+                recovered.get('_source'),
+                recovered.get('attachments'),
+            ):
+                return
+        else:
+            for existing in reversed(context_messages[-8:]):
+                if not isinstance(existing, dict) or existing.get('role') != recovered.get('role'):
+                    continue
+                if _normalize_journal_recovery_text(existing.get('content')) == recovered_text:
+                    return
+    context_messages.append(dict(recovered))
+
+
+def _seed_recovered_context_from_messages(session, context_messages: list) -> None:
+    for message in getattr(session, 'messages', None) or []:
+        projected = _recovered_model_context_projection(message)
+        if projected is None:
+            continue
+        context_messages.append(projected)
+
+
+def _append_recovered_turn_to_context(session, recovered: dict) -> None:
+    context_messages = getattr(session, 'context_messages', None)
+    if not isinstance(context_messages, list):
+        context_messages = []
+        session.context_messages = context_messages
+    if not context_messages:
+        _seed_recovered_context_from_messages(session, context_messages)
+    projected = _recovered_model_context_projection(recovered)
+    if projected is None:
+        return
+    _append_recovered_context_projection(session, context_messages, projected)
+
+
+def _recovered_pending_timestamp(value=None) -> int | float:
+    """Retain the pending intent's exact finite time, with the legacy fallback."""
+    if type(value) in (int, float) and value > 0 and (type(value) is int or math.isfinite(value)):
+        return value
+    return int(time.time())
+
+
+def _append_recovered_pending_turn(session, *, timestamp: int | float | None = None) -> dict | None:
+    pending_text = str(session.pending_user_message or '')
+    if not pending_text:
+        return None
+    recovered_ts = _recovered_pending_timestamp(timestamp)
+    recovered: dict = {
+        'role': 'user',
+        'content': session.pending_user_message,
+        'timestamp': recovered_ts,
+        '_recovered': True,
+    }
+    pending_source = getattr(session, 'pending_user_source', None)
+    stamp_message_source(recovered, pending_source, active_turn_token=_pending_active_turn_token(session))
+    if session.pending_attachments:
+        recovered['attachments'] = list(session.pending_attachments)
+    session.messages.append(recovered)
+    _append_recovered_turn_to_context(session, recovered)
+    # The new user turn is now committed to messages (#3831): advance the
+    # truncation watermark to the new message's timestamp so that
+    # merge_session_messages_append_only() still filters out replaced
+    # pre-edit rows from state.db whose timestamps fall below the boundary.
+    # The merge's sidecar_advanced_past_watermark guard allows state.db rows
+    # newer than the watermark, so post-edit turns are not dropped.
+    # Never 0.0 (the truncate-to-empty sentinel, #2914).
+    if getattr(session, 'truncation_watermark', None):
+        session.truncation_watermark = recovered_ts
+    return recovered
+
+
+def _is_streaming_session(active_stream_id, active_stream_ids):
+    return bool(active_stream_id and active_stream_id in active_stream_ids)
+
+def _session_sort_timestamp(session):
+    if isinstance(session, dict):
+        return session.get('last_message_at') or session.get('updated_at') or 0
+    return _last_message_timestamp(getattr(session, 'messages', None)) or getattr(session, 'updated_at', 0) or 0
+
+
+def _message_timestamp(message):
+    if not isinstance(message, dict):
+        return None
+    raw = message.get('_ts') or message.get('timestamp')
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_empty_partial_activity_message(message):
+    """Return True for cancelled/recovered activity rows with no reply text."""
+    if not isinstance(message, dict):
+        return False
+    if message.get('role') != 'assistant' or not message.get('_partial'):
+        return False
+    content = message.get('content', '')
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                if part.get('type') == 'text' and str(part.get('text') or part.get('content') or '').strip():
+                    return False
+                continue
+            if str(part or '').strip():
+                return False
+        return True
+    return not str(content or '').strip()
+
+
+def _last_message_timestamp(messages, *, tail_window: int = 8):
+    """perf(session-load-latency) Priority 1: bounded tail-scan.
+
+    Old behavior: reversed-iterate ALL messages until a non-tool, non-empty
+    message's timestamp is found. For a 2,730-message session on eMMC, that's
+    ~500ms of Python attribute lookups, repeated on every /api/session
+    response.
+
+    New behavior: the messages array is chronologically ordered, so the
+    last non-tool message is at the very end. We scan only the last
+    ``tail_window`` messages — covers the realistic case where 1-3 tool
+    rows sit after the last assistant/user message. Falls back to a full
+    scan only when no timestamp is found in the window, which preserves
+    exact correctness for messages with very large trailing tool clusters
+    (rare in practice; we'd need >8 consecutive tool rows to hit it).
+    """
+    if not isinstance(messages, list):
+        return None
+    n = len(messages)
+    start = max(0, n - max(1, int(tail_window)))
+    # Walk from the end backwards. reversed() over a slice still creates
+    # a full reverse iterator, but only the slice's elements are touched.
+    for message in reversed(messages[start:]):
+        if isinstance(message, dict) and message.get('role') == 'tool':
+            continue
+        if _is_empty_partial_activity_message(message):
+            continue
+        ts = _message_timestamp(message)
+        if ts:
+            return ts
+    # Window miss — fall back to the original full-reversed scan. The
+    # caller pays this cost only when the heuristic didn't find a hit,
+    # which means the session is unusual (long tool tail or all-empty
+    # messages).
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get('role') == 'tool':
+            continue
+        if _is_empty_partial_activity_message(message):
+            continue
+        ts = _message_timestamp(message)
+        if ts:
+            return ts
+    return None
+
+
+def _message_role(message):
+    if not isinstance(message, dict):
+        return ''
+    return str(message.get('role', '')).strip().lower()
+
+
+# Scan complete strings and structural delimiters in C, rather than visiting
+# every character of large metadata strings in Python. The EOF alternative also
+# consumes an unfinished string (including a dangling backslash), so braces or
+# key-like text inside a truncated string can never be mistaken for structure.
+_JSON_PREFIX_TOKENS = re.compile(r'"((?:[^"\\]+|\\[\s\S])*)("|\\?\Z)|([{}\[\]])')
+_JSON_PREFIX_ESCAPES = re.compile(r'\\([\s\S])')
+
+
+def _find_top_level_json_key(text, key):
+    """Return the character offset of a top-level JSON object key, if present."""
+    depth = 0
+    for token in _JSON_PREFIX_TOKENS.finditer(text):
+        structural = token.group(3)
+        if structural is not None:
+            depth += 1 if structural in '{[' else -1
+            continue
+        if token.group(2) != '"':
+            return None
+        if depth != 1:
+            continue
+        name = token.group(1)
+        # Match the original scanner's escape handling, not JSON unescaping:
+        # it drops the backslash and keeps the following character literally.
+        if '\\' in name:
+            name = _JSON_PREFIX_ESCAPES.sub(r'\1', name)
+        if name == key:
+            j = token.end()
+            while j < len(text) and text[j] in ' \t\r\n':
+                j += 1
+            if j < len(text) and text[j] == ':':
+                return token.start()
+    return None
+
+
+def _read_file_head(path: Path, max_prefix_bytes: int = 4096) -> str:
+    """Read at most ``max_prefix_bytes`` bytes from ``path`` and decode UTF-8."""
+    if not isinstance(path, Path):
+        path = Path(path)
+    if max_prefix_bytes <= 0:
+        return ''
+    with path.open('rb') as fp:
+        return fp.read(max_prefix_bytes).decode('utf-8', errors='ignore')
+
+
+#: Budget for the cheap metadata read. Sized as a BACKSTOP, not a target: the
+#: prefix normally stops at ``messages`` after a few KB, and the write-side field
+#: order keeps it there. The cap only matters for a sidecar already on disk whose
+#: heavy metadata blobs serialize BEFORE ``messages`` — where the old 64 KB cap
+#: turned one oversized field into a full multi-MB parse on EVERY poll (#4633).
+#: Measured case: a 73,192-byte ``compression_anchor_summary`` pushed the
+#: ``messages`` key to offset 76,603, so the read gave up 11 KB short of it.
+_METADATA_PREFIX_MAX_BYTES = 1024 * 1024
+
+#: Size of the FIRST stage of the cheap metadata read. A healthy sidecar carries
+#: its stop key (`messages`) within a few KB — the write-side field order in
+#: ``save()`` guarantees it — so every ordinary poll pays this read and stops
+#: there. The 1 MiB backstop above is only reached by a sidecar already on disk
+#: whose heavy metadata blobs really do precede ``messages`` in bulk. Without a
+#: small first stage the cheap read pulls the whole budget on the polling path
+#: even when the stop key sits at 2 KB.
+_METADATA_PREFIX_FIRST_STAGE_BYTES = 64 * 1024
+
+# Marks a sidecar as written by the CURRENT writer contract, where the
+# persisted `message_count` equals len(messages) by construction (both keys
+# land in the same atomic write). save()'s bounded-prefix shrink check trusts
+# a persisted count ONLY when this marker sits next to it in the file; see
+# _prefix_message_count(). Bump the value whenever the writer contract changes
+# meaning, so counts from an older contract fall back to the full parse.
+_MESSAGE_COUNT_MARKER = 1
+
+
+def _read_metadata_json_prefix(path, max_prefix_bytes=_METADATA_PREFIX_MAX_BYTES):
+    """Read only the metadata portion before the large arrays.
+
+    #5854: stop at the top-level ``messages`` key OR the top-level
+    ``anchor_activity_scenes`` key, whichever appears first. On the modern
+    layout scenes serialize AFTER ``messages`` so this stops at ``messages`` as
+    before (the prefix is now small — scene bodies are no longer in it). On the
+    LEGACY layout scenes serialize BEFORE ``messages`` and can be 250-480KB, so
+    stopping at ``anchor_activity_scenes`` keeps the read cheap and — critically
+    — still captures ``message_count`` (which is written before both). Without
+    the scenes-stop a legacy large-scene sidecar overflows ``max_prefix_bytes``
+    and forces a full multi-MB parse on every poll (the #4633 churn).
+    """
+    if max_prefix_bytes <= 0:
+        return None
+    # Geometric staged reads: 64 KiB, 128 KiB, 256 KiB, ... up to the backstop.
+    #
+    # The original loop read 4096 bytes at a time and re-scanned the WHOLE
+    # accumulated buffer after each chunk — two full `_find_top_level_json_key`
+    # passes (a pure-Python char loop) plus a decode per chunk. That is O(n^2) in
+    # the prefix size, and it is why the cap could not simply be raised.
+    # Measured on this function before the change:
+    #     prefix    10 KB ->     19.6 ms
+    #     prefix    60 KB ->     87.3 ms     <- already paid on EVERY poll
+    #     prefix   200 KB ->    768.9 ms
+    #     prefix   500 KB ->  4,634.7 ms
+    #     prefix   900 KB -> 14,957.1 ms     <- slower than the full parse
+    #
+    # A single `f.read(max_prefix_bytes)` fixed that complexity but pulled the
+    # whole 1 MiB backstop on every poll, even when the stop key sat at 2 KB —
+    # read amplification on a path that runs once per sidebar poll. Doubling
+    # stages keep both properties: the COMMON case stops inside the first small
+    # read, and re-scanning each accumulated stage stays linear because the stage
+    # sizes form a bounded geometric series (total work < 2x the bytes actually
+    # read, worst case). `_find_top_level_json_key` returns AT the key, so the
+    # final scan costs O(offset of the stop key), not O(stage).
+    stage = min(_METADATA_PREFIX_FIRST_STAGE_BYTES, max_prefix_bytes)
+    raw = b''
+    buf = ''
+    stop_pos = None
+    with open(path, 'rb') as f:
+        while len(raw) < max_prefix_bytes:
+            chunk = f.read(min(stage, max_prefix_bytes - len(raw)))
+            if not chunk:
+                # EOF before the stop key: no metadata prefix to serve, so the
+                # caller falls back to a full parse (same answer as a budget miss).
+                return None
+            raw += chunk
+            # A byte budget can truncate a multi-byte character at the boundary;
+            # dropping it is safe because a stop key straddling the cap is a miss
+            # either way.
+            buf = raw.decode('utf-8', errors='ignore')
+            stop_pos = _find_top_level_json_key(buf, 'messages')
+            scenes_pos = _find_top_level_json_key(buf, 'anchor_activity_scenes')
+            if scenes_pos is not None and (stop_pos is None or scenes_pos < stop_pos):
+                stop_pos = scenes_pos
+            if stop_pos is not None:
+                break
+            stage *= 2
+    if stop_pos is None:
+        return None
+    prefix = buf[:stop_pos].rstrip()
+    if prefix.endswith(','):
+        prefix = prefix[:-1].rstrip()
+    return f'{prefix}\n}}'
+
+
+def _load_session_from_path(path: Path) -> "Session | None":
+    """Load a session from an explicit JSON path without consulting SESSION_DIR."""
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
+    session_id = data.get('session_id')
+    if not isinstance(session_id, str) or not session_id:
+        session_id = path.stem
+    if path.parent == SESSION_DIR:
+        data = _apply_session_draft_overlay(data, session_id)
+    return Session(**data)
+
+
+def _lookup_index_message_count(session_id):
+    """Return the indexed message count without loading the full session file."""
+    return _index_message_count_map().get(str(session_id))
+
+
+def _index_message_count_map(entries=None) -> dict[str, int]:
+    """Return indexed message counts keyed by session id.
+
+    ``load_metadata_only()`` is called in loops for stale lineage/sidebar rows.
+    Reading and parsing ``_index.json`` once per row turns /api/sessions into an
+    accidental O(n²) poll for old sidecars that predate persisted
+    ``message_count``. Accepting already-loaded index rows lets callers reuse
+    the index they just parsed.
+    """
+    if entries is None:
+        try:
+            entries = json.loads(SESSION_INDEX_FILE.read_bytes())
+        except Exception:
+            return {}
+    if not isinstance(entries, list):
+        return {}
+    counts: dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        sid = str(entry.get('session_id') or '')
+        if not sid:
+            continue
+        count = entry.get('message_count')
+        if not isinstance(count, int):
+            try:
+                count = int(count)
+            except (TypeError, ValueError):
+                continue
+        if count >= 0:
+            counts[sid] = count
+    return counts
+
+
+def _parse_nonnegative_int(value):
+    if isinstance(value, int) and value >= 0:
+        return value
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def model_explicit_pick_signature(model, model_provider) -> str:
+    """Stable signature of a (model, provider) selection for #5979 explicit-pick
+    provenance. The persisted ``Session.model_explicit_pick_signature`` is set to
+    this when the user deliberately picks a model; the streaming resolver only
+    treats a selection as deliberate when the CURRENT routing context produces
+    the same signature. Any model/provider change (chat-start, session-update,
+    normalization, provider repair) yields a different signature and thus
+    invalidates the stale pick — so a #433 first-party leftover is never wrongly
+    preserved. Uses \\x1f (unit separator) so it can't collide with model ids.
+    """
+    _m = str(model or "").strip()
+    _p = str(model_provider or "").strip().lower()
+    return f"{_m}\x1f{_p}"
+
+
+def _deduplicate_exact_stable_messages(messages):
+    """Drop only exact replay copies that carry stable event identity.
+
+    Repeated role/content without both an id and timestamp can be a legitimate
+    later turn, so those rows are deliberately preserved.  The complete
+    dictionary is canonicalized before hashing: same-event rows with enriched
+    metadata or changed content remain distinct.
+    """
+    if not isinstance(messages, list):
+        return [], 0
+    # Persist from a deep snapshot, not only a detached outer list. A retained
+    # message can contain nested dict/list values; if those remain aliased to the
+    # owner-visible transcript, a mutation after this scan can change the bytes
+    # serialized for a deletion decision that was made against older content.
+    messages_snapshot = copy.deepcopy(messages)
+    if len(messages_snapshot) < 2:
+        return messages_snapshot, 0
+
+    seen_by_identity = {}
+    guarded = []
+    removed = 0
+
+    def _stable_identity_component(value):
+        """Return a typed exact built-in scalar, or None when untrusted."""
+        # Numeric/string subclasses (for example an IntEnum) can compare and
+        # serialize exactly like their base scalar, so accepting them would let
+        # a distinct runtime value authorize deletion.
+        if type(value) is str:
+            return ("str", value) if value.strip() else None
+        if type(value) is int:
+            return ("int", value)
+        if type(value) is float:
+            return ("float", value) if math.isfinite(value) else None
+        return None
+
+    def _is_missing_or_blank(value):
+        return value is None or (type(value) is str and not value.strip())
+
+    def _fingerprint(message):
+        try:
+            canonical = json.dumps(
+                message,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(canonical).digest()
+
+    for message in messages_snapshot:
+        if not isinstance(message, dict):
+            guarded.append(message)
+            continue
+        message_id = message.get("id")
+        message_id_component = _stable_identity_component(message_id)
+        timestamp_value = message.get("timestamp")
+        timestamp_component = _stable_identity_component(timestamp_value)
+        if timestamp_component is None and _is_missing_or_blank(timestamp_value):
+            timestamp_component = _stable_identity_component(message.get("_ts"))
+        if message_id_component is None or timestamp_component is None:
+            guarded.append(message)
+            continue
+        identity = (
+            "event",
+            message_id_component,
+            "timestamp",
+            timestamp_component,
+        )
+        seen = seen_by_identity.get(identity)
+        if seen is None:
+            # A unique identity cannot authorize a deletion. Retain its deep
+            # snapshot now and defer canonicalization until it actually repeats.
+            seen_by_identity[identity] = (message, None)
+            guarded.append(message)
+            continue
+        first, identity_variants = seen
+        if identity_variants is None:
+            identity_variants = {}
+            first_fingerprint = _fingerprint(first)
+            if first_fingerprint is not None:
+                identity_variants[first_fingerprint] = [first]
+            seen_by_identity[identity] = (first, identity_variants)
+        fingerprint = _fingerprint(message)
+        if fingerprint is None:
+            guarded.append(message)
+            continue
+        prior_variants = identity_variants.setdefault(fingerprint, [])
+        if any(prior == message for prior in prior_variants):
+            removed += 1
+            continue
+        prior_variants.append(message)
+        guarded.append(message)
+    return guarded, removed
+
+
+_SIDEBAR_HEAVY_METADATA_FIELDS = (
+    'compression_anchor_summary',
+    'compression_anchor_details',
+    'context_engine_state',
+    'compression_recovery',
+    'gateway_routing_history',
+    'composer_draft',
+    'process_wakeup_pause',
+    'share_token',
+)
+
+
+def _strip_sidebar_heavy_metadata(row: dict) -> dict:
+    """Remove detail-only values after sidebar reconciliation is complete."""
+    for key in _SIDEBAR_HEAVY_METADATA_FIELDS:
+        row.pop(key, None)
+    return row
+
+
+def _validated_webui_pending_user_timestamp_identity(session, value):
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    stream_id = getattr(session, 'active_stream_id', None)
+    source = str(getattr(session, 'pending_user_source', '') or '').strip().lower()
+    if (
+        not isinstance(stream_id, str)
+        or not stream_id
+        or value[0] != stream_id
+        or not isinstance(getattr(session, 'pending_user_message', None), str)
+        or not getattr(session, 'pending_user_message', None)
+        or source not in {'webui', 'fork'}
+    ):
+        return None
+    pending_timestamp, pending_valid = _message_exact_timestamp_details(
+        {'timestamp': getattr(session, 'pending_started_at', None)}
+    )
+    identity_timestamp, identity_valid = _message_exact_timestamp_details(
+        {'timestamp': value[1]}
+    )
+    if (
+        not pending_valid
+        or not identity_valid
+        or pending_timestamp is None
+        or pending_timestamp != identity_timestamp
+    ):
+        return None
+    return (stream_id, pending_timestamp)
+
+
+class Session:
+    def __init__(self, session_id: str=None, title: str='Untitled',
+                 workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
+                 model=DEFAULT_MODEL,
+                 model_provider=None,
+                 messages=None, created_at=None, updated_at=None,
+                 tool_calls=None, pinned: bool=False, archived: bool=False,
+                 project_id: str=None, profile=None,
+                 input_tokens: int=0, output_tokens: int=0, estimated_cost=None,
+                 cache_read_tokens: int=0, cache_write_tokens: int=0,
+                 personality=None,
+                 active_stream_id: str=None,
+                 pending_user_message: str=None,
+                 pending_attachments=None,
+                 pending_started_at=None,
+                 pending_user_source: str=None,
+                 context_messages=None,
+                 compression_anchor_visible_idx=None,
+                 compression_anchor_message_key=None,
+                 compression_anchor_summary=None,
+                 pre_compression_snapshot: bool=False,
+                 pre_compression_continuation_session_id: str=None,
+                 context_engine=None,
+                 compression_anchor_engine=None,
+                 compression_anchor_mode=None,
+                 compression_anchor_details=None,
+                 context_engine_state=None,
+                 context_length=None, threshold_tokens=None,
+                 last_prompt_tokens=None,
+                 post_compression_context_tokens_estimate=None,
+                 compression_recovery=None,
+                 recommended_recovery_action=None,
+                 compression_recovery_source_session_id=None,
+                 compression_recovery_action=None,
+                 truncation_watermark=None,
+                 truncation_boundary=None,
+                 clear_generation=None,
+                 intentional_shrink_generation=None,
+                 transcript_generation: int=0,
+                 transcript_generation_baseline: int=0,
+                 gateway_routing=None, gateway_routing_history=None,
+                 last_used_model=None,
+                 llm_title_generated: bool=False,
+                 manual_title: bool=False,
+                parent_session_id: str=None,
+                worktree_path=None,
+                worktree_branch=None,
+                 worktree_repo_root=None,
+                 worktree_created_at=None,
+                 enabled_toolsets=None,
+                 composer_draft=None,
+                 anchor_activity_scenes=None,
+                 process_wakeup_pause=None,
+                 share_token=None,
+                 share_created_at=None,
+                 gateway_run=None,
+                 delegation_reservation=None,
+                 delegation_cutoff_ts=None,
+                 **kwargs):
+        self.session_id = session_id or uuid.uuid4().hex[:12]
+        self.title = title
+        self.profile = profile
+        self.workspace = str(_resolve_path(workspace, profile=profile))
+        # #6672: immutable snapshot of the workspace at session creation time.
+        # s.workspace is updated on every turn when the user switches workspaces
+        # mid-session via the WebUI header dropdown; interpolating the live
+        # value into the system prompt would mutate msg[0] and invalidate LLM
+        # prefix caches (APC/Radix Tree) for the whole transcript. Freeze the
+        # original workspace here and keep the active workspace out of the
+        # system prompt (mid-session switches ride on the [Workspace::v1: ...]
+        # tag appended to the active user turn instead). Legacy sessions
+        # without a persisted created_workspace fall back to the workspace
+        # recorded on disk, which is the best available approximation.
+        self.created_workspace = (
+            str(_resolve_path(created_workspace, profile=profile))
+            if created_workspace
+            else self.workspace
+        )
+        self.model = model
+        self.model_provider = str(model_provider).strip().lower() if model_provider else None
+        # #5979: signature of the model the user DELIBERATELY picked this session
+        # (``"<model>\x1f<provider>"``), or None. Used by the streaming resolver
+        # to preserve a custom-proxy vendor namespace on a COLD catalog ONLY when
+        # the current routing context still matches what was picked. Storing a
+        # SIGNATURE (not a bare bool) means any later model/provider change — via
+        # /api/chat/start, /api/session/update, normalization, or provider repair
+        # — automatically invalidates the pick (the signatures no longer match),
+        # so a stale first-party leftover (#433) is never wrongly preserved.
+        # Restored from persisted metadata on load (arrives via **kwargs).
+        self.model_explicit_pick_signature = kwargs.get('model_explicit_pick_signature') or None
+        # Preserve malformed persisted containers so save() can fail closed
+        # instead of silently normalizing a dict/string to an empty transcript.
+        self.messages = messages if messages is not None else []
+        self.tool_calls = tool_calls or []
+        self.created_at = created_at or time.time()
+        self.updated_at = updated_at or time.time()
+        self.pinned = bool(pinned)
+        self.archived = bool(archived)
+        self.project_id = project_id or None
+        self.profile = profile
+        self.input_tokens = input_tokens or 0
+        self.output_tokens = output_tokens or 0
+        self.estimated_cost = estimated_cost
+        self.cache_read_tokens = cache_read_tokens or 0
+        self.cache_write_tokens = cache_write_tokens or 0
+        self.personality = personality
+        self.active_stream_id = active_stream_id
+        self.pending_user_message = pending_user_message
+        self.pending_attachments = pending_attachments or []
+        self.pending_started_at = pending_started_at
+        self.pending_user_source = pending_user_source
+        self._webui_pending_user_timestamp_identity = (
+            _validated_webui_pending_user_timestamp_identity(
+                self, kwargs.get('_webui_pending_user_timestamp_identity')
+            )
+        )
+        self.context_messages = context_messages if isinstance(context_messages, list) else []
+        self.compression_anchor_visible_idx = compression_anchor_visible_idx
+        self.compression_anchor_message_key = compression_anchor_message_key
+        self.compression_anchor_summary = compression_anchor_summary
+        self.pre_compression_snapshot = bool(pre_compression_snapshot)
+        self.pre_compression_continuation_session_id = (
+            str(pre_compression_continuation_session_id).strip()
+            if pre_compression_continuation_session_id
+            else None
+        )
+        self.context_engine = context_engine
+        self.compression_anchor_engine = compression_anchor_engine
+        self.compression_anchor_mode = compression_anchor_mode
+        self.compression_anchor_details = compression_anchor_details if isinstance(compression_anchor_details, dict) else {}
+        self.context_engine_state = context_engine_state if isinstance(context_engine_state, dict) else {}
+        self.context_length = context_length
+        self.threshold_tokens = threshold_tokens
+        self.last_prompt_tokens = last_prompt_tokens
+        _post_compression_tokens = _parse_nonnegative_int(post_compression_context_tokens_estimate)
+        self.post_compression_context_tokens_estimate = (
+            _post_compression_tokens if _post_compression_tokens and _post_compression_tokens > 0 else None
+        )
+        self.compression_recovery = compression_recovery if isinstance(compression_recovery, dict) else {}
+        self.recommended_recovery_action = recommended_recovery_action
+        self.compression_recovery_source_session_id = (
+            str(compression_recovery_source_session_id).strip()
+            if compression_recovery_source_session_id
+            else None
+        )
+        self.compression_recovery_action = (
+            str(compression_recovery_action).strip()
+            if compression_recovery_action
+            else None
+        )
+        self.truncation_watermark = truncation_watermark
+        self.truncation_boundary = truncation_boundary
+        self.clear_generation = clear_generation
+        self.intentional_shrink_generation = intentional_shrink_generation
+        self.transcript_generation = max(0, _parse_nonnegative_int(transcript_generation) or 0)
+        self.transcript_generation_baseline = max(
+            0, _parse_nonnegative_int(transcript_generation_baseline) or 0
+        )
+        self.gateway_routing = gateway_routing if isinstance(gateway_routing, dict) else None
+        self.gateway_routing_history = gateway_routing_history if isinstance(gateway_routing_history, list) else []
+        self.last_used_model = str(last_used_model).strip()[:240] if last_used_model else None
+        self.llm_title_generated = bool(llm_title_generated)
+        self.manual_title = bool(manual_title)
+        self.parent_session_id = parent_session_id
+        self.worktree_path = str(Path(worktree_path).expanduser().resolve()) if worktree_path else None
+        self.worktree_branch = str(worktree_branch) if worktree_branch else None
+        self.worktree_repo_root = str(Path(worktree_repo_root).expanduser().resolve()) if worktree_repo_root else None
+        self.worktree_created_at = worktree_created_at
+        self.is_cli_session = bool(kwargs.get('is_cli_session', False))
+        self.source_tag = kwargs.get('source_tag')
+        self.raw_source = kwargs.get('raw_source')
+        self.session_source = kwargs.get('session_source')
+        self.source_label = kwargs.get('source_label')
+        self.read_only = bool(kwargs.get('read_only', False))
+        self.enabled_toolsets = enabled_toolsets  # List[str] or None — per-session toolset override
+        self.composer_draft = composer_draft if isinstance(composer_draft, dict) else {}
+        self.anchor_activity_scenes = anchor_activity_scenes if isinstance(anchor_activity_scenes, dict) else {}
+        self.process_wakeup_pause = process_wakeup_pause if isinstance(process_wakeup_pause, dict) else {}
+        self.share_token = str(share_token).strip() if share_token else None
+        self.share_created_at = share_created_at
+        self.gateway_run = gateway_run if isinstance(gateway_run, dict) else None
+        # Gateway delegation rows leased for this session's next accepted turn (api.gateway_delegation_wakeup).
+        self.delegation_reservation = delegation_reservation if isinstance(delegation_reservation, dict) else None
+        # Last clear/truncation: Gateway delegation rows written before it are never woken into context.
+        self.delegation_cutoff_ts = delegation_cutoff_ts if isinstance(delegation_cutoff_ts, (int, float)) else None
+        # #5854: a compact fingerprint of anchor_activity_scenes ({scene_key:
+        # updated_at}) persisted BEFORE the messages array so the sidebar-poll
+        # freshness check can compare scene freshness without parsing the full
+        # (often 250-480KB) scene bodies, which serialize AFTER messages. None
+        # on legacy sidecars (scenes-before-messages, no fingerprint) — callers
+        # fall back to reading keys/updated_at off anchor_activity_scenes.
+        _raw_scene_index = kwargs.get('anchor_scene_index')
+        self._anchor_scene_index = _raw_scene_index if isinstance(_raw_scene_index, dict) else None
+        raw_message_count = kwargs.get('message_count')
+        parsed_message_count = None
+        if raw_message_count is not None:
+            try:
+                parsed_message_count = int(raw_message_count)
+            except (TypeError, ValueError):
+                parsed_message_count = None
+        self._metadata_message_count = parsed_message_count if parsed_message_count is not None and parsed_message_count >= 0 else None
+        # #quiet-delegation: visible count from the sidecar metadata prefix
+        # (written by save()); None on legacy sidecars → compact() walks
+        # messages instead.
+        _raw_visible_count = kwargs.get('visible_message_count')
+        _parsed_visible_count = None
+        if _raw_visible_count is not None:
+            try:
+                _parsed_visible_count = int(_raw_visible_count)
+            except (TypeError, ValueError):
+                _parsed_visible_count = None
+        self._metadata_visible_message_count = (
+            _parsed_visible_count
+            if _parsed_visible_count is not None and _parsed_visible_count >= 0
+            else None
+        )
+
+    @property
+    def path(self):
+        return SESSION_DIR / f'{self.session_id}.json'
+
+    def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
+        if not is_safe_session_id(self.session_id):
+            raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
+        # ── #1558 P0 guard ──────────────────────────────────────────────
+        # Refuse to save a session that was loaded with metadata_only=True.
+        # Such sessions have messages=[] (it's the whole point of the partial
+        # load), and save() unconditionally writes self.messages to disk via
+        # an atomic os.replace(). Saving a metadata-only stub thus wipes the
+        # full conversation history — which is exactly the v0.50.279
+        # _clear_stale_stream_state() regression that lost users 1000+
+        # message conversations. Any caller that needs to mutate persisted
+        # fields on a metadata-only session must reload with
+        # metadata_only=False first.
+        if getattr(self, '_loaded_metadata_only', False):
+            raise RuntimeError(
+                f"Refusing to save metadata-only session {self.session_id!r}: "
+                f"would atomically overwrite on-disk messages with []. "
+                f"Reload with metadata_only=False before mutating state. "
+                f"See #1558."
+            )
+        if not isinstance(self.messages, list):
+            raise ValueError(
+                f"Refusing to save session {self.session_id!r}: messages must be a list, "
+                f"got {type(self.messages).__name__}."
+            )
+        if touch_updated_at:
+            self.updated_at = time.time()
+        self._webui_pending_user_timestamp_identity = (
+            _validated_webui_pending_user_timestamp_identity(
+                self, getattr(self, '_webui_pending_user_timestamp_identity', None)
+            )
+        )
+        # Write metadata fields first so load_metadata_only() can read them
+        # without parsing the full messages array (which may be 400KB+).
+        # Fields are listed in the order they should appear in the JSON file.
+        METADATA_FIELDS = [
+            'session_id', 'title', 'workspace', 'created_workspace', 'model', 'model_provider', 'model_explicit_pick_signature', 'created_at', 'updated_at',
+            'pinned', 'archived', 'project_id', 'profile',
+            'input_tokens', 'output_tokens', 'estimated_cost',
+            'cache_read_tokens', 'cache_write_tokens',
+            'personality', 'active_stream_id',
+            'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_user_source',
+            '_webui_pending_user_timestamp_identity',
+            'compression_anchor_visible_idx', 'compression_anchor_message_key',
+            'compression_anchor_summary', 'pre_compression_snapshot',
+            'pre_compression_continuation_session_id',
+            'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
+            'compression_anchor_details', 'context_engine_state',
+            'context_length', 'threshold_tokens', 'last_prompt_tokens',
+            'post_compression_context_tokens_estimate',
+            'compression_recovery', 'recommended_recovery_action',
+            'compression_recovery_source_session_id', 'compression_recovery_action',
+            'truncation_watermark',
+            'truncation_boundary',
+            'clear_generation',
+            'intentional_shrink_generation',
+            'transcript_generation',
+            'transcript_generation_baseline',
+            'gateway_routing', 'gateway_routing_history', 'last_used_model', 'llm_title_generated', 'manual_title',
+            'parent_session_id',
+            'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
+            'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
+            'enabled_toolsets', 'composer_draft',
+            'process_wakeup_pause',
+            'share_token', 'share_created_at',
+            'gateway_run', 'delegation_reservation', 'delegation_cutoff_ts',
+        ]
+        guarded_messages, exact_replay_rows_removed = _deduplicate_exact_stable_messages(self.messages)
+        if exact_replay_rows_removed:
+            logger.warning(
+                "Removed %d exact stable replay messages from persisted snapshot for session %s",
+                exact_replay_rows_removed,
+                self.session_id,
+            )
+        meta = {k: getattr(self, k, None) for k in METADATA_FIELDS}
+        # #5854: message_count and a compact anchor-scene fingerprint go in the
+        # metadata prefix (BEFORE messages) so load_metadata_only() and the
+        # sidebar-poll freshness check never have to parse the full (250-480KB)
+        # scene bodies. message_count is placed BEFORE anchor_scene_index so a
+        # legacy-format reader that stops at a scene key still finds the count.
+        # The full anchor_activity_scenes bodies serialize AFTER messages.
+        meta['message_count'] = len(guarded_messages or [])
+        # #quiet-delegation: visible count excludes hidden internal rows
+        # (delegation_wakeup). Raw message_count stays the paging/reconnect
+        # authority; sidebar/topbar labels consume the visible count. Both are
+        # derived from the same in-memory array inside this same atomic write,
+        # so they can never disagree about a shrink.
+        meta['visible_message_count'] = sum(
+            1 for m in (guarded_messages or [])
+            if not is_hidden_transcript_row(m)
+        )
+        # _mc_v marks this file as written by the current writer contract,
+        # where `message_count` equals len(the persisted guarded messages) by
+        # construction and both keys land in the same atomic write. save()'s
+        # shrink guard takes the bounded-prefix shortcut ONLY for marked files;
+        # an unmarked count (a legacy pre-#5854 sidecar, a sidecar materialized
+        # by an older recovery writer, any foreign writer) gets the full parse,
+        # so a stale count from outside this contract can never read a real
+        # shrink as a growth and skip the #1558 backup. One save re-marks the
+        # file, so the fast path still covers steady state.
+        meta['_mc_v'] = _MESSAGE_COUNT_MARKER
+        meta['anchor_scene_index'] = _anchor_scene_index_from_records(self.anchor_activity_scenes)
+        # Keep the in-memory fingerprint aligned with what we just persisted, so a
+        # later metadata-only reload of THIS object (or any fingerprint reader)
+        # sees the current value rather than a stale load-time snapshot (#5854
+        # defense-in-depth; the cached-side freshness check reads real records,
+        # not this, so this is belt-and-suspenders).
+        self._anchor_scene_index = dict(meta['anchor_scene_index'])
+        meta['messages'] = guarded_messages
+        meta['tool_calls'] = self.tool_calls
+        meta['anchor_activity_scenes'] = self.anchor_activity_scenes if isinstance(self.anchor_activity_scenes, dict) else {}
+        # Fields not in METADATA_FIELDS (e.g. last_usage) go at the end. Exclude
+        # the keys we placed explicitly above so they aren't emitted twice.
+        _placed = {'message_count', '_mc_v', 'anchor_scene_index', 'messages', 'tool_calls', 'anchor_activity_scenes'}
+        extra = {k: v for k, v in self.__dict__.items()
+                 if k not in METADATA_FIELDS and k not in _placed
+                 and not k.startswith('_')}
+        payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
+        try:
+            payload.encode('utf-8')
+        except UnicodeEncodeError:
+            # Journal recovery may preserve a lone provider surrogate. Escape
+            # it losslessly before touching the atomic sidecar temp file, just
+            # as the journal writer does, so repeated cold loads can commit.
+            payload = json.dumps({**meta, **extra}, ensure_ascii=True, indent=2)
+
+        # ── #1558 backup safeguard ──────────────────────────────────────
+        # Before overwriting the session file, copy the previous version to
+        # ``<sid>.json.bak`` IFF the previous file has more messages than the
+        # incoming payload. The asymmetric guard means:
+        #   * Normal grow-the-conversation saves never produce a backup
+        #     (incoming messages >= existing) — keeps disk overhead near zero.
+        #   * Any save that would shrink the messages array (the failure mode
+        #     of #1558, plus anything similar in the future) leaves a recoverable
+        #     snapshot of the pre-shrink state on disk.
+        # The recovery path is api/session_recovery.py — at server startup and
+        # via /api/session/recover, sessions whose JSON has fewer messages than
+        # their .bak get restored automatically.
+        try:
+            if self.path.exists():
+                # The on-disk count, without reading the body.
+                #
+                # The decision below is a function of ONE integer -- how many
+                # messages the file on disk holds -- and save() already writes
+                # that integer into the metadata prefix, before `messages`, as
+                # `message_count` (see METADATA_FIELDS above; load_metadata_only
+                # and the sidebar freshness check read it the same way). So read
+                # THAT through a bounded 64 KiB prefix instead of the whole file.
+                # Measured before this: a 203,439,398-byte sidecar cost 20,377 ms
+                # (17,453 in read_text, 2,924 in json.loads) to yield one integer,
+                # on EVERY save -- including the grow-saves that never back
+                # anything up. The prefix read is O(64 KiB), and because the count
+                # is part of the bytes on disk it travels with any rewrite of them.
+                #
+                # An in-memory "I wrote this, stat says nothing changed" cache is
+                # NOT sufficient here, and was removed after review: (inode, size,
+                # mtime_ns) is not a content identity. A same-length in-place
+                # rewrite inside one mtime tick keeps all three fields -- ext4
+                # stamps mtime from a coarse clock, so two writes in the same tick
+                # share one mtime_ns -- and a stale cached count then reads a real
+                # shrink as a growth and skips the #1558 backup. The prefix count
+                # cannot be fooled that way.
+                #
+                # Every unknown falls through to the full read + parse below: a
+                # legacy (pre-#5854) sidecar whose count is not in the prefix, a
+                # count written without the current writer's _mc_v marker (an
+                # older writer's count can be stale relative to the messages
+                # array next to it), a corrupt or truncated prefix, a file with
+                # no top-level `messages` key at all, or metadata alone that
+                # overflows the budget.
+                # Fail-open is the contract -- never "assume no shrink".
+                existing_text = None
+                existing = None
+                existing_guarded_messages = None
+                existing_exact_replay_rows_removed = 0
+                existing_msg_count = _prefix_message_count(self.path)
+                if existing_msg_count is None:
+                    existing_text = self.path.read_text(encoding='utf-8')
+                    try:
+                        existing = json.loads(existing_text)
+                        existing_messages = existing.get('messages') or []
+                        existing_msg_count = len(existing_messages)
+                        if isinstance(existing_messages, list):
+                            (
+                                existing_guarded_messages,
+                                existing_exact_replay_rows_removed,
+                            ) = _deduplicate_exact_stable_messages(existing_messages)
+                    except (json.JSONDecodeError, ValueError, AttributeError):
+                        existing_msg_count = -1  # corrupt → always back up
+                incoming_msg_count = len(guarded_messages or [])
+                if (
+                    existing_msg_count > 0
+                    and incoming_msg_count == 0
+                    and (self.active_stream_id or self.pending_user_message)
+                ):
+                    logger.warning(
+                        "refusing to overwrite session %s messages with empty active/pending snapshot "
+                        "(existing=%s, incoming=%s, stream=%s)",
+                        self.session_id,
+                        existing_msg_count,
+                        incoming_msg_count,
+                        self.active_stream_id,
+                    )
+                    return
+                if existing_msg_count > incoming_msg_count:
+                    bak_path = self.path.with_suffix('.json.bak')
+                    if existing_text is None:
+                        # The .bak body is the one thing that needs the full text,
+                        # and a shrink is the one time it is needed.
+                        existing_text = self.path.read_text(encoding='utf-8')
+                    if existing is None:
+                        try:
+                            existing = json.loads(existing_text)
+                            existing_messages = existing.get('messages') or []
+                            if isinstance(existing_messages, list):
+                                (
+                                    existing_guarded_messages,
+                                    existing_exact_replay_rows_removed,
+                                ) = _deduplicate_exact_stable_messages(existing_messages)
+                        except (json.JSONDecodeError, ValueError, AttributeError):
+                            existing = None
+                    # SHOULD-FIX #2 (Opus): atomic write via tmp+replace,
+                    # mirroring the main save() pattern below. Prevents a
+                    # torn .bak from a crash mid-write or a concurrent
+                    # backup-producing save. Recovery defends against a
+                    # torn .bak (JSONDecodeError → no_action), so the
+                    # failure mode pre-fix was "backup is lost"; with
+                    # this fix the backup either lands cleanly or doesn't
+                    # land at all.
+                    try:
+                        backup_text = existing_text
+                        if (
+                            existing_exact_replay_rows_removed
+                            and isinstance(existing, dict)
+                            and isinstance(existing_guarded_messages, list)
+                        ):
+                            cleaned_existing = dict(existing)
+                            cleaned_existing['messages'] = existing_guarded_messages
+                            cleaned_existing['message_count'] = len(existing_guarded_messages)
+                            backup_text = json.dumps(cleaned_existing, ensure_ascii=False, indent=2)
+                            try:
+                                backup_text.encode('utf-8')
+                            except UnicodeEncodeError:
+                                # Keep recovered surrogates lossless when
+                                # replay cleanup rewrites the shrink backup,
+                                # before creating its atomic temp file.
+                                backup_text = json.dumps(cleaned_existing, ensure_ascii=True, indent=2)
+                            logger.warning(
+                                "Removed %d exact stable replay messages from backup for session %s",
+                                existing_exact_replay_rows_removed,
+                                self.session_id,
+                            )
+                        bak_tmp = bak_path.with_suffix(
+                            f'.bak.tmp.{os.getpid()}.{threading.current_thread().ident}'
+                        )
+                        with open(bak_tmp, 'w', encoding='utf-8') as bf:
+                            bf.write(backup_text)
+                            bf.flush()
+                            os.fsync(bf.fileno())
+                        _safe_replace(bak_tmp, bak_path)
+                    except OSError:
+                        # Backup is best-effort; main save proceeds regardless.
+                        try:
+                            bak_tmp.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+        except OSError:
+            pass
+
+        tmp = self.path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            if skip_index:
+                # Callers that explicitly skip the sidebar projection retain
+                # the existing same-session concurrency contract: their unique
+                # temp files may replace the sidecar independently.
+                _replace_session_sidecar(tmp, self.path, self.session_id)
+            else:
+                # Publish the sidecar and its sidebar projection as one ordered
+                # operation. _write_session_index() uses this same RLock, so the
+                # nested acquisition is safe. Without the outer ownership, an
+                # older save can pause after replacing the sidecar, a newer save
+                # can publish both files, and then the older save can regress
+                # only the index with its frozen projection.
+                with _INDEX_WRITE_LOCK:
+                    _replace_session_sidecar(tmp, self.path, self.session_id)
+                    # Build the sidebar entry from the same guarded transcript
+                    # snapshot as the JSON payload. A shallow copy avoids
+                    # rebinding/mutating the live Session while keeping message
+                    # count, user count, and last-message time aligned with
+                    # what this save actually persisted.
+                    persisted_index_session = copy.copy(self)
+                    persisted_index_session.messages = guarded_messages
+                    persisted_index_session._metadata_message_count = len(guarded_messages)
+                    _write_session_index(updates=[persisted_index_session])
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
+        # #4985 belt-and-suspenders self-heal: a successful save with at
+        # least one real message on the sidecar is unconditional proof the
+        # row is alive (the #4985 "zero-message orphan" only ever exists
+        # when ``len(self.messages) == 0``). Clear the tombstone so the
+        # next ``/api/sessions`` poll does not need the prune helper to
+        # run before the row re-appears — useful when the message-commit
+        # happens on a poll that does not yet see state.db.messages rows
+        # (e.g. the WebUI's own sidecar commit lands before the agent's
+        # state.db append, or the helper is skipped via a different code
+        # path). Wrapped because a tombstone failure must never block a
+        # save. The helper's self-healing branch in
+        # ``_prune_orphaned_webui_zero_message_sessions`` is the primary
+        # fix; this is the belt.
+        if self.messages:
+            try:
+                _clear_webui_zero_message_orphan_tombstone(self.session_id)
+                _clear_webui_deleted_session_tombstone(self.session_id)
+            except Exception:
+                logger.debug(
+                    "Failed to clear webui tombstone for %s",
+                    self.session_id,
+                    exc_info=True,
+                )
+
+    @classmethod
+    def load(cls, sid):
+        # Validate session ID format to prevent path traversal.  API/gateway
+        # session ids may contain hyphens (for example ``api-*`` and
+        # ``reachy-voice-*``); allow those but still reject dots/slashes.
+        if not is_safe_session_id(sid):
+            return None
+        p = SESSION_DIR / f'{sid}.json'
+        if not p.exists():
+            return None
+        # #5854: snapshot the stat signature BEFORE reading so a legacy-facts
+        # cache write is only committed if the file didn't change under us
+        # during the parse (TOCTOU guard against an atomic replace mid-read).
+        _pre_read_sig = _sidecar_stat_signature(p)
+        data = json.loads(p.read_text(encoding='utf-8'))
+        data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
+        data = _apply_session_draft_overlay(data, sid)
+        session = cls(**data)
+        if _collapsed_partials:
+            try:
+                # Self-heal bloated sessions on first full load without touching
+                # recency/index ordering; save() creates a .bak because this
+                # intentionally shrinks the transcript (#2592).
+                session.save(touch_updated_at=False, skip_index=True)
+            except Exception:
+                logger.debug("Failed to persist collapsed duplicate partials for %s", sid, exc_info=True)
+        else:
+            # #5854: for a LEGACY sidecar (no modern anchor_scene_index key), the
+            # cheap metadata-prefix read cannot recover message_count/scenes when
+            # scenes serialize before them, so cache the authoritative facts we
+            # just parsed. This keeps the metadata-only path and the eviction
+            # check from full-parsing this unchanged file again on every poll.
+            # Keyed by stat signature, so any edit invalidates it; the next
+            # save() rewrites the modern layout and the fallback stops firing.
+            # expected_sig guards against an atomic replace during the read.
+            # (When _collapsed_partials fired, save() above already rewrote the
+            # modern layout, so no legacy caching is needed.)
+            #
+            # WHY STILL GATED, and not "obviously" broadened to modern files: the
+            # cache is only READ from the two sites that reach it when the cheap
+            # prefix carried NEITHER message_count NOR anchor_scene_index — i.e.
+            # legacy layouts (see the `if ... and 'anchor_scene_index' not in
+            # parsed` guards in load_metadata_only() and the eviction-count
+            # helper). A modern sidecar that overflows the budget therefore
+            # never consults an entry written for it, so populating one is dead
+            # work that also stores entries no consumer can use. Making the
+            # modern case benefit needs the READ side redesigned to build a
+            # metadata stub from cached facts — a separate change; until then
+            # this stays legacy-only.
+            if 'anchor_scene_index' not in data:
+                try:
+                    _legacy_sidecar_facts_put(
+                        sid,
+                        len(getattr(session, 'messages', None) or []),
+                        _anchor_scene_index_from_records(getattr(session, 'anchor_activity_scenes', None)),
+                        expected_sig=_pre_read_sig,
+                    )
+                except Exception:
+                    logger.debug("legacy sidecar facts cache populate failed for %s", sid, exc_info=True)
+        return session
+
+    @classmethod
+    def load_metadata_only(cls, sid, *, index_message_counts=None):
+        """Load only the compact metadata fields, skipping the messages array.
+
+        Session JSON files have metadata fields (session_id, title, model, etc.)
+        at the top level, before the large messages array. Read only up to the
+        top-level "messages" field and synthesize a small metadata-only object.
+        Falls back to load() for legacy or unexpected file layouts.
+        """
+        # Same path-safety contract as load(): hyphens are valid session ids,
+        # path separators and traversal dots are not.
+        if not is_safe_session_id(sid):
+            return None
+        p = SESSION_DIR / f'{sid}.json'
+        if not p.exists():
+            return None
+        try:
+            prefix = _read_metadata_json_prefix(p)
+            if not prefix:
+                return cls.load(sid)
+            parsed = json.loads(prefix)
+            needed = {'session_id', 'title', 'created_at', 'updated_at'}
+            if not needed.issubset(parsed.keys()):
+                return cls.load(sid)
+            parsed['messages'] = []
+            parsed['tool_calls'] = []
+            parsed = _apply_session_draft_overlay(parsed, sid)
+            session = cls(**parsed)
+            sidecar_message_count = _parse_nonnegative_int(parsed.get('message_count'))
+            index_message_count = None
+            if sidecar_message_count is None:
+                if index_message_counts is not None:
+                    index_message_count = index_message_counts.get(str(sid))
+                else:
+                    index_message_count = _lookup_index_message_count(sid)
+            # #5854 legacy-layout recovery: a pre-#5854 sidecar serialized
+            # anchor_activity_scenes BEFORE message_count, so on a large-scene
+            # legacy file the cheap prefix now stops at the scenes key and
+            # captures NO message_count. The sidebar _index.json count can lag
+            # behind external sidecar appends, so trusting it here would report a
+            # stale/zero count and could drop an unsaved user tail on the next
+            # get_session cache-replace. When the prefix carries NEITHER
+            # message_count NOR the modern anchor_scene_index key (⇒ a legacy
+            # file whose count fell after the scenes), recover the authoritative
+            # facts. To avoid re-parsing an unchanged legacy file on every poll
+            # (which would recreate the #4633 churn for legacy sidecars that are
+            # never re-saved), consult a bounded stat-signature cache first and
+            # only full-load on a miss, caching the result. The next save()
+            # rewrites the modern layout so the fallback stops firing entirely.
+            # A MODERN file always carries message_count in the prefix, so it
+            # never reaches here — a genuine 0 stays 0.
+            if (
+                sidecar_message_count is None
+                and 'anchor_scene_index' not in parsed
+            ):
+                _facts = _legacy_sidecar_facts_get(sid)
+                if _facts is not None:
+                    parsed['anchor_scene_index'] = _facts.get('scene_index') or {}
+                    session = cls(**parsed)
+                    session._metadata_message_count = _parse_nonnegative_int(_facts.get('message_count'))
+                    session._loaded_metadata_only = True
+                    return session
+                # Cache miss → full-load. cls.load() itself populates the legacy
+                # facts cache with a TOCTOU-guarded write (expected_sig), so we
+                # do NOT re-cache here (an unguarded second write could stamp
+                # stale facts under a replacement file's signature — Codex r5).
+                return cls.load(sid)
+            # Modern sidecars carry an accurate message_count, so it is the
+            # source of truth and we skip the per-row _index.json read in the
+            # common case. The sidebar index is only a cache (it can lag behind
+            # external sidecar appends/backfills), so consult it solely as a
+            # fallback when the sidecar has no count. When both are present we
+            # still take the largest known count as a defensive measure.
+            known_counts = [
+                count for count in (index_message_count, sidecar_message_count)
+                if count is not None
+            ]
+            session._metadata_message_count = max(known_counts) if known_counts else None
+            # Note: visible_message_count rides the same modern-prefix contract
+            # and is picked up by __init__ from the parsed kwargs; legacy
+            # sidecars omit it. compact() consumes the metadata value ONLY on
+            # this metadata-only stub (messages=[]); full loads re-walk the
+            # live array so an appended turn can never report a stale count.
+            # Mark this session as a metadata-only stub. save() refuses to write
+            # such a session because doing so would atomically replace the
+            # on-disk JSON with messages=[], wiping the conversation. Any
+            # caller that needs to mutate persisted state on a metadata-only
+            # session must reload it with metadata_only=False first.
+            # See #1558 — v0.50.279 _clear_stale_stream_state() data-loss bug.
+            session._loaded_metadata_only = True
+            return session
+        except Exception:
+            # Corrupt prefix or decode error — fall back to full load
+            return cls.load(sid)
+
+    @staticmethod
+    def _compute_user_message_count(messages) -> int:
+        """perf(session-load-latency) Priority 1: bounded in-memory count.
+
+        Returns the number of messages with role='user' in ``messages``.
+        Pre-patch compact() did the same O(N) walk inline; the walk is
+        extracted here so it can be measured and bounded independently.
+
+        On the test corpus (a 2,400-message sidecar) this walk runs in
+        tens of milliseconds on a Celeron N3350 with eMMC. Cost is
+        proportional to the sidecar length the caller already loaded, not
+        to anything new we read from disk.
+
+        Critical: this walks ``messages`` (the sidecar) and NOT state.db.
+        A previous version of this helper queried state.db for the same
+        count, but the two sources can diverge by hundreds of messages
+        during recovery / mid-flight writes / pending_user_message, and
+        the sidebar's stale-row detection (see
+        ``_looks_like_stale_zero_message_row`` and
+        ``_row_may_need_sidecar_metadata_refresh``) consumes this field as
+        if the sidecar were the source of truth. Mixing the two sources
+        would silently flip the field's semantics.
+        """
+        if not isinstance(messages, list):
+            return 0
+        n = 0
+        for m in messages:
+            if isinstance(m, dict):
+                # Inline role check to avoid the _message_role helper call
+                # on every iteration. dict.get('role') with default '' is
+                # materially faster than a function call for the hot loop.
+                role = m.get('role')
+                if isinstance(role, str) and role == 'user':
+                    n += 1
+        return n
+
+    def compact(
+        self,
+        include_runtime=False,
+        active_stream_ids=None,
+        sidebar_metadata_only=False,
+    ) -> dict:
+        active_stream_ids = active_stream_ids if active_stream_ids is not None else set()
+        has_pending_user_message = bool(self.pending_user_message)
+        message_count = (
+            self._metadata_message_count
+            if self._metadata_message_count is not None
+            else len(self.messages)
+        )
+        if has_pending_user_message:
+            message_count = max(message_count, 1)
+        # #quiet-delegation: labels that count "messages" for humans must not
+        # count hidden internal rows. Raw message_count stays the paging /
+        # reconnect authority; visible_message_count feeds topbar + sidebar.
+        # The metadata-prefix value is trusted ONLY for metadata-only stubs
+        # (messages=[]); a full session re-walks the live array so a
+        # save → load → append → save sequence cannot report a stale count
+        # (gate review finding 3: visible 1 for 2 persisted messages).
+        if getattr(self, '_loaded_metadata_only', False):
+            _meta_visible = getattr(self, '_metadata_visible_message_count', None)
+            # Legacy sidecars written before this PR have NO visible-count
+            # prefix field, which parses as None — not as "unknown". Emitting
+            # 0 here made older sessions show "0 messages" in the sidebar
+            # (gate review, metadata-only load). Fall back to the raw
+            # message_count: a legacy file cannot contain hidden
+            # delegation_wakeup rows, so every message is visible.
+            if _meta_visible is None:
+                _meta_visible = message_count if message_count else None
+        else:
+            _meta_visible = None
+        visible_message_count = max(
+            0,
+            _meta_visible
+            if _meta_visible is not None
+            else sum(
+                1 for m in (self.messages or [])
+                if not is_hidden_transcript_row(m)
+            ),
+        )
+        if (
+            has_pending_user_message
+            and getattr(self, 'pending_user_source', None) != 'delegation_wakeup'
+        ):
+            visible_message_count = max(visible_message_count, 1)
+        last_message_at = _last_message_timestamp(self.messages) or self.updated_at
+        if has_pending_user_message and self.pending_started_at:
+            last_message_at = self.pending_started_at
+        compact = {
+            'session_id': self.session_id,
+            'title': self.title,
+            'workspace': self.workspace,
+            'model': self.model,
+            'model_provider': self.model_provider,
+            'message_count': message_count,
+            'created_at': self.created_at,
+            'updated_at': self.updated_at,
+            'last_message_at': last_message_at,
+            'transcript_generation': self.transcript_generation,
+            'transcript_generation_baseline': self.transcript_generation_baseline,
+            'pinned': self.pinned,
+            'archived': self.archived,
+            'project_id': self.project_id,
+            'profile': self.profile,
+            'input_tokens': self.input_tokens,
+            'output_tokens': self.output_tokens,
+            'estimated_cost': self.estimated_cost,
+            'cache_read_tokens': self.cache_read_tokens,
+            'cache_write_tokens': self.cache_write_tokens,
+            'cache_hit_percent': prompt_cache_hit_percent(self.cache_read_tokens, self.input_tokens),
+            'personality': self.personality,
+            'compression_anchor_visible_idx': self.compression_anchor_visible_idx,
+            'compression_anchor_message_key': self.compression_anchor_message_key,
+            'compression_anchor_summary': self.compression_anchor_summary,
+            'pre_compression_snapshot': self.pre_compression_snapshot,
+            'context_engine': self.context_engine,
+            'compression_anchor_engine': self.compression_anchor_engine,
+            'compression_anchor_mode': self.compression_anchor_mode,
+            'compression_anchor_details': self.compression_anchor_details,
+            'context_engine_state': self.context_engine_state,
+            'context_length': self.context_length,
+            'threshold_tokens': self.threshold_tokens,
+            'last_prompt_tokens': self.last_prompt_tokens,
+            'post_compression_context_tokens_estimate': self.post_compression_context_tokens_estimate,
+            'compression_recovery': self.compression_recovery,
+            'recommended_recovery_action': self.recommended_recovery_action,
+            'gateway_routing': self.gateway_routing,
+            'gateway_routing_history': self.gateway_routing_history,
+            'last_used_model': self.last_used_model,
+            'manual_title': self.manual_title,
+            # Only emit 'parent_session_id' when set (the /branch fork link, #1342).
+            # Sessions without a fork must not leak None — see test_session_lineage_metadata_api.
+            **({'parent_session_id': self.parent_session_id} if self.parent_session_id else {}),
+            # #6672: immutable workspace captured at session creation, exposed so
+            # the UI can distinguish it from the live `workspace` field (which
+            # updates on mid-session switches without touching the system prompt).
+            'created_workspace': getattr(self, 'created_workspace', None) or self.workspace,
+            **({
+                'compression_recovery_source_session_id': self.compression_recovery_source_session_id,
+                'compression_recovery_action': self.compression_recovery_action,
+            } if (self.compression_recovery_source_session_id or self.compression_recovery_action) else {}),
+            **({
+                'worktree_path': self.worktree_path,
+                'worktree_branch': self.worktree_branch,
+                'worktree_repo_root': self.worktree_repo_root,
+                'worktree_created_at': self.worktree_created_at,
+            } if self.worktree_path else {}),
+            'user_message_count': Session._compute_user_message_count(self.messages),
+            'visible_message_count': visible_message_count,
+            'active_stream_id': self.active_stream_id,
+            'pending_user_message': self.pending_user_message,
+            'has_pending_user_message': has_pending_user_message,
+            # #7882 re-gate: provenance for the pending turn rides to the
+            # sidebar overlay — a pending delegation wakeup is appended to
+            # state.db by the Agent core as a PLAIN user row (no _source
+            # stamp until settle), so the overlay cannot classify the raw
+            # growth without knowing the pending turn's source. Emitted only
+            # for non-default sources (webui/fork pending rows behave as
+            # ordinary visible user rows and keep the old shape).
+            **(
+                {'pending_user_source': self.pending_user_source}
+                if str(self.pending_user_source or '').strip().lower()
+                not in ('', 'webui', 'fork')
+                else {}
+            ),
+            'is_cli_session': self.is_cli_session,
+            'source_tag': self.source_tag,
+            'raw_source': self.raw_source,
+            'session_source': self.session_source,
+            'source_label': self.source_label,
+            'read_only': self.read_only,
+            'enabled_toolsets': self.enabled_toolsets,
+            'composer_draft': self.composer_draft if isinstance(self.composer_draft, dict) else {},
+            'process_wakeup_pause': self.process_wakeup_pause if isinstance(self.process_wakeup_pause, dict) else {},
+            'share_token': self.share_token,
+            'share_created_at': self.share_created_at,
+            'is_streaming': _is_streaming_session(
+                self.active_stream_id, active_stream_ids
+            ) if include_runtime else False,
+        }
+        if sidebar_metadata_only:
+            _strip_sidebar_heavy_metadata(compact)
+        return compact
+
+
+PROCESS_WAKEUP_PROVIDER_UNAVAILABLE_TYPES = frozenset({
+    'credential_pool_empty',
+})
+PROCESS_WAKEUP_PAUSE_ERROR = 'process_wakeup_paused'
+_PROCESS_WAKEUP_PAUSE_VERSION = 1
+
+
+def _process_wakeup_pause_part(value) -> str:
+    return str(value or '').strip().lower()
+
+
+def _process_wakeup_pause_provider_part(value) -> str:
+    provider = _process_wakeup_pause_part(value)
+    if not provider:
+        return ''
+    try:
+        return _process_wakeup_pause_part(_cfg._resolve_provider_alias(provider))
+    except Exception:
+        return provider
+
+
+def _process_wakeup_pause_lane(model=None, provider=None) -> tuple[str, str]:
+    model_part = _process_wakeup_pause_part(model)
+    provider_part = _process_wakeup_pause_provider_part(provider)
+    try:
+        resolved_model, resolved_provider = _cfg.canonical_model_provider_lane(model, provider)
+    except Exception:
+        logger.debug(
+            "failed to canonicalize process_wakeup pause lane for model=%r provider=%r",
+            model,
+            provider,
+            exc_info=True,
+        )
+        resolved_model, resolved_provider = None, None
+    if resolved_model:
+        model_part = _process_wakeup_pause_part(resolved_model)
+    if resolved_provider:
+        provider_part = _process_wakeup_pause_provider_part(resolved_provider)
+    return model_part, provider_part
+
+
+def _process_wakeup_pause_int(value, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _process_wakeup_pause_float(value, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _process_wakeup_pause_key(model=None, provider=None, classification=None) -> dict:
+    model_part, provider_part = _process_wakeup_pause_lane(model, provider)
+    return {
+        'model': model_part,
+        'provider': provider_part,
+        'classification': _process_wakeup_pause_part(classification),
+    }
+
+
+def process_wakeup_pause_matches(session, *, model=None, provider=None, classification=None) -> bool:
+    """Return True when the session has an active pause for this wakeup lane."""
+    pause = getattr(session, 'process_wakeup_pause', None)
+    if not isinstance(pause, dict) or not pause.get('paused'):
+        return False
+    expected = _process_wakeup_pause_key(model, provider, classification)
+    for key, expected_value in expected.items():
+        if key == 'classification' and not expected_value:
+            continue
+        if _process_wakeup_pause_part(pause.get(key)) != expected_value:
+            return False
+    return True
+
+
+def clear_process_wakeup_pause(session, *, reason: str = '') -> bool:
+    """Clear any persisted process-wakeup pause metadata.
+
+    Returns True when a pause was present. Callers decide whether and how to
+    persist, because some paths are already inside a larger session writeback.
+    """
+    pause = getattr(session, 'process_wakeup_pause', None)
+    if not isinstance(pause, dict) or not pause:
+        return False
+    session.process_wakeup_pause = {}
+    if reason:
+        session._last_process_wakeup_pause_clear_reason = str(reason)
+    return True
+
+
+def clear_process_wakeup_pause_if_model_changed(session, *, model=None, provider=None) -> bool:
+    """Reset a wakeup pause when the resolved model/provider lane changed."""
+    pause = getattr(session, 'process_wakeup_pause', None)
+    if not isinstance(pause, dict) or not pause.get('paused'):
+        return False
+    current = _process_wakeup_pause_key(model, provider, pause.get('classification'))
+    if (
+        _process_wakeup_pause_part(pause.get('model')) == current['model']
+        and _process_wakeup_pause_part(pause.get('provider')) == current['provider']
+    ):
+        return False
+    return clear_process_wakeup_pause(session, reason='model_or_provider_changed')
+
+
+def record_process_wakeup_provider_unavailable_pause(
+    session,
+    *,
+    classification: str,
+    model=None,
+    provider=None,
+) -> dict | None:
+    """Record the first visible provider-unavailable wakeup failure.
+
+    The persisted object is deliberately metadata-only: it records the lane and
+    counters, not the wakeup prompt or provider response body, so it remains
+    auditable without copying process output or credentials into diagnostics.
+    """
+    classification = _process_wakeup_pause_part(classification)
+    if classification not in PROCESS_WAKEUP_PROVIDER_UNAVAILABLE_TYPES:
+        return None
+    now = time.time()
+    key = _process_wakeup_pause_key(model, provider, classification)
+    credential_state_fingerprint = process_wakeup_credential_state_fingerprint(session)
+    existing = getattr(session, 'process_wakeup_pause', None)
+    same_window = (
+        isinstance(existing, dict)
+        and existing.get('paused')
+        and _process_wakeup_pause_part(existing.get('model')) == key['model']
+        and _process_wakeup_pause_part(existing.get('provider')) == key['provider']
+        and _process_wakeup_pause_part(existing.get('classification')) == key['classification']
+    )
+    visible_error_count = 1
+    suppressed_count = 0
+    first_paused_at = now
+    if same_window:
+        first_paused_at = _process_wakeup_pause_float(existing.get('first_paused_at'), now)
+        visible_error_count = _process_wakeup_pause_int(
+            existing.get('visible_error_count'),
+            1,
+        ) + 1
+        suppressed_count = _process_wakeup_pause_int(existing.get('suppressed_count'), 0)
+    session.process_wakeup_pause = {
+        'version': _PROCESS_WAKEUP_PAUSE_VERSION,
+        'paused': True,
+        'source': 'process_wakeup',
+        'classification': key['classification'],
+        'model': key['model'],
+        'provider': key['provider'],
+        'first_paused_at': first_paused_at,
+        'last_error_at': now,
+        'visible_error_count': visible_error_count,
+        'suppressed_count': suppressed_count,
+        'credential_state_fingerprint': credential_state_fingerprint,
+    }
+    return session.process_wakeup_pause
+
+
+def suppress_process_wakeup_for_provider_pause(
+    session,
+    *,
+    model=None,
+    provider=None,
+    classification: str = 'credential_pool_empty',
+) -> dict | None:
+    """Increment suppression metadata if this automatic wakeup is paused."""
+    if not process_wakeup_pause_matches(
+        session,
+        model=model,
+        provider=provider,
+        classification=classification,
+    ):
+        return None
+    pause = dict(getattr(session, 'process_wakeup_pause', {}) or {})
+    pause['suppressed_count'] = _process_wakeup_pause_int(pause.get('suppressed_count'), 0) + 1
+    pause['last_suppressed_at'] = time.time()
+    pause['last_suppressed_reason'] = 'provider_unavailable_pause'
+    session.process_wakeup_pause = pause
+    return pause
+
+
+_PROCESS_WAKEUP_AUTH_ROTATION_KEYS = frozenset({
+    'expires_at',
+    'expires_at_ms',
+    'expires_in',
+    'last_status',
+    'last_status_at',
+    'last_error_code',
+    'last_error_reason',
+    'last_error_message',
+    'last_error_reset_at',
+    'request_count',
+    'updated_at',
+})
+_PROCESS_WAKEUP_AUTH_SECRET_PRESENCE_KEYS = frozenset({
+    'access_token',
+    'refresh_token',
+    'id_token',
+    'api_key',
+    'secret',
+    'client_secret',
+    'runtime_api_key',
+    'token',
+})
+
+
+def _process_wakeup_secret_presence(value):
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
+def _process_wakeup_auth_fingerprint_payload(value):
+    if isinstance(value, dict):
+        payload = {}
+        for key, child in value.items():
+            key_text = str(key)
+            key_norm = key_text.strip().lower()
+            if key_norm in _PROCESS_WAKEUP_AUTH_ROTATION_KEYS:
+                continue
+            if key_norm in _PROCESS_WAKEUP_AUTH_SECRET_PRESENCE_KEYS:
+                payload[key_text] = _process_wakeup_secret_presence(child)
+            else:
+                payload[key_text] = _process_wakeup_auth_fingerprint_payload(child)
+        return payload
+    if isinstance(value, list):
+        return [_process_wakeup_auth_fingerprint_payload(item) for item in value]
+    return value
+
+
+def _process_wakeup_auth_store_fingerprint(path: Path) -> dict:
+    p = Path(path).expanduser()
+    payload: dict = {'path': str(p)}
+    try:
+        stat = p.stat()
+    except FileNotFoundError:
+        payload['missing'] = True
+        return payload
+    except OSError as exc:
+        payload['error'] = exc.__class__.__name__
+        return payload
+    if not p.is_file():
+        payload['kind'] = 'other'
+        return payload
+    try:
+        raw = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        payload['kind'] = 'file'
+        payload['semantic'] = 'unparsed-fallback'
+        payload['mtime_ns'] = int(stat.st_mtime_ns)
+        payload['size'] = int(stat.st_size)
+        return payload
+    sanitized = _process_wakeup_auth_fingerprint_payload(raw)
+    try:
+        encoded = json.dumps(
+            sanitized,
+            sort_keys=True,
+            separators=(',', ':'),
+            ensure_ascii=True,
+            default=str,
+        ).encode('utf-8')
+        payload['semantic_sha256'] = hashlib.sha256(encoded).hexdigest()
+    except Exception:
+        payload['kind'] = 'file'
+        payload['semantic'] = 'encode-fallback'
+        payload['mtime_ns'] = int(stat.st_mtime_ns)
+        payload['size'] = int(stat.st_size)
+    return payload
+
+
+def process_wakeup_credential_state_fingerprint(session) -> str:
+    """Return a metadata-only fingerprint for credential/config state.
+
+    auth.json is rewritten by OAuth/token-refresh and request telemetry churn.
+    Hash its semantic content instead of mtime/size so those rewrites do not
+    clear a credential-exhausted process-wakeup pause. Secret fields are
+    represented only by presence booleans: adding a credential changes the
+    fingerprint, while rotating an existing token value does not persist or
+    compare secret material.
+    """
+    try:
+        hermes_home = _get_profile_home(getattr(session, 'profile', None))
+    except Exception:
+        hermes_home = Path(os.environ.get('HERMES_HOME') or HOME).expanduser()
+    files = []
+    for name in ('auth.json', 'config.yaml', 'config.yml', '.env'):
+        path = hermes_home / name
+        if name == 'auth.json':
+            files.append((name, _process_wakeup_auth_store_fingerprint(path)))
+            continue
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            files.append((name, 'missing'))
+        except OSError as exc:
+            files.append((name, 'error', exc.__class__.__name__))
+        else:
+            kind = 'file' if path.is_file() else 'other'
+            files.append((name, kind, int(stat.st_mtime_ns), int(stat.st_size)))
+    payload = {
+        'version': 2,
+        'profile': _process_wakeup_pause_part(getattr(session, 'profile', None)),
+        'files': files,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def process_wakeup_pause_credential_state_changed(session) -> bool:
+    """Return True when a stored credential pause should be revalidated."""
+    pause = getattr(session, 'process_wakeup_pause', None)
+    if not isinstance(pause, dict) or not pause.get('paused'):
+        return False
+    classification = _process_wakeup_pause_part(pause.get('classification'))
+    if classification not in PROCESS_WAKEUP_PROVIDER_UNAVAILABLE_TYPES:
+        return False
+    previous = str(pause.get('credential_state_fingerprint') or '').strip()
+    if not previous:
+        return True
+    return process_wakeup_credential_state_fingerprint(session) != previous
+
+
+def _get_profile_home(profile) -> Path:
+    """Resolve the hermes agent home directory for the given profile.
+
+    Prefers the profile-specific helper from api.profiles; falls back to the
+    HERMES_HOME environment variable or ~/.hermes, expanding ~ correctly.
+    """
+    try:
+        from api.profiles import get_hermes_home_for_profile
+        return Path(get_hermes_home_for_profile(profile))
+    except ImportError:
+        return Path(os.environ.get('HERMES_HOME') or '~/.hermes').expanduser()
+
+
+_INTERRUPTED_RECOVERED_WORDING = (
+    '**Response interrupted.**\n\n'
+    'The live response stream stopped before this turn finished. '
+    'The partial output above was recovered from the run journal, '
+    'but the interrupted agent process could not continue.'
+)
+_INTERRUPTED_NO_OUTPUT_WORDING = (
+    '**Response interrupted.**\n\n'
+    'The live response stream stopped before this turn finished. '
+    'The user message above was preserved, but no agent output was recovered.'
+)
+_INTERRUPTED_PENDING_RETRY_WORDING = (
+    '**Response interrupted.**\n\n'
+    'The live response stream stopped before this turn finished. '
+    'Recovering the partial output from the run journal — '
+    'reload this session to retry.'
+)
+# Neutral wording used when the lazy retry path gives up (max attempts reached
+# or the marker has been pending longer than _JOURNAL_RETRY_GIVEUP_SECONDS).
+_INTERRUPTED_NEUTRAL_WORDING = (
+    '**Response interrupted.**\n\n'
+    'The live response stream stopped before this turn finished. '
+    'Partial output may have been lost.'
+)
+
+_INTERRUPTION_CAUSE_DETAILS = {
+    'process_restart': (
+        'Evidence: the WebUI process started after this turn began, so this '
+        'looks like a real process crash or restart.'
+    ),
+    'stream_run_split_brain': (
+        'Evidence: the browser response stream was gone but the worker registry '
+        'still listed the run. This is a stream/run bookkeeping split-brain.'
+    ),
+    'lost_worker_bookkeeping': (
+        'Evidence: the stream was gone and worker bookkeeping no longer had an '
+        'active run for it. This usually means the worker state was lost or '
+        'cleaned up without a terminal event.'
+    ),
+    'unknown': (
+        'Evidence: the stream stopped, but the WebUI could not classify the '
+        'interruption more precisely.'
+    ),
+}
+
+
+def _classify_interruption_cause(
+    *, stream_id: str | None = None, pending_started_at=None,
+) -> str:
+    """Classify the stale live-response state without overstating certainty."""
+    try:
+        started = float(pending_started_at) if pending_started_at else None
+    except (TypeError, ValueError):
+        started = None
+
+    if started is not None:
+        try:
+            if float(getattr(_cfg, 'SERVER_START_TIME', 0.0) or 0.0) > started:
+                return 'process_restart'
+        except (TypeError, ValueError):
+            pass
+
+    if stream_id:
+        try:
+            with _cfg.ACTIVE_RUNS_LOCK:
+                if str(stream_id) in _cfg.ACTIVE_RUNS:
+                    return 'stream_run_split_brain'
+        except Exception:
+            pass
+        return 'lost_worker_bookkeeping'
+
+    return 'unknown'
+
+
+def _interrupted_content_for(
+    *, recovered_output: bool, pending_retry: bool, interruption_cause: str,
+) -> str:
+    if recovered_output:
+        outcome = (
+            'The partial output above was recovered from the run journal, '
+            'but the interrupted agent process could not continue.'
+        )
+    elif pending_retry:
+        outcome = (
+            'Recovering the partial output from the run journal — '
+            'reload this session to retry.'
+        )
+    else:
+        outcome = 'The user message above was preserved, but no agent output was recovered.'
+    cause_detail = _INTERRUPTION_CAUSE_DETAILS.get(
+        interruption_cause,
+        _INTERRUPTION_CAUSE_DETAILS['unknown'],
+    )
+    return (
+        '**Response interrupted.**\n\n'
+        'The live response stream stopped before this turn finished. '
+        f'{cause_detail} {outcome}'
+    )
+
+
+def _interrupted_recovery_marker(
+    *,
+    recovered_output: bool = False,
+    pending_retry: bool = False,
+    stream_id: str | None = None,
+    pending_started_at=None,
+) -> dict:
+    """Build the standard interrupted-turn marker.
+
+    ``recovered_output=True`` means the run journal already yielded visible
+    text on this repair pass — the marker advertises that the partial output
+    has been recovered.
+
+    ``pending_retry=True`` is the lazy-retry hook: the journal was unreadable
+    on this pass (page-cache loss, un-fsynced writes on slow FS, etc.). The
+    marker carries a ``_pending_journal_recovery`` flag so a later
+    ``get_session()`` can re-attempt recovery without baking a permanent
+    "no output" claim into the transcript.
+
+    The two are mutually exclusive; ``recovered_output`` wins if both are
+    set so the caller cannot accidentally re-arm retry on a successful
+    repair.
+    """
+    interruption_cause = _classify_interruption_cause(
+        stream_id=stream_id,
+        pending_started_at=pending_started_at,
+    )
+    content = _interrupted_content_for(
+        recovered_output=recovered_output,
+        pending_retry=pending_retry,
+        interruption_cause=interruption_cause,
+    )
+    marker = {
+        'role': 'assistant',
+        'content': content,
+        'timestamp': int(time.time()),
+        '_error': True,
+        'type': 'interrupted',
+        'interruption_cause': interruption_cause,
+    }
+    if pending_retry and not recovered_output:
+        marker['_pending_journal_recovery'] = True
+    return marker
+
+
+def _truncate_journal_tool_args(args, limit: int = 4) -> dict:
+    if not isinstance(args, dict):
+        return {}
+    out = {}
+    for key, value in list(args.items())[:limit]:
+        text = str(value)
+        out[str(key)] = text[:120] + ('...' if len(text) > 120 else '')
+    return out
+
+
+def _normalize_journal_recovery_text(value) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _message_matches_pending_checkpoint(message, pending_text, timestamp, source, attachments):
+    if not isinstance(message, dict) or message.get('role') != 'user':
+        return False
+    try:
+        message_timestamp = int(message.get('timestamp'))
+        expected_timestamp = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    return (
+        _normalize_journal_recovery_text(message.get('content'))
+        == _normalize_journal_recovery_text(pending_text)
+        and message_timestamp == expected_timestamp
+        and (message.get('_source') or 'webui') == (source or 'webui')
+        and list(message.get('attachments') or []) == list(attachments or [])
+    )
+
+
+def _message_matches_pending_text(message, pending_text):
+    if not isinstance(message, dict) or message.get('role') != 'user':
+        return False
+    return (
+        _normalize_journal_recovery_text(message.get('content'))
+        == _normalize_journal_recovery_text(pending_text)
+    )
+
+
+def _latest_user_matches_pending_text(messages, pending_text):
+    if not isinstance(messages, list) or not pending_text:
+        return False
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get('role') == 'user':
+            return _message_matches_pending_text(message, pending_text)
+    return False
+
+
+def _pending_active_turn_token(session):
+    """Return the exact WebUI active-turn token for the pending turn.
+
+    The token is ``"<stream_id>:<pending_started_at>"`` — the same value the
+    eager user-message checkpoint and the agent-result merge stamp onto the
+    materialized user row (``stamp_message_source``). It is unforgeable
+    per-turn identity: two distinct streams that submit the same prompt
+    inside the same second produce different tokens.
+    """
+    from api.process_event_utils import build_active_turn_token
+
+    return build_active_turn_token(
+        getattr(session, 'active_stream_id', None),
+        getattr(session, 'pending_started_at', None),
+    )
+
+
+def _transcript_user_row_is_pending_turn(message, session, pending_token) -> bool:
+    """Return True only when a transcript user row provably IS the pending turn.
+
+    Identity is bound to the active-turn token, never to integer-second
+    timestamp equality: two different streams that send the same prompt
+    within one second truncate to the same ``int(timestamp)``, so the
+    checkpoint matcher alone would accept the *other* stream's row as the
+    pending turn. A token mismatch therefore always loses, and a row that
+    carries no token at all cannot be proven to be this turn — which means
+    the caller must recover, not suppress.
+    """
+    if not isinstance(message, dict) or message.get('role') != 'user':
+        return False
+    row_token = message.get('_active_turn_token')
+    if pending_token:
+        if not row_token:
+            # Ambiguous legacy identity: the pending turn has a resolvable
+            # token but this row predates token stamping. We cannot prove it
+            # is the same turn, so recovery must run.
+            return False
+        return row_token == pending_token
+    if row_token:
+        # The row belongs to a different, token-bearing turn. Never let a
+        # same-second timestamp collision override that mismatch.
+        return False
+    # Neither side carries a token (legacy/dead-stream pending state): fall
+    # back to the strict content + timestamp + source + attachments
+    # checkpoint, which is the only identity signal available.
+    return _message_matches_pending_checkpoint(
+        message,
+        getattr(session, 'pending_user_message', None),
+        getattr(session, 'pending_started_at', None),
+        getattr(session, 'pending_user_source', None),
+        getattr(session, 'pending_attachments', None),
+    )
+
+
+def _pending_turn_has_final_assistant_answer(messages, start_idx: int) -> bool:
+    """Return True when the matched user turn ends in a genuine final answer.
+
+    Reuses the established final-answer semantics
+    (``_assistant_message_has_final_visible_text``) instead of "an assistant
+    row exists". An assistant row only settles the turn when it carries real
+    visible answer text: empty rows, tool-call-only rows, interim
+    ``_partial`` progress rows, rows recovered from the run journal and
+    compaction reference cards are all rejected, so a turn that was
+    interrupted mid-tool-execution is never mistaken for a completed one.
+
+    The scan stops at the next real user row — a final answer that belongs
+    to a *later* turn must not settle this pending turn.
+    """
+    from api.streaming import (
+        _assistant_message_has_final_visible_text,
+        _is_synthetic_control_message,
+    )
+
+    for later in messages[start_idx + 1:]:
+        if not isinstance(later, dict):
+            continue
+        if _is_synthetic_control_message(later):
+            continue
+        role = later.get('role')
+        if role == 'user':
+            if is_context_compression_marker(later):
+                # Synthetic compaction cards are not a user-turn boundary.
+                continue
+            return False
+        if role != 'assistant':
+            # Tool rows never prove a final answer.
+            continue
+        if (
+            later.get('_partial')
+            or later.get('_error')
+            or later.get('_recovered')
+            or later.get('_recovered_from_run_journal')
+        ):
+            continue
+        if is_context_compression_marker(later):
+            continue
+        if _assistant_message_has_final_visible_text(later):
+            return True
+    return False
+
+
+def _transcript_already_advanced_past_pending(session) -> bool:
+    """#6366: a stale pending user message whose own user row already appears
+    in the durable transcript, followed by a genuine final assistant answer
+    inside that same user-turn boundary, means the transcript has already
+    advanced past this pending turn. Returning True here lets the recovery
+    path skip the recovered user / ``_partial`` clone / journal replay /
+    generic no-response error that would otherwise append after the valid
+    final answer. The tail-only check at line ~3485 (``session.messages[-1]``)
+    misses this case: when the pending turn's user row is older than
+    the transcript tail, the tail is a *newer* assistant row that
+    can never match the pending **user** checkpoint, and the recovery
+    path falls through into the append branch.
+
+    Identity is bound to the pending stream's exact active-turn token
+    (``_transcript_user_row_is_pending_turn``), so a repeated prompt from a
+    different stream — even one submitted in the same integer second —
+    can never be matched against this pending turn and silently dropped.
+
+    Completion requires a genuine final visible assistant answer
+    (``_pending_turn_has_final_assistant_answer``): empty, tool-call-only,
+    interim ``_partial``, journal-recovered and compaction tails all keep
+    recovery active, because that is precisely the interrupted-turn shape
+    the recovery path exists for.
+
+    The transcript heuristic alone is not durable: an unflagged interim
+    prose row ("Let me check the logs first.") followed by tool rows that
+    were never followed by a final answer in the transcript passes the
+    predicate as a "completed" turn, but the stream may have died mid-
+    tool and the run journal was never marked done. 9/23 re-gate: also
+    require durable same-stream terminal evidence. The run journal
+    cannot supply that evidence on this path — the caller in
+    ``_apply_core_sync_or_error_marker`` already returns early whenever
+    the run journal reports ``completed`` for the stream, so the branch
+    that reaches this predicate can never observe that state (which is
+    why the previous run-journal gate was unreachable dead code). The
+    evidence therefore has to come from the turn journal, which records
+    the exact-stream ``completed`` event for the pending turn
+    (``_turn_journal_records_completion``). Without it, fall through to
+    the normal journal-recovery path so the partial output is replayed
+    and the interruption is marked.
+
+    The suppression is therefore deliberately conservative: whenever the
+    turn's identity, its completion, or its durable terminal evidence
+    cannot be positively proven, this helper returns False and the
+    prompt is recovered instead of discarded. A false negative leaves a
+    visible cosmetic duplicate; a false positive silently destroys a
+    prompt or a response.
+
+    Idempotent: this is a pure read that does not mutate the session.
+    Running recovery twice therefore produces the same outcome.
+    """
+    pending_text = getattr(session, 'pending_user_message', None)
+    if not pending_text:
+        return False
+    messages = getattr(session, 'messages', None)
+    if not isinstance(messages, list):
+        return False
+    pending_token = _pending_active_turn_token(session)
+    for idx, message in enumerate(messages):
+        if not _transcript_user_row_is_pending_turn(message, session, pending_token):
+            continue
+        # Found the pending turn's own user row at ``idx``. A genuine
+        # final answer inside that turn's boundary is necessary but not
+        # sufficient: durable same-stream terminal evidence must also
+        # exist, otherwise unflagged interim prose
+        # ("Let me check the logs first.") followed by tool rows can be
+        # mistaken for a finished turn.
+        if not _pending_turn_has_final_assistant_answer(messages, idx):
+            continue
+        stream_id = getattr(session, 'active_stream_id', None)
+        # The turn journal — not the run journal — carries the
+        # completion evidence that is still observable here: the caller
+        # (``_apply_core_sync_or_error_marker``) already consumed the
+        # run-journal ``completed`` state on its own early return, so a
+        # run-journal gate at this depth can never fire.
+        if not _turn_journal_records_completion(session, stream_id):
+            # No durable same-stream terminal evidence — the turn may
+            # have died mid-tool. Fall through to the journal-recovery
+            # path instead of suppressing it.
+            return False
+        return True
+    return False
+
+
+def _partial_message_signature(message: dict) -> tuple:
+    """Return a stable identity for partial assistant markers recovered on load."""
+    if not isinstance(message, dict):
+        return ('', '', ())
+    tool_sig = []
+    for tool_call in message.get('_partial_tool_calls') or []:
+        if not isinstance(tool_call, dict):
+            continue
+        try:
+            args_sig = json.dumps(
+                tool_call.get('args') or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            args_sig = str(tool_call.get('args') or '')
+        tool_sig.append((
+            str(tool_call.get('name') or ''),
+            args_sig,
+            bool(tool_call.get('done', False)),
+            bool(tool_call.get('is_error', False)),
+            str(tool_call.get('preview') or tool_call.get('snippet') or ''),
+        ))
+    return (
+        str(message.get('content') or '').strip(),
+        str(message.get('reasoning') or '').strip(),
+        tuple(tool_sig),
+    )
+
+
+def _collapse_adjacent_duplicate_partials(messages) -> tuple[list, bool]:
+    """Collapse repeated identical partial markers from the same failed turn."""
+    if not isinstance(messages, list):
+        return messages, False
+    collapsed = []
+    changed = False
+    previous_partial_sig = None
+    for message in messages:
+        if isinstance(message, dict) and message.get('_partial'):
+            sig = _partial_message_signature(message)
+            if previous_partial_sig == sig:
+                changed = True
+                continue
+            previous_partial_sig = sig
+        else:
+            previous_partial_sig = None
+        collapsed.append(message)
+    return collapsed, changed
+
+
+def _find_existing_assistant_for_journal_content(
+    session,
+    content: str,
+    *,
+    min_index: int | None = None,
+    max_index: int | None = None,
+    excluded_indexes: set[int] | None = None,
+) -> int | None:
+    candidate = _normalize_journal_recovery_text(content)
+    if not candidate:
+        return None
+    messages = session.messages or []
+    start = 0 if min_index is None else max(0, min(len(messages), min_index))
+    stop = len(messages) if max_index is None else max(start, min(len(messages), max_index))
+    substring_match = None
+    for idx in range(start, stop):
+        if excluded_indexes and idx in excluded_indexes:
+            continue
+        message = messages[idx]
+        if not isinstance(message, dict) or message.get('role') != 'assistant':
+            continue
+        if message.get('_error'):
+            continue
+        existing = _normalize_journal_recovery_text(message.get('content'))
+        if not existing:
+            continue
+        if existing == candidate:
+            return idx
+        if substring_match is None and len(candidate) >= 24 and candidate in existing:
+            substring_match = idx
+    return substring_match
+
+
+def _journal_tool_already_present(
+    session,
+    name: str,
+    preview: str,
+    *,
+    stream_id: str | None = None,
+    tool_id: str | None = None,
+    min_assistant_idx: int | None = None,
+    max_assistant_idx: int | None = None,
+) -> bool:
+    """Return True when an equivalent tool card already exists.
+
+    Matching rule:
+
+    * If the existing tool card carries ``_recovered_stream_id``, that means a
+      previous journal-recovery run materialized it.  The retry can safely
+      collapse against it only when both stream ids match — otherwise a
+      legitimately-repeated tool (e.g. a second ``terminal: ls`` in a
+      different turn) would be dropped.
+    * If the existing tool card has no ``_recovered_stream_id`` (a live tool
+      card, or a tool card carried over from a core transcript that pre-dates
+      stream-id tagging), the legacy name+preview match still wins.  This
+      preserves the "core transcript already has this tool, don't duplicate
+      it" invariant the original repair path established.
+    * When ``stream_id`` is omitted, the helper degrades cleanly to its
+      pre-fix session-wide behaviour.
+    """
+    candidate_name = str(name or '')
+    candidate_preview = _normalize_journal_recovery_text(preview)
+    candidate_stream = str(stream_id) if stream_id else None
+    candidate_tool_id = str(tool_id or '').strip() or None
+    for tool_call in session.tool_calls or []:
+        if not isinstance(tool_call, dict):
+            continue
+        if str(tool_call.get('name') or '') != candidate_name:
+            continue
+        existing_preview = _normalize_journal_recovery_text(
+            tool_call.get('preview') or tool_call.get('snippet') or ''
+        )
+        if existing_preview != candidate_preview:
+            continue
+        if candidate_tool_id is not None:
+            existing_tool_id = str(
+                tool_call.get('tid') or tool_call.get('tool_call_id') or ''
+            ).strip()
+            if existing_tool_id and existing_tool_id != candidate_tool_id:
+                continue
+        if candidate_stream is not None:
+            existing_stream = tool_call.get('_recovered_stream_id')
+            # A tool card explicitly tagged with a recovered_stream_id that
+            # differs from ours belongs to another retry's turn — don't let
+            # it pre-empt this retry. An exact tagged retry remains globally
+            # eligible for idempotence even if later transcript edits moved
+            # its owner outside the original positional window.
+            if existing_stream:
+                if str(existing_stream) != candidate_stream:
+                    continue
+                return True
+        if min_assistant_idx is not None or max_assistant_idx is not None:
+            owner_idx = tool_call.get('assistant_msg_idx')
+            if type(owner_idx) is not int:
+                continue
+            if min_assistant_idx is not None and owner_idx < min_assistant_idx:
+                continue
+            if max_assistant_idx is not None and owner_idx >= max_assistant_idx:
+                continue
+        return True
+    return False
+
+
+def _run_journal_has_visible_output(session, stream_id: str | None) -> bool:
+    if not stream_id:
+        return False
+    try:
+        from api.run_journal import read_run_events
+        journal = read_run_events(session.session_id, stream_id, validated_recovery=True)
+    except Exception:
+        return False
+    for event in journal.get('events') or []:
+        if not isinstance(event, dict):
+            continue
+        event_name = str(event.get('event') or event.get('type') or '')
+        payload = event.get('payload') if isinstance(event.get('payload'), dict) else {}
+        if event_name == 'token' and str(payload.get('text') or ''):
+            return True
+        if event_name == 'interim_assistant':
+            if payload.get('already_streamed'):
+                continue
+            if str(payload.get('text') or '').strip():
+                return True
+        if event_name == 'reasoning':
+            reasoning_text = str(
+                payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
+            )
+            if reasoning_text.strip():
+                return True
+        if event_name == 'tool':
+            return True
+    return False
+
+
+def _run_journal_event_owns_run(
+    event,
+    session_id: str,
+    stream_id: str | None,
+) -> bool:
+    if not isinstance(event, dict) or not stream_id:
+        return False
+    seq = event.get('seq')
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        return False
+    return (
+        event.get('session_id') == session_id
+        and event.get('run_id') == stream_id
+        and event.get('event_id') == f"{stream_id}:{seq}"
+    )
+
+
+def _run_journal_terminal_state(session, stream_id: str | None) -> str | None:
+    if not stream_id:
+        return None
+    try:
+        from api.run_journal import (
+            read_run_events,
+            select_authoritative_terminal_event,
+        )
+        journal = read_run_events(session.session_id, stream_id, validated_recovery=True)
+        terminal = select_authoritative_terminal_event(journal.get('events') or [])
+    except Exception:
+        return None
+    if (
+        not _run_journal_event_owns_run(
+            terminal, session.session_id, stream_id,
+        )
+        or terminal.get('terminal') is not True
+    ):
+        return None
+    return str(terminal.get('terminal_state') or '') or None
+
+
+def _turn_journal_records_completion(session, stream_id: str | None) -> bool:
+    """Return True when the crash-safe turn journal proves the turn for
+    ``stream_id`` reached its terminal ``completed`` state.
+
+    The turn journal is written per stream/turn id by the exact-stream
+    workers and by :mod:`api.routes` on submission, so a ``completed``
+    event for the *pending stream id* is completion evidence that
+    survives a run-journal write failure: the run journal only reaches
+    ``done`` / ``stream_end`` on its own write path, and a process that
+    dies between the turn journal write and the run-journal terminal
+    append leaves the run journal without terminal state while the turn
+    journal still records that the turn actually finished.
+
+    Bound strictly to ``stream_id`` — a ``completed`` turn belonging to
+    another stream of the same session never settles this one — and to
+    the latest turn recorded for that stream, so a turn that was
+    cancelled or crashed (``interrupted``) keeps recovery active even
+    when an earlier turn of the same stream completed normally.
+    """
+    if not stream_id:
+        return False
+    try:
+        from api.turn_journal import (
+            derive_turn_journal_states,
+            read_turn_journal,
+        )
+        journal = read_turn_journal(session.session_id)
+        states, _ = derive_turn_journal_states(journal.get('events') or [])
+    except Exception:
+        return False
+    latest: tuple[float, str, dict] | None = None
+    for turn_id, event in states.items():
+        if str(event.get('stream_id') or '') != str(stream_id):
+            continue
+        try:
+            created_at = float(event.get('created_at') or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        # ``>=`` on both elements keeps the winner deterministic when two
+        # turns of the same stream share a ``created_at``.
+        candidate = (created_at, turn_id, event)
+        if latest is None or candidate[:2] >= latest[:2]:
+            latest = candidate
+    if latest is None:
+        return False
+    return latest[2].get('event') == 'completed'
+
+
+def _recoverable_unsaved_gateway_terminal_error(
+    session,
+    stream_id: str | None,
+) -> dict | None:
+    """Return one validated current-turn terminal error from the run journal."""
+    if not stream_id:
+        return None
+    try:
+        from api.run_journal import (
+            read_run_events,
+            select_authoritative_terminal_event,
+        )
+        journal = read_run_events(session.session_id, stream_id, validated_recovery=True)
+    except Exception:
+        logger.debug(
+            "Session %s: failed to read terminal error journal for stream %s",
+            getattr(session, 'session_id', '?'),
+            stream_id,
+            exc_info=True,
+        )
+        return None
+
+    event = select_authoritative_terminal_event(journal.get('events') or [])
+    if (
+        not isinstance(event, dict)
+        or event.get('event') != 'apperror'
+        or event.get('type') != 'apperror'
+        or event.get('terminal') is not True
+    ):
+        return None
+    if (
+        not _run_journal_event_owns_run(
+            event, session.session_id, stream_id,
+        )
+    ):
+        return None
+    expected_event_id = event['event_id']
+
+    payload = event.get('payload')
+    if not isinstance(payload, dict) or payload.get('session_id') != session.session_id:
+        return None
+    embedded_session = payload.get('session')
+    if (
+        not isinstance(embedded_session, dict)
+        or embedded_session.get('session_id') != session.session_id
+    ):
+        return None
+    persisted_id = payload.get('terminal_session_persisted_session_id')
+    if (
+        payload.get('terminal_session_persisted') is True
+        and persisted_id == session.session_id
+    ):
+        return None
+
+    embedded_messages = embedded_session.get('messages')
+    if not isinstance(embedded_messages, list):
+        return None
+    current_user_idx = next(
+        (
+            idx
+            for idx in range(len(embedded_messages) - 1, -1, -1)
+            if isinstance(embedded_messages[idx], dict)
+            and embedded_messages[idx].get('role') == 'user'
+        ),
+        None,
+    )
+    if current_user_idx is None:
+        return None
+    candidate = next(
+        (
+            embedded_messages[idx]
+            for idx in range(len(embedded_messages) - 1, current_user_idx, -1)
+            if isinstance(embedded_messages[idx], dict)
+            and embedded_messages[idx].get('role') == 'assistant'
+        ),
+        None,
+    )
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get('_error') is not True
+        or not isinstance(candidate.get('content'), str)
+        or not candidate.get('content').strip()
+    ):
+        return None
+    return {
+        'event_id': expected_event_id,
+        'stream_id': stream_id,
+        'message': dict(candidate),
+    }
+
+
+def _pending_recovery_turn_start(session) -> int | None:
+    pending_text = getattr(session, 'pending_user_message', None)
+    if not pending_text:
+        return None
+    for idx in range(len(session.messages or []) - 1, -1, -1):
+        message = session.messages[idx]
+        if _message_matches_pending_checkpoint(
+            message,
+            pending_text,
+            session.pending_started_at,
+            session.pending_user_source,
+            session.pending_attachments,
+        ) or _message_matches_pending_text(message, pending_text):
+            return idx
+    return None
+
+
+def _materialize_unsaved_gateway_terminal_error(
+    session,
+    stream_id: str | None,
+    recovery: dict | None = None,
+) -> bool:
+    """Place the validated current-turn gateway error at the transcript tail."""
+    recovery = recovery or _recoverable_unsaved_gateway_terminal_error(
+        session, stream_id,
+    )
+    if not isinstance(recovery, dict):
+        return False
+    event_id = recovery.get('event_id')
+    candidate = recovery.get('message')
+    if not event_id or not isinstance(candidate, dict):
+        return False
+
+    for existing in session.messages or []:
+        if (
+            isinstance(existing, dict)
+            and existing.get('_recovered_event_id') == event_id
+        ):
+            return True
+
+    turn_start = _pending_recovery_turn_start(session)
+    if turn_start is not None:
+        for existing in reversed((session.messages or [])[turn_start + 1:]):
+            if not isinstance(existing, dict):
+                continue
+            existing_stream = existing.get('_recovered_stream_id')
+            if existing_stream and existing_stream != stream_id:
+                continue
+            if (
+                existing.get('role') == 'assistant'
+                and existing.get('_error') is True
+                and existing.get('content') == candidate.get('content')
+            ):
+                existing['_recovered_from_run_journal'] = True
+                existing['_recovered_stream_id'] = stream_id
+                existing['_recovered_event_id'] = event_id
+                return True
+
+    recovered = dict(candidate)
+    recovered['_recovered_from_run_journal'] = True
+    recovered['_recovered_stream_id'] = stream_id
+    recovered['_recovered_event_id'] = event_id
+    session.messages.append(recovered)
+    return True
+
+
+def _recover_journaled_output_and_terminal_error(
+    session,
+    stream_id: str | None,
+    *,
+    dedupe_existing: bool = False,
+    terminal_recovery: dict | None = None,
+    append_context: bool = True,
+    dedupe_min_index: int | None = None,
+    dedupe_max_index: int | None = None,
+) -> tuple[bool, bool]:
+    """Recover readable activity first, then append its authoritative terminal error."""
+    recovered_output = _append_journaled_partial_output(
+        session,
+        stream_id,
+        dedupe_existing=dedupe_existing,
+        dedupe_min_index=dedupe_min_index,
+        dedupe_max_index=dedupe_max_index,
+        append_context=append_context,
+        display_only=not append_context,
+    )
+    terminal_error_recovered = _materialize_unsaved_gateway_terminal_error(
+        session,
+        stream_id,
+        terminal_recovery,
+    )
+    return recovered_output, terminal_error_recovered
+
+
+def _journal_is_still_arriving(session, stream_id: str | None) -> bool:
+    """Return True for journals that may become visible on a later read.
+
+    `read_run_events()` deliberately collapses missing files and empty files
+    into an empty event list, so the lazy retry path needs a small filesystem
+    visibility check to avoid burning all retry attempts while WSL2 / network
+    filesystems are still surfacing the journal.  Non-empty journals are treated
+    as sealed enough for retry-budget accounting; if they contain no visible
+    output, the normal capped give-up path handles them.
+    """
+    if not stream_id:
+        return False
+    try:
+        from api.run_journal import _run_path, latest_run_summary
+
+        path = _run_path(session.session_id, stream_id)
+        summary = latest_run_summary(session.session_id, stream_id)
+        if summary.get('terminal'):
+            return False
+        try:
+            return (not path.exists()) or path.stat().st_size == 0
+        except OSError:
+            return True
+    except Exception:
+        logger.debug(
+            "Session %s: failed to classify journal visibility for stream %s",
+            getattr(session, 'session_id', '?'),
+            stream_id,
+            exc_info=True,
+        )
+        return False
+
+
+def _append_journaled_partial_output(
+    session,
+    stream_id: str | None,
+    *,
+    dedupe_existing: bool = False,
+    dedupe_min_index: int | None = None,
+    dedupe_max_index: int | None = None,
+    append_context: bool = True,
+    display_only: bool = False,
+) -> bool:
+    """Recover already-emitted visible output from a dead stream journal.
+
+    This repair path is intentionally conservative: it restores user-visible
+    assistant text, display-only reasoning, and tool-card metadata that had
+    already been emitted over SSE before the WebUI process died. Restored
+    reasoning stays out of ``context_messages`` so it cannot become provider-
+    facing history. The repair does not try to continue execution.
+    """
+    if not stream_id:
+        return False
+
+    try:
+        from api.run_journal import read_run_events
+        journal = read_run_events(session.session_id, stream_id, validated_recovery=True)
+    except Exception:
+        logger.debug(
+            "Session %s: failed to read run journal for stream %s",
+            getattr(session, 'session_id', '?'),
+            stream_id,
+            exc_info=True,
+        )
+        return False
+
+    events = [event for event in journal.get('events') or [] if isinstance(event, dict)]
+    if not events:
+        return False
+
+    appended_any = False
+    assistant_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    assistant_started_at: float | None = None
+    current_assistant_idx: int | None = None
+    recovered_tool_calls: list[dict] = []
+    initial_message_count = len(session.messages or [])
+    claimed_existing_assistant_indexes: set[int] = set()
+
+    def content_match_can_receive_reasoning(existing_idx: int) -> bool:
+        messages = session.messages or []
+        owner_idx = None
+        for candidate_idx in range(existing_idx - 1, -1, -1):
+            candidate = messages[candidate_idx]
+            if isinstance(candidate, dict) and candidate.get('role') == 'user':
+                owner_idx = candidate_idx
+                break
+        if owner_idx is None:
+            return False
+
+        pending_text = _normalize_journal_recovery_text(session.pending_user_message)
+        if pending_text and not _message_matches_pending_checkpoint(
+            messages[owner_idx],
+            session.pending_user_message,
+            session.pending_started_at,
+            session.pending_user_source,
+            session.pending_attachments,
+        ):
+            return False
+
+        for candidate_idx in range(existing_idx + 1, initial_message_count):
+            candidate = messages[candidate_idx]
+            if not isinstance(candidate, dict) or candidate.get('role') != 'user':
+                continue
+            candidate_text = _normalize_journal_recovery_text(candidate.get('content'))
+            candidate_matches_checkpoint = pending_text and _message_matches_pending_checkpoint(
+                candidate,
+                session.pending_user_message,
+                session.pending_started_at,
+                session.pending_user_source,
+                session.pending_attachments,
+            )
+            if candidate_matches_checkpoint and candidate.get('_recovered'):
+                continue
+            if pending_text and candidate_text == pending_text:
+                return False
+            return False
+        return True
+
+    def append_context_projection(message: dict) -> None:
+        if not append_context:
+            return
+        context_projection = dict(message)
+        context_projection.pop('reasoning', None)
+        _append_recovered_turn_to_context(session, context_projection)
+
+    def attach_display_reasoning(message: dict, reasoning: str) -> bool:
+        if not reasoning:
+            return False
+        existing = str(message.get('reasoning') or '').strip()
+        if existing:
+            return False
+        message['reasoning'] = reasoning
+        return True
+
+    def flush_assistant() -> int | None:
+        nonlocal appended_any, assistant_parts, reasoning_parts
+        nonlocal assistant_started_at, current_assistant_idx
+        content = ''.join(assistant_parts).strip()
+        reasoning = ''.join(reasoning_parts).strip()
+        assistant_parts = []
+        reasoning_parts = []
+        if not content and not reasoning:
+            return current_assistant_idx
+        if dedupe_existing and content:
+            search_excluded = set(claimed_existing_assistant_indexes)
+            existing_idx = None
+            while True:
+                candidate_idx = _find_existing_assistant_for_journal_content(
+                    session,
+                    content,
+                    min_index=dedupe_min_index,
+                    max_index=(
+                        initial_message_count
+                        if dedupe_max_index is None
+                        else min(initial_message_count, dedupe_max_index)
+                    ),
+                    excluded_indexes=search_excluded,
+                )
+                if candidate_idx is None:
+                    break
+                if not reasoning or content_match_can_receive_reasoning(candidate_idx):
+                    existing_idx = candidate_idx
+                    break
+                search_excluded.add(candidate_idx)
+            if existing_idx is not None:
+                claimed_existing_assistant_indexes.add(existing_idx)
+                current_assistant_idx = existing_idx
+                assistant_started_at = None
+                if 0 <= existing_idx < len(session.messages):
+                    existing_message = session.messages[existing_idx]
+                    append_context_projection(existing_message)
+                    if attach_display_reasoning(existing_message, reasoning):
+                        appended_any = True
+                return existing_idx
+        if dedupe_existing and reasoning and not content:
+            reasoning_start = (
+                0
+                if dedupe_min_index is None
+                else max(0, min(initial_message_count, dedupe_min_index))
+            )
+            reasoning_stop = (
+                initial_message_count
+                if dedupe_max_index is None
+                else max(reasoning_start, min(initial_message_count, dedupe_max_index))
+            )
+            for existing_idx in range(reasoning_start, reasoning_stop):
+                if existing_idx in claimed_existing_assistant_indexes:
+                    continue
+                existing_message = session.messages[existing_idx]
+                if not isinstance(existing_message, dict):
+                    continue
+                if (
+                    existing_message.get('_recovered_from_run_journal')
+                    and existing_message.get('_recovered_stream_id') == stream_id
+                    and existing_message.get('role') == 'assistant'
+                    and not str(existing_message.get('content') or '').strip()
+                    and str(existing_message.get('reasoning') or '').strip() == reasoning
+                ):
+                    claimed_existing_assistant_indexes.add(existing_idx)
+                    current_assistant_idx = existing_idx
+                    assistant_started_at = None
+                    return existing_idx
+        timestamp = int(assistant_started_at or time.time())
+        recovered_assistant = {
+            'role': 'assistant',
+            'content': content,
+            'timestamp': timestamp,
+            '_recovered_from_run_journal': True,
+            '_recovered_stream_id': stream_id,
+        }
+        attach_display_reasoning(recovered_assistant, reasoning)
+        if display_only:
+            recovered_assistant['_recovered_display_only'] = True
+        session.messages.append(recovered_assistant)
+        append_context_projection(recovered_assistant)
+        current_assistant_idx = len(session.messages) - 1
+        assistant_started_at = None
+        appended_any = True
+        return current_assistant_idx
+
+    def ensure_assistant_anchor(created_at: float | None = None) -> int:
+        nonlocal appended_any, current_assistant_idx
+        idx = flush_assistant()
+        if idx is not None:
+            return idx
+        # A stream can start with tools before any text. Keep those tools
+        # visible after restart with an empty recovered assistant anchor instead
+        # of inventing synthetic progress prose.
+        #
+        # Dedup guard (#3875): reuse an existing empty recovered anchor for THIS
+        # stream instead of appending a fresh one. The lazy read-side retry path
+        # (_retry_journal_recovery_in_place) re-runs this recovery on repeated
+        # get_session() calls, and a tool-first stream that never emitted text
+        # has no content to dedup on (flush_assistant() returns early on empty),
+        # so without this guard each retry — and each distinct interrupted stream
+        # over the session's life — appends another empty anchor. A session that
+        # was interrupted-and-recovered many times then accumulates thousands of
+        # empty content-less assistant rows, bloating the file and (combined with
+        # the render path) painting the transcript blank. One anchor per stream
+        # is all that's needed to host its recovered tool cards.
+        for _existing_idx in range(len(session.messages) - 1, -1, -1):
+            _m = session.messages[_existing_idx]
+            if not isinstance(_m, dict):
+                continue
+            if (
+                _m.get('_recovered_from_run_journal')
+                and _m.get('_recovered_stream_id') == stream_id
+                and _m.get('role') == 'assistant'
+                and not str(_m.get('content') or '').strip()
+                and not str(_m.get('reasoning') or '').strip()
+            ):
+                current_assistant_idx = _existing_idx
+                return _existing_idx
+        recovered_anchor = {
+            'role': 'assistant',
+            'content': '',
+            'timestamp': int(created_at or time.time()),
+            '_recovered_from_run_journal': True,
+            '_recovered_stream_id': stream_id,
+        }
+        if display_only:
+            recovered_anchor['_recovered_display_only'] = True
+        session.messages.append(recovered_anchor)
+        current_assistant_idx = len(session.messages) - 1
+        appended_any = True
+        return current_assistant_idx
+
+    for event in events:
+        event_name = str(event.get('event') or event.get('type') or '')
+        payload = event.get('payload') if isinstance(event.get('payload'), dict) else {}
+        created_at = event.get('created_at') if isinstance(event.get('created_at'), (int, float)) else None
+        if event_name == 'reasoning':
+            text = str(
+                payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
+            )
+            if not text:
+                continue
+            if not assistant_parts and not reasoning_parts and assistant_started_at is None:
+                assistant_started_at = created_at or time.time()
+            reasoning_parts.append(text)
+            continue
+        if event_name == 'token':
+            text = str(payload.get('text') or '')
+            if not text:
+                continue
+            if not assistant_parts and assistant_started_at is None:
+                assistant_started_at = created_at or time.time()
+            assistant_parts.append(text)
+            continue
+        if event_name == 'interim_assistant':
+            if payload.get('already_streamed'):
+                flush_assistant()
+                continue
+            text = str(payload.get('text') or '').strip()
+            if not text:
+                continue
+            if not assistant_parts and assistant_started_at is None:
+                assistant_started_at = created_at or time.time()
+            if assistant_parts and not ''.join(assistant_parts).endswith(('\n', ' ')):
+                assistant_parts.append('\n\n')
+            assistant_parts.append(text)
+            flush_assistant()
+            continue
+        if event_name == 'tool':
+            anchor_idx = flush_assistant()
+            if anchor_idx is None:
+                anchor_idx = ensure_assistant_anchor(created_at)
+            name = str(payload.get('name') or 'tool')
+            preview = str(payload.get('preview') or '')
+            tool_id = str(
+                payload.get('tid') or payload.get('tool_call_id') or ''
+            ).strip()
+            if dedupe_existing and _journal_tool_already_present(
+                session,
+                name,
+                preview,
+                stream_id=stream_id,
+                tool_id=tool_id or None,
+                min_assistant_idx=dedupe_min_index,
+                max_assistant_idx=dedupe_max_index,
+            ):
+                current_assistant_idx = anchor_idx
+                continue
+            recovered_tool_calls.append({
+                'name': name,
+                'preview': preview,
+                'snippet': preview,
+                'tid': (
+                    tool_id
+                    or f"journal-{event.get('seq') or len(recovered_tool_calls) + 1}"
+                ),
+                '_journal_synthetic_tid': not bool(tool_id),
+                'assistant_msg_idx': anchor_idx,
+                'args': _truncate_journal_tool_args(payload.get('args') or {}),
+                'done': False,
+                '_recovered_from_run_journal': True,
+                '_recovered_stream_id': stream_id,
+            })
+            appended_any = True
+            current_assistant_idx = anchor_idx
+            continue
+        if event_name == 'tool_complete':
+            name = str(payload.get('name') or '')
+            completion_tool_id = str(
+                payload.get('tid') or payload.get('tool_call_id') or ''
+            ).strip()
+            unfinished = [call for call in reversed(recovered_tool_calls) if not call.get('done')]
+            matched_tool = None
+            if completion_tool_id:
+                matched_tool = next((
+                    call for call in unfinished
+                    if str(call.get('tid') or '') == completion_tool_id
+                ), None)
+                if matched_tool is None:
+                    matched_tool = next((
+                        call for call in unfinished
+                        if call.get('_journal_synthetic_tid')
+                        and name and call.get('name') == name
+                    ), None)
+            else:
+                matched_tool = next((
+                    call for call in unfinished
+                    if not name or call.get('name') == name
+                ), None)
+            if matched_tool is not None:
+                tool_call = matched_tool
+                tool_call['done'] = True
+                if payload.get('preview'):
+                    tool_call['preview'] = str(payload.get('preview') or '')
+                    tool_call['snippet'] = str(payload.get('preview') or '')
+                if payload.get('duration') is not None:
+                    tool_call['duration'] = payload.get('duration')
+                tool_call['is_error'] = bool(payload.get('is_error', False))
+            continue
+        if event_name in {'done', 'stream_end', 'cancel', 'apperror', 'error'}:
+            flush_assistant()
+
+    flush_assistant()
+    if recovered_tool_calls:
+        for tool_call in recovered_tool_calls:
+            tool_call.pop('_journal_synthetic_tid', None)
+        session.tool_calls = list(session.tool_calls or []) + recovered_tool_calls
+        appended_any = True
+    return appended_any
+
+
+# ── Lazy run-journal recovery (read-side self-heal) ─────────────────────────
+#
+# When sidecar repair runs before the run-journal for the dead stream is
+# visible on disk (page-cache loss on WSL2 9p / DrvFs, an un-fsynced journal
+# tail, a slow network FS, …), `_append_journaled_partial_output` returns
+# False even though the journaled events will appear on disk shortly. Without
+# the helpers below the repair path baked a permanent "no agent output was
+# recovered" claim into the marker, and a later session read could never
+# correct it.
+#
+# The contract is:
+#
+#   * Sidecar repair (`_apply_core_sync_or_error_marker`) writes a marker
+#     with `_pending_journal_recovery=True` whenever it could not recover
+#     visible output AND the stream id is known. Three retry-meta keys go
+#     onto the marker: `_journal_retry_stream_id`, `_journal_retry_attempts`,
+#     `_journal_retry_first_seen_ts`.
+#   * Every `get_session()` call that returns the full session checks the
+#     latest assistant marker; if the flag is set it re-runs journaled output
+#     and terminal-error recovery with `dedupe_existing=True`. On success,
+#     journaled rows move above the marker. A specific gateway terminal error
+#     replaces the marker; otherwise the marker is promoted to recovered-output
+#     wording and its retry meta is stripped. If the journal is still missing or
+#     zero-byte, the retry is a no-op and does not consume attempt budget.
+#     Terminal/non-useful journals consume attempt budget and can demote
+#     immediately at the max-attempt cap.
+#   * After `_JOURNAL_RETRY_MAX_ATTEMPTS` failed retries or
+#     `_JOURNAL_RETRY_GIVEUP_SECONDS` of wall-clock age, the marker is
+#     demoted to the neutral wording ("Partial output may have been lost.")
+#     so users do not see "reload to retry" prompts forever.
+_JOURNAL_RETRY_MAX_ATTEMPTS = 12
+_JOURNAL_RETRY_GIVEUP_SECONDS = 24 * 3600
+# Persisted cancel-recovery hooks record the process instance that created
+# them. ACTIVE_RUNS can be reaped while a wedged worker still exists, so
+# registry absence alone is not proof that a same-process journal can no
+# longer receive writes. A fresh process gets a fresh token; that is positive
+# evidence the old writer cannot still be running in this interpreter.
+_JOURNAL_RECOVERY_PROCESS_TOKEN = uuid.uuid4().hex
+_JOURNAL_RETRY_LOCKS: dict[str, threading.Lock] = {}
+_JOURNAL_RETRY_LOCKS_GUARD = threading.Lock()
+
+
+def _journal_retry_lock_for_sid(sid: str) -> threading.Lock:
+    with _JOURNAL_RETRY_LOCKS_GUARD:
+        return _JOURNAL_RETRY_LOCKS.setdefault(str(sid), threading.Lock())
+
+
+def _build_recovery_marker_with_retry_hook(
+    *, recovered_output: bool, stream_id: str | None, pending_started_at=None,
+) -> dict:
+    """Build an interrupted-turn marker, arming the lazy-retry hook when
+    visible output was not recovered yet but a stream id is available."""
+    if recovered_output:
+        return _interrupted_recovery_marker(
+            recovered_output=True,
+            stream_id=stream_id,
+            pending_started_at=pending_started_at,
+        )
+    if not stream_id:
+        return _interrupted_recovery_marker(
+            recovered_output=False,
+            pending_started_at=pending_started_at,
+        )
+    marker = _interrupted_recovery_marker(
+        pending_retry=True,
+        stream_id=stream_id,
+        pending_started_at=pending_started_at,
+    )
+    marker['_journal_retry_stream_id'] = str(stream_id)
+    marker['_journal_retry_attempts'] = 0
+    marker['_journal_retry_first_seen_ts'] = int(time.time())
+    return marker
+
+
+def _is_cancel_journal_retry_marker(message: dict) -> bool:
+    """Return True for a durable journal-only Stop recovery marker."""
+    return (
+        isinstance(message, dict)
+        and message.get('_pending_journal_recovery') is True
+        and message.get('_journal_retry_kind') == 'cancelled'
+    )
+
+
+def _cancel_journal_retry_owner_index(session, marker_idx: int, marker: dict) -> int | None:
+    """Resolve the exact token-bearing user row owned by a cancel hook."""
+    messages = getattr(session, 'messages', None) or []
+    owner_token = str(marker.get('_journal_retry_owner_token') or '').strip()
+    if not owner_token:
+        return None
+    matches = [
+        index
+        for index, row in enumerate(messages[:marker_idx])
+        if (
+            isinstance(row, dict)
+            and row.get('role') == 'user'
+            and str(row.get('_active_turn_token') or '').strip() == owner_token
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+
+def _journal_user_identity_details(row):
+    """Keep stable user identities in separate namespaces; reject bad aliases."""
+    stable, stable_valid = _stable_message_identity_details(row)
+    state_row, state_valid = _state_db_row_identity_details(row)
+    identities = {'message': stable, 'state_row': state_row}
+    valid = stable_valid and state_valid
+    for key in ('_active_turn_token', 'message_uid'):
+        value = row.get(key)
+        if value is None or value == '':
+            identities[key] = None
+        elif isinstance(value, str) and value.strip():
+            identities[key] = value.strip()
+        else:
+            identities[key] = None
+            valid = False
+    return identities, valid
+
+
+def _journal_user_display_text(row):
+    """Compare display text without rewriting native image/provider payloads."""
+    from api.streaming import _strip_title_attachment_suffix, _strip_workspace_prefix
+
+    content = row.get('content')
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                return None
+            kind = part.get('type')
+            if kind in ('text', 'input_text', 'output_text'):
+                if not isinstance(part.get('text'), str):
+                    return None
+                parts.append(part['text'])
+            elif kind not in ('image_url', 'input_image', 'image'):
+                return None
+        text = '\n'.join(parts)
+    else:
+        return None
+    return _strip_workspace_prefix(
+        _strip_title_attachment_suffix(text), include_legacy=True,
+    )
+
+
+def _journal_user_metadata_key(row):
+    timestamp = row.get('timestamp')
+    # Preserve exact numeric timestamps: float coercion loses large-int identity,
+    # and booleans/nonfinite values must never establish ownership.
+    if timestamp is not None and (type(timestamp) not in (int, float)
+                                 or (isinstance(timestamp, float) and not math.isfinite(timestamp))):
+        return None
+    source = row.get('_source')
+    # Only absent/blank string metadata has the legacy WebUI default. Falsy
+    # non-strings are malformed authority, not permission to infer an owner.
+    if source is None or source == '':
+        source = 'webui'
+    if not isinstance(source, str):
+        return None
+    return timestamp, source.strip().casefold()
+
+
+def _journal_user_fallback_key(row):
+    metadata = _journal_user_metadata_key(row)
+    text = _journal_user_display_text(row)
+    if metadata is None or metadata[0] is None or text is None:
+        return None
+    return (*metadata, text)
+
+
+def _journal_user_timestamps_match(left, right) -> bool:
+    """Match exact times or a legacy integer against its finite fractional time."""
+    if type(left) not in (int, float) or type(right) not in (int, float):
+        return False
+    if any(type(value) is float and not math.isfinite(value) for value in (left, right)):
+        return False
+    if left == right:
+        return True
+    if type(left) is int:
+        return left == int(right)
+    if type(right) is int:
+        return int(left) == right
+    return False
+
+
+def _journal_user_fallback_keys_match(left, right) -> bool:
+    return (left is not None and right is not None and left[1:] == right[1:]
+            and _journal_user_timestamps_match(left[0], right[0]))
+
+
+def _interrupted_journal_context_owner(session, marker_idx: int, owner_idx: int | None):
+    """Prove an interrupted owner and its successor across rich projections."""
+    messages = session.messages or []
+    context = getattr(session, 'context_messages', None)
+    if owner_idx is None or not isinstance(context, list):
+        return None
+    display_users = [row for row in messages if isinstance(row, dict) and row.get('role') == 'user']
+    context_users = [row for row in context if isinstance(row, dict) and row.get('role') == 'user']
+    display_rows = [row for row in messages if isinstance(row, dict)]
+    context_rows = [row for row in context if isinstance(row, dict)]
+
+    def identity_projections(namespace):
+        # Turn tokens identify user turns; stable message/DB/UID identities are
+        # message-wide, so an assistant/tool alias also defeats uniqueness.
+        return (display_users, context_users) if namespace == '_active_turn_token' else (display_rows, context_rows)
+
+    def unique_context_user(expected):
+        identities, valid = _journal_user_identity_details(expected)
+        if not valid:
+            return None
+        for namespace, value in identities.items():
+            if value is not None and any(
+                sum(_journal_user_identity_details(row)[0][namespace] == value for row in users) > 1
+                for users in identity_projections(namespace)
+            ):
+                return None
+        expected_metadata = _journal_user_metadata_key(expected)
+        if expected_metadata is None:
+            return None
+        expected_key = _journal_user_fallback_key(expected)
+        matches = []
+        for row in context_users:
+            row_ids, row_valid = _journal_user_identity_details(row)
+            if not row_valid or not _message_private_identity_compatible(row, expected):
+                continue
+            if any(value is not None and row_ids[key] is not None and value != row_ids[key]
+                   for key, value in identities.items()):
+                continue
+            # Legacy eager repair can lack the display token in context. Only
+            # a unique fallback pair may bridge that missing token; a context-
+            # only token or any conflicting shared token still fails closed.
+            missing_context_token = bool(identities['_active_turn_token'] and row_ids['_active_turn_token'] is None)
+            if row_ids['_active_turn_token'] != identities['_active_turn_token'] and not missing_context_token:
+                continue
+            if any(row.get(key) not in (None, '', []) and expected.get(key) not in (None, '', [])
+                   and row[key] != expected[key] for key in ('api_content', 'attachments')):
+                continue
+            row_metadata = _journal_user_metadata_key(row)
+            if row_metadata is None or row_metadata[1] != expected_metadata[1]:
+                continue
+            if row_metadata[0] is not None and expected_metadata[0] is not None and not _journal_user_timestamps_match(row_metadata[0], expected_metadata[0]):
+                continue
+            row_key = _journal_user_fallback_key(row)
+            shared = [key for key, value in identities.items() if value is not None and value == row_ids[key]]
+            if shared and not missing_context_token:
+                if any(sum(_journal_user_identity_details(candidate)[0][key] == identities[key]
+                           for candidate in users) != 1
+                       for key in shared for users in identity_projections(key)):
+                    continue
+            elif not _journal_user_fallback_keys_match(row_key, expected_key) or any(
+                sum(_journal_user_fallback_keys_match(_journal_user_fallback_key(candidate), endpoint)
+                    for candidate in users) != 1
+                for endpoint in (row_key, expected_key) for users in (display_users, context_users)
+            ):
+                continue
+            matches.append(row)
+        return matches[0] if len(matches) == 1 else None
+
+    context_owner = unique_context_user(messages[owner_idx])
+    if context_owner is None:
+        return None
+    owner_position = next(i for i, row in enumerate(context) if row is context_owner)
+    successor = next((row for row in context[owner_position + 1:]
+                      if isinstance(row, dict) and row.get('role') == 'user'), None)
+    display_successors = [row for row in messages[marker_idx + 1:]
+                          if isinstance(row, dict) and row.get('role') == 'user']
+    if successor is not None:
+        token = str(successor.get('_active_turn_token') or '').strip()
+        matches = [row for row in display_successors
+                   if token and str(row.get('_active_turn_token') or '').strip() == token]
+        if len(matches) != 1 or unique_context_user(matches[0]) is not successor:
+            return None
+    elif owner_position != len(context) - 1 or not any(
+        str(row.get('_active_turn_token') or '').strip() for row in display_successors
+    ):
+        # Without a context successor, only a tail owner has a proven insertion
+        # boundary. Compression summaries or unowned suffixes stay untouched.
+        return None
+    return context_owner
+
+
+def _rehome_interrupted_journal_context(session, context_owner, stream_id: str, *, display_owner=None) -> None:
+    """Insert exact-stream output before the proven successor, preserving pairs."""
+    context = session.context_messages
+    owner_positions = [i for i, row in enumerate(context) if row is context_owner]
+    if len(owner_positions) != 1:
+        return
+    recovered = []
+    for row in session.messages:
+        if (not isinstance(row, dict) or row.get('_recovered_from_run_journal') is not True
+                or str(row.get('_recovered_stream_id') or '') != stream_id):
+            continue
+        candidate = dict(row)
+        candidate.pop('_recovered_display_only', None)
+        projected = _recovered_model_context_projection(candidate)
+        if projected is not None:
+            recovered.append(projected)
+        row.pop('_recovered_display_only', None)
+    if not recovered:
+        return
+    if any(row.get('role') == 'assistant' for row in recovered):
+        # Answered recovered questions are no longer provisional. Match the
+        # cancellation promotion rule so a first question survives sanitizing.
+        context_owner.pop('_recovered', None)
+        if display_owner is not None:
+            display_owner.pop('_recovered', None)
+    # Keep any existing native assistant/tool block together; never synthesize
+    # provider calls from the journal's truncated display-only tool metadata.
+    insert_at = next((i for i in range(owner_positions[0] + 1, len(context))
+                      if isinstance(context[i], dict) and context[i].get('role') == 'user'), len(context))
+    session.context_messages = context[:insert_at] + recovered + context[insert_at:]
+
+
+def _rehome_cancel_journal_rows(session, marker_idx: int, stream_id: str) -> None:
+    """Move only this cancelled stream's recovered rows before its marker."""
+    messages = getattr(session, 'messages', None)
+    if not isinstance(messages, list) or not (0 <= marker_idx < len(messages)):
+        return
+    marker = messages[marker_idx]
+    before = list(messages)
+    recovered = [
+        row
+        for index, row in enumerate(before)
+        if index > marker_idx
+        and isinstance(row, dict)
+        and row.get('_recovered_from_run_journal') is True
+        and str(row.get('_recovered_stream_id') or '') == str(stream_id)
+    ]
+    if not recovered:
+        return
+    recovered_ids = {id(row) for row in recovered}
+    remaining = [row for row in before if id(row) not in recovered_ids]
+    try:
+        marker_position = next(index for index, row in enumerate(remaining) if row is marker)
+    except StopIteration:
+        return
+    session.messages = (
+        remaining[:marker_position]
+        + recovered
+        + [marker]
+        + remaining[marker_position + 1:]
+    )
+
+    _reindex_tool_owners_after_message_reorder(session, before)
+
+
+def _reindex_tool_owners_after_message_reorder(session, before, *, after_messages=None) -> None:
+    """Preserve exact row ownership, including a projection before deepcopy."""
+    after = session.messages if after_messages is None else after_messages
+    new_index_by_row = {id(row): index for index, row in enumerate(after)}
+    for tool_call in getattr(session, 'tool_calls', None) or []:
+        if not isinstance(tool_call, dict):
+            continue
+        old_index = tool_call.get('assistant_msg_idx')
+        if type(old_index) is not int or not (0 <= old_index < len(before)):
+            continue
+        owner = before[old_index]
+        new_index = new_index_by_row.get(id(owner))
+        if new_index is not None:
+            tool_call['assistant_msg_idx'] = new_index
+
+
+def _rehome_cancel_journal_context(
+    session,
+    *,
+    owner_token: str,
+    stream_id: str,
+) -> None:
+    """Project exact recovered rows after the token-owned context user only."""
+    context = getattr(session, 'context_messages', None)
+    messages = getattr(session, 'messages', None)
+    if not isinstance(context, list) or not isinstance(messages, list):
+        return
+
+    remaining = [
+        row
+        for row in context
+        if not (
+            isinstance(row, dict)
+            and row.get('_recovered_from_run_journal') is True
+            and str(row.get('_recovered_stream_id') or '') == str(stream_id)
+        )
+    ]
+    owner_token = str(owner_token or '').strip()
+    if not owner_token:
+        session.context_messages = remaining
+        return
+    owner_positions = [
+        index
+        for index, row in enumerate(remaining)
+        if (
+            isinstance(row, dict)
+            and row.get('role') == 'user'
+            and str(row.get('_active_turn_token') or '').strip() == owner_token
+        )
+    ]
+    if len(owner_positions) != 1:
+        # Compression may legitimately remove the exact provider-context owner.
+        # Visible transcript recovery remains valid, but old assistant output
+        # must never be guessed onto a successor user turn.
+        session.context_messages = remaining
+        return
+    owner_position = owner_positions[0]
+
+    # Display rows start without model authority. Only this unique owner can
+    # authorize a candidate projection; do not use text dedupe across turns.
+    recovered = []
+    projected_rows = []
+    for row in messages:
+        if not (
+            isinstance(row, dict)
+            and row.get('_recovered_from_run_journal') is True
+            and str(row.get('_recovered_stream_id') or '') == str(stream_id)
+        ):
+            continue
+        candidate = dict(row)
+        candidate.pop('_recovered_display_only', None)
+        projected = _recovered_model_context_projection(candidate)
+        if projected is not None:
+            recovered.append(projected)
+            projected_rows.append(row)
+    if not recovered:
+        session.context_messages = remaining
+        return
+
+    if any(row.get('role') == 'assistant' for row in recovered):
+        # Only model-visible assistant output promotes the provisional owner.
+        # Display-only reasoning and terminal errors do not answer the prompt.
+        remaining[owner_position].pop('_recovered', None)
+        for row in messages:
+            if (
+                isinstance(row, dict)
+                and row.get('role') == 'user'
+                and str(row.get('_active_turn_token') or '').strip() == owner_token
+            ):
+                row.pop('_recovered', None)
+
+    insert_at = len(remaining)
+    for index in range(owner_position + 1, len(remaining)):
+        if isinstance(remaining[index], dict) and remaining[index].get('role') == 'user':
+            insert_at = index
+            break
+    session.context_messages = remaining[:insert_at] + recovered + remaining[insert_at:]
+    for row in projected_rows:
+        row.pop('_recovered_display_only', None)
+
+
+def _session_has_pending_journal_retry(session) -> bool:
+    """Return True when a durable interrupted/cancelled journal hook is pending."""
+    messages = getattr(session, 'messages', None) or []
+    # A cancelled-stream hook remains authoritative even if a successor turn is
+    # already persisted after it. The exact stream id on the marker prevents a
+    # successor from becoming the recovery source.
+    if any(_is_cancel_journal_retry_marker(msg) for msg in messages):
+        return True
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get('_pending_journal_recovery'):
+            return True
+        if msg.get('role') == 'assistant' and not msg.get('_error') \
+                and msg.get('_recovered_from_cancel_journal') is not True:
+            # A normal assistant turn after any pending marker — nothing to
+            # retry above this point.
+            return False
+    return False
+
+
+def _strip_journal_retry_meta(marker: dict) -> None:
+    marker.pop('_pending_journal_recovery', None)
+    marker.pop('_journal_retry_stream_id', None)
+    marker.pop('_journal_retry_attempts', None)
+    marker.pop('_journal_retry_first_seen_ts', None)
+    marker.pop('_journal_retry_kind', None)
+    marker.pop('_journal_retry_owner_token', None)
+    marker.pop('_journal_retry_process_token', None)
+
+
+def _reorder_journal_tail_above_marker(session, marker_idx: int) -> None:
+    """Move `_recovered_from_run_journal=True` rows appended *after*
+    ``marker_idx`` to sit immediately above the marker so chronological
+    order is preserved (journaled output happened during the turn, marker
+    annotates its end).
+    """
+    messages = session.messages
+    if marker_idx < 0 or marker_idx >= len(messages):
+        return
+    tail = messages[marker_idx + 1 :]
+    if not tail:
+        return
+    journaled = [
+        m for m in tail
+        if isinstance(m, dict) and m.get('_recovered_from_run_journal')
+    ]
+    if not journaled:
+        return
+    rest = [
+        m for m in tail
+        if not (isinstance(m, dict) and m.get('_recovered_from_run_journal'))
+    ]
+    marker = messages[marker_idx]
+    new_messages = (
+        messages[:marker_idx]
+        + journaled
+        + [marker]
+        + rest
+    )
+    # Rebase any tool_calls.assistant_msg_idx values that pointed into the
+    # journaled rows when they were appended at the tail.
+    old_journaled_idx_base = marker_idx + 1
+    new_journaled_idx_base = marker_idx
+    shift = new_journaled_idx_base - old_journaled_idx_base  # = -1
+    for tool_call in session.tool_calls or []:
+        if not isinstance(tool_call, dict):
+            continue
+        idx = tool_call.get('assistant_msg_idx')
+        if isinstance(idx, int) and idx >= old_journaled_idx_base \
+                and idx < old_journaled_idx_base + len(journaled):
+            tool_call['assistant_msg_idx'] = idx + shift
+    session.messages = new_messages
+
+
+def _try_retry_journal_recovery_in_place(session) -> bool:
+    sid = str(getattr(session, 'session_id', '') or '')
+    lock = _journal_retry_lock_for_sid(sid)
+    if not lock.acquire(blocking=False):
+        logger.debug("lazy journal-retry already running for session %s", sid)
+        return False
+    try:
+        return _retry_journal_recovery_in_place(
+            session, preserve_arriving_budget=True,
+        )
+    finally:
+        lock.release()
+        with _JOURNAL_RETRY_LOCKS_GUARD:
+            if _JOURNAL_RETRY_LOCKS.get(sid) is lock:
+                _JOURNAL_RETRY_LOCKS.pop(sid, None)
+
+
+def _retry_journal_recovery_in_place(
+    session,
+    *,
+    preserve_arriving_budget: bool = False,
+    _skip_cancel_hooks: bool = False,
+) -> bool:
+    """Retry eligible cancellation hooks, then the latest interrupted marker.
+
+    Interrupted-response hooks keep their existing bounded retry behavior.
+    Journal-only cancellation hooks are exact-stream capabilities: they remain
+    discoverable across successor turns, wait until the old runtime owner is
+    gone, and splice recovered rows back before their cancellation marker.
+    """
+    def snapshot_cancel_projection():
+        return (
+            copy.deepcopy(getattr(session, 'messages', None) or []),
+            copy.deepcopy(getattr(session, 'context_messages', None) or []),
+            copy.deepcopy(getattr(session, 'tool_calls', None) or []),
+            getattr(session, 'updated_at', None),
+        )
+
+    def restore_cancel_projection(snapshot) -> None:
+        (
+            session.messages,
+            session.context_messages,
+            session.tool_calls,
+            session.updated_at,
+        ) = snapshot
+
+    def save_cancel_projection(snapshot, reason: str) -> bool:
+        try:
+            session.save(touch_updated_at=False)
+            return True
+        except Exception:
+            restore_cancel_projection(snapshot)
+            logger.debug(
+                "save() failed while %s for cancelled session %s",
+                reason,
+                getattr(session, 'session_id', '?'),
+                exc_info=True,
+            )
+            return False
+
+    # A failed cancellation save replaces rows with a deep-copied snapshot;
+    # abort that pass instead of continuing with stale marker identities.
+    visited_cancel_markers: set[int] = set()
+    try:
+        while True:
+            messages = session.messages or []
+            cancel_candidates = [] if _skip_cancel_hooks else [
+                (index, message)
+                for index, message in enumerate(messages)
+                if _is_cancel_journal_retry_marker(message)
+                and id(message) not in visited_cancel_markers
+            ]
+            idx = None
+            msg = None
+            cancel_hook = False
+            if cancel_candidates:
+                # Multiple cancelled turns may remain pending in one transcript.
+                # A newer hook that is still owned by a live worker (or by a
+                # same-process nonterminal journal) must not starve an older hook
+                # whose exact stream is already safe to recover.
+                active_stream_ids = _active_stream_ids()
+                for candidate_idx, candidate in reversed(cancel_candidates):
+                    candidate_stream_id = str(
+                        candidate.get('_journal_retry_stream_id') or ''
+                    ).strip()
+                    candidate_process_token = str(
+                        candidate.get('_journal_retry_process_token') or ''
+                    ).strip()
+                    candidate_owner_token = str(
+                        candidate.get('_journal_retry_owner_token') or ''
+                    ).strip()
+                    if (
+                        not candidate_stream_id
+                        or not candidate_process_token
+                        or not candidate_owner_token
+                    ):
+                        continue
+                    if candidate_stream_id in active_stream_ids:
+                        continue
+                    if candidate_process_token == _JOURNAL_RECOVERY_PROCESS_TOKEN:
+                        try:
+                            if not _run_journal_terminal_state(session, candidate_stream_id):
+                                continue
+                        except Exception:
+                            continue
+                    idx, msg = candidate_idx, candidate
+                    cancel_hook = True
+                    break
+
+            if msg is None:
+                # Cancellation recovery is opportunistic. A newer cancel hook that
+                # is not selectable must not mask the older interrupted-response
+                # recovery contract.
+                cancel_hook = False
+                for candidate_idx in range(len(messages) - 1, -1, -1):
+                    candidate = messages[candidate_idx]
+                    if not isinstance(candidate, dict):
+                        continue
+                    if candidate.get('role') == 'assistant' and not candidate.get('_error') \
+                            and not candidate.get('_pending_journal_recovery') \
+                            and candidate.get('_recovered_from_cancel_journal') is not True:
+                        # Walked past the pending marker without finding it.
+                        return False
+                    if (
+                        candidate.get('type') == 'interrupted'
+                        and candidate.get('_pending_journal_recovery')
+                    ):
+                        idx, msg = candidate_idx, candidate
+                        break
+                if msg is None:
+                    return False
+
+            assert isinstance(idx, int) and isinstance(msg, dict)
+            stream_id = msg.get('_journal_retry_stream_id')
+            first_seen = msg.get('_journal_retry_first_seen_ts') or 0
+            attempts = int(msg.get('_journal_retry_attempts') or 0)
+            now = time.time()
+            give_up = (
+                attempts >= _JOURNAL_RETRY_MAX_ATTEMPTS
+                or (
+                    first_seen
+                    and now - float(first_seen) > _JOURNAL_RETRY_GIVEUP_SECONDS
+                )
+            )
+
+            if cancel_hook:
+                visited_cancel_markers.add(id(msg))
+                if not stream_id:
+                    # A cancellation hook without its exact run identity cannot
+                    # safely select a journal. Keep it intact rather than guessing.
+                    continue
+                if str(stream_id) in _active_stream_ids():
+                    # Stop detaches the browser stream before the worker finishes.
+                    # The durable hook belongs to restart/read-side recovery only
+                    # after that old runtime owner has disappeared.
+                    continue
+                marker_process_token = str(
+                    msg.get('_journal_retry_process_token') or ''
+                ).strip()
+                owner_token = str(msg.get('_journal_retry_owner_token') or '').strip()
+                if not marker_process_token or not owner_token:
+                    # Unknown process ownership is not permission to consume an
+                    # exact cancellation hook.
+                    continue
+                if marker_process_token == _JOURNAL_RECOVERY_PROCESS_TOKEN:
+                    # ACTIVE_RUNS has a bounded stale reaper, so its absence inside
+                    # the same process does not prove a wedged worker is gone. Only
+                    # an explicit terminal journal row closes that same-process
+                    # ambiguity. A real restart changes the process token and can
+                    # recover a nonterminal durable tail because the old writer
+                    # cannot survive into the new interpreter.
+                    try:
+                        if not _run_journal_terminal_state(session, str(stream_id)):
+                            continue
+                    except Exception:
+                        continue
+                cancel_snapshot = snapshot_cancel_projection()
+                if give_up:
+                    _strip_journal_retry_meta(msg)
+                    if not save_cancel_projection(cancel_snapshot, "retiring expired cancel journal hook"):
+                        return False
+                    continue
+                owner_index = _cancel_journal_retry_owner_index(session, idx, msg)
+                if owner_index is None:
+                    continue
+                recovered_output = _append_journaled_partial_output(
+                    session,
+                    stream_id,
+                    dedupe_existing=True,
+                    dedupe_min_index=owner_index + 1,
+                    dedupe_max_index=idx,
+                    append_context=False,
+                    display_only=True,
+                )
+                terminal_error_recovered = False
+            else:
+                if not stream_id:
+                    # No stream id to retry against; demote immediately.
+                    msg['content'] = _INTERRUPTED_NEUTRAL_WORDING
+                    _strip_journal_retry_meta(msg)
+                    try:
+                        session.save(touch_updated_at=False)
+                    except Exception:
+                        logger.debug(
+                            "save() failed while demoting marker for session %s",
+                            getattr(session, 'session_id', '?'),
+                            exc_info=True,
+                        )
+                    return False
+                if give_up:
+                    msg['content'] = _INTERRUPTED_NEUTRAL_WORDING
+                    _strip_journal_retry_meta(msg)
+                    try:
+                        session.save(touch_updated_at=False)
+                    except Exception:
+                        logger.debug(
+                            "save() failed while demoting marker for session %s",
+                            getattr(session, 'session_id', '?'),
+                            exc_info=True,
+                        )
+                    return False
+                # Display successors alone do not establish context placement.
+                has_successor = any(
+                    isinstance(row, dict) and row.get('role') == 'user'
+                    for row in messages[idx + 1:]
+                )
+                owner_index = next((
+                    index for index in range(idx - 1, -1, -1)
+                    if isinstance(messages[index], dict)
+                    and messages[index].get('role') == 'user'
+                ), None)
+                context_owner = (
+                    _interrupted_journal_context_owner(session, idx, owner_index)
+                    if has_successor else None
+                )
+                interrupted_snapshot = snapshot_cancel_projection() if context_owner is not None else None
+                recovered_output, terminal_error_recovered = (
+                    _recover_journaled_output_and_terminal_error(
+                        session,
+                        stream_id,
+                        dedupe_existing=True,
+                        append_context=not has_successor,
+                        dedupe_min_index=owner_index + 1 if owner_index is not None else idx,
+                        dedupe_max_index=idx,
+                    )
+                )
+
+            if recovered_output or terminal_error_recovered:
+                if cancel_hook:
+                    # Only this successful cancellation action can authorize
+                    # scans past its exact-stream recovered assistant rows.
+                    for row in session.messages:
+                        if (
+                            isinstance(row, dict)
+                            and row.get('role') == 'assistant'
+                            and not row.get('_error')
+                            and row.get('_recovered_from_run_journal') is True
+                            and str(row.get('_recovered_stream_id') or '') == str(stream_id)
+                        ):
+                            row['_recovered_from_cancel_journal'] = True
+                    _rehome_cancel_journal_rows(session, idx, str(stream_id))
+                    _rehome_cancel_journal_context(
+                        session,
+                        owner_token=owner_token,
+                        stream_id=str(stream_id),
+                    )
+                    # Keep the user-visible cancellation wording. Only the durable
+                    # recovery capability is retired by this commit.
+                    _strip_journal_retry_meta(msg)
+                    if not save_cancel_projection(
+                        cancel_snapshot,
+                        "applying cancelled journal recovery",
+                    ):
+                        return False
+                else:
+                    if not terminal_error_recovered:
+                        msg['content'] = _INTERRUPTED_RECOVERED_WORDING
+                        _strip_journal_retry_meta(msg)
+                    # The journaled rows were appended at the end of messages;
+                    # move them above the marker before either retaining its
+                    # interrupted wording or replacing it with a specific terminal
+                    # error from that same stream.
+                    _rehome_cancel_journal_rows(session, idx, str(stream_id))
+                    if context_owner is not None:
+                        _rehome_interrupted_journal_context(session, context_owner, str(stream_id), display_owner=messages[owner_index])
+                    if terminal_error_recovered:
+                        before_removal = session.messages
+                        session.messages = [
+                            message
+                            for message in session.messages
+                            if message is not msg
+                        ]
+                        _reindex_tool_owners_after_message_reorder(session, before_removal)
+                    try:
+                        session.save(touch_updated_at=False)
+                    except Exception:
+                        if interrupted_snapshot is not None:
+                            logger.debug("save() failed while applying proven interrupted context recovery", exc_info=True)
+                            restore_cancel_projection(interrupted_snapshot)
+                            return False
+                        logger.debug(
+                            "save() failed while applying lazy journal recovery for session %s",
+                            getattr(session, 'session_id', '?'),
+                            exc_info=True,
+                        )
+                logger.info(
+                    "Session %s: lazy journal-recovery applied stream %s "
+                    "after %d attempts",
+                    getattr(session, 'session_id', '?'),
+                    stream_id,
+                    attempts,
+                )
+                return True
+
+            if (
+                preserve_arriving_budget
+                and _journal_is_still_arriving(session, stream_id)
+            ):
+                logger.debug(
+                    "Session %s: journal for stream %s still arriving; "
+                    "preserving retry budget",
+                    getattr(session, 'session_id', '?'),
+                    stream_id,
+                )
+                if cancel_hook:
+                    continue
+                return False
+
+            next_attempts = attempts + 1
+            if cancel_hook:
+                cancel_snapshot = snapshot_cancel_projection()
+                if next_attempts >= _JOURNAL_RETRY_MAX_ATTEMPTS:
+                    _strip_journal_retry_meta(msg)
+                else:
+                    msg['_journal_retry_attempts'] = next_attempts
+                if not save_cancel_projection(cancel_snapshot, "updating cancel journal retry counter"):
+                    return False
+                continue
+
+            if next_attempts >= _JOURNAL_RETRY_MAX_ATTEMPTS:
+                msg['content'] = _INTERRUPTED_NEUTRAL_WORDING
+                _strip_journal_retry_meta(msg)
+            else:
+                msg['_journal_retry_attempts'] = next_attempts
+            try:
+                session.save(touch_updated_at=False)
+            except Exception:
+                logger.debug(
+                    "save() failed while updating retry counter for session %s",
+                    getattr(session, 'session_id', '?'),
+                    exc_info=True,
+                )
+            return False
+    except Exception:
+        logger.exception(
+            "_retry_journal_recovery_in_place failed for session %s",
+            getattr(session, 'session_id', '?'),
+        )
+        return False
+
+
+def _apply_core_sync_or_error_marker(
+    session,
+    core_path,
+    stream_id_for_recheck=None,
+    *,
+    require_stream_dead=True,
+    touch_updated_at=True,
+) -> bool:
+    """Inner repair logic. Must be called with the per-session lock already held.
+
+    Re-checks session state under the lock, then either syncs messages from the
+    core transcript (if present and non-empty) or restores the pending user
+    message as a recovered user turn and appends an error marker.
+
+    stream_id_for_recheck: when provided, repair bails if session.active_stream_id
+    changed (e.g. context compression rotated it).  The cache-miss repair path
+    also requires the stream to be absent from active streams; the streaming
+    thread's final fallback passes require_stream_dead=False because it runs
+    before its own stream is removed from STREAMS.
+
+    Returns True if repair was applied, False if the re-check bailed out.
+    Must never raise — caller is responsible for exception handling.
+    """
+    sid = session.session_id
+    # Bail if pending is unset — nothing to repair.
+    if not session.pending_user_message:
+        return False
+    if stream_id_for_recheck is not None:
+        # Bail if active_stream_id rotated between the pre-lock check and now.
+        # Cache-miss repair must also skip if the stream is alive again, but the
+        # streaming thread's final fallback runs before removing its own stream
+        # from STREAMS and must be allowed to repair that same active stream.
+        if session.active_stream_id != stream_id_for_recheck:
+            return False
+        if require_stream_dead and session.active_stream_id in _active_stream_ids():
+            return False
+    _stream_id = stream_id_for_recheck or session.active_stream_id
+    _terminal_recovery = _recoverable_unsaved_gateway_terminal_error(
+        session, _stream_id,
+    )
+
+    # When messages is already non-empty, do not overwrite history from any core
+    # transcript. The pending user turn may still be the only durable copy of a
+    # prompt submitted just before a server restart, so materialize it before
+    # clearing runtime stream state.
+    if len(session.messages) != 0:
+        _recovered_ts = _recovered_pending_timestamp(session.pending_started_at)
+        _already_checkpointed = _message_matches_pending_checkpoint(
+            session.messages[-1],
+            session.pending_user_message,
+            _recovered_ts,
+            session.pending_user_source,
+            session.pending_attachments,
+        )
+        _tail_user_already_checkpointed = _already_checkpointed or _message_matches_pending_text(
+            session.messages[-1],
+            session.pending_user_message,
+        )
+        _pending_started_at = session.pending_started_at
+        if _run_journal_terminal_state(session, _stream_id) == 'completed':
+            if not (_already_checkpointed or _latest_user_matches_pending_text(session.messages, session.pending_user_message)):
+                _append_recovered_pending_turn(session, timestamp=_recovered_ts)
+            _append_journaled_partial_output(
+                session,
+                _stream_id,
+                dedupe_existing=True,
+            )
+            session.active_stream_id = None
+            session.pending_user_message = None
+            session.pending_attachments = []
+            session.pending_started_at = None
+            session.pending_user_source = None
+            session.save(touch_updated_at=touch_updated_at)
+            logger.info(
+                "Session %s: cleared stale pending state for completed stream %s without error marker",
+                sid,
+                _stream_id,
+            )
+            return True
+        if not _tail_user_already_checkpointed:
+            # #6366 re-gate: when the durable transcript has already
+            # advanced past this pending turn into a newer settled
+            # user/assistant boundary, the recovery path must NOT
+            # append a recovered user row + ``_partial`` clone +
+            # journal replay + generic no-response error after the
+            # valid final answer. The tail-only check above misses
+            # that case (the tail is a newer assistant row that can
+            # never match the pending user checkpoint). Clear only
+            # the stale pending fields and return; the transcript is
+            # already correct and durable.
+            if _transcript_already_advanced_past_pending(session):
+                session.active_stream_id = None
+                session.pending_user_message = None
+                session.pending_attachments = []
+                session.pending_started_at = None
+                session.pending_user_source = None
+                session.save(touch_updated_at=touch_updated_at)
+                logger.info(
+                    "Session %s: cleared stale pending state for stream %s — transcript already advanced past this turn",
+                    sid,
+                    _stream_id,
+                )
+                return True
+            _append_recovered_pending_turn(session, timestamp=_recovered_ts)
+        else:
+            recovered = {
+                'role': 'user',
+                'content': session.pending_user_message,
+                'timestamp': _recovered_ts,
+                '_recovered': True,
+            }
+            pending_source = getattr(session, 'pending_user_source', None)
+            stamp_message_source(recovered, pending_source, active_turn_token=_pending_active_turn_token(session))
+            if session.pending_attachments:
+                recovered['attachments'] = list(session.pending_attachments)
+            _append_recovered_turn_to_context(session, recovered)
+        recovered_output, terminal_error_recovered = (
+            _recover_journaled_output_and_terminal_error(
+                session,
+                _stream_id,
+                terminal_recovery=_terminal_recovery,
+            )
+        )
+        session.active_stream_id = None
+        session.pending_user_message = None
+        session.pending_attachments = []
+        session.pending_started_at = None
+        session.pending_user_source = None
+        if not terminal_error_recovered:
+            session.messages.append(
+                _build_recovery_marker_with_retry_hook(
+                    recovered_output=recovered_output,
+                    stream_id=_stream_id,
+                    pending_started_at=_pending_started_at,
+                )
+            )
+        session.save(touch_updated_at=touch_updated_at)
+        logger.info(
+            "Session %s: recovered pending user turn (messages non-empty), added error marker",
+            sid,
+        )
+        return True
+
+    # ── messages *is* empty ─ full repair ─────────────────────────────────
+
+    if core_path.exists():
+        with open(core_path, encoding='utf-8') as f:
+            core = json.load(f)
+        core_messages = core.get('messages', [])
+        if core_messages:
+            session.messages = core_messages
+            session.tool_calls = core.get('tool_calls', [])
+            for field in ('input_tokens', 'output_tokens', 'estimated_cost'):
+                if core.get(field) is not None:
+                    setattr(session, field, core[field])
+            _pending_text = _normalize_journal_recovery_text(session.pending_user_message)
+            _recovered_ts = _recovered_pending_timestamp(session.pending_started_at)
+            _already_checkpointed = _message_matches_pending_checkpoint(
+                session.messages[-1] if session.messages else None,
+                session.pending_user_message,
+                _recovered_ts,
+                session.pending_user_source,
+                session.pending_attachments,
+            )
+            _tail_user_already_checkpointed = _already_checkpointed or _message_matches_pending_text(
+                session.messages[-1] if session.messages else None,
+                session.pending_user_message,
+            )
+            if (
+                _pending_text
+                and not _tail_user_already_checkpointed
+                and (
+                    _run_journal_has_visible_output(session, _stream_id)
+                    or _terminal_recovery is not None
+                )
+            ):
+                _append_recovered_pending_turn(session, timestamp=_recovered_ts)
+            recovered_output, terminal_error_recovered = (
+                _recover_journaled_output_and_terminal_error(
+                    session,
+                    _stream_id,
+                    dedupe_existing=True,
+                    terminal_recovery=_terminal_recovery,
+                )
+            )
+            _pending_started_at = session.pending_started_at
+            session.active_stream_id = None
+            session.pending_user_message = None
+            session.pending_attachments = []
+            session.pending_started_at = None
+            session.pending_user_source = None
+            if recovered_output and not terminal_error_recovered:
+                session.messages.append(
+                    _interrupted_recovery_marker(
+                        recovered_output=True,
+                        stream_id=_stream_id,
+                        pending_started_at=_pending_started_at,
+                    )
+                )
+            # NOTE: when the core transcript was synced in but the run journal
+            # is not yet visible, intentionally do NOT append a lazy-retry
+            # marker here. In this branch the canonical history is the core
+            # transcript itself (which has already been written to s.messages
+            # above) and the marker is purely advisory — the existing contract
+            # is "marker only when there is a recovered partial turn to
+            # annotate". Adding a pending-retry marker on every empty-journal
+            # core-sync would surface a spurious "reload to retry" banner on
+            # sessions whose journal is legitimately absent (e.g. archived
+            # streams). The first and third branches handle the lost-response
+            # case where the marker is the only signal the user gets.
+            session.save(touch_updated_at=touch_updated_at)
+            logger.info(
+                "Session %s: synced %d messages from core transcript%s",
+                sid,
+                len(core_messages),
+                " and recovered journaled output" if recovered_output else "",
+            )
+            return True
+
+    # Core missing or empty — restore the pending user message as a recovered
+    # user turn (preserving the draft), then append an error marker.
+    if session.pending_user_message:
+        # Use the original send time if available so the recovered turn
+        # appears in the correct chronological position.
+        _recovered_ts = _recovered_pending_timestamp(session.pending_started_at)
+        _append_recovered_pending_turn(session, timestamp=_recovered_ts)
+    recovered_output, terminal_error_recovered = (
+        _recover_journaled_output_and_terminal_error(
+            session,
+            _stream_id,
+            terminal_recovery=_terminal_recovery,
+        )
+    )
+    _pending_started_at = session.pending_started_at
+    session.active_stream_id = None
+    session.pending_user_message = None
+    session.pending_attachments = []
+    session.pending_started_at = None
+    session.pending_user_source = None
+    if not terminal_error_recovered:
+        session.messages.append(
+            _build_recovery_marker_with_retry_hook(
+                recovered_output=recovered_output,
+                stream_id=_stream_id,
+                pending_started_at=_pending_started_at,
+            )
+        )
+    session.save(touch_updated_at=touch_updated_at)
+    logger.info("Session %s: no core transcript found, added error marker", sid)
+    return True
+
+
+# ── _repair_stale_pending grace period (#1624) ─────────────────────────────
+#
+# Defense-in-depth against a narrow race between the streaming thread clearing
+# pending_user_message and STREAMS.pop(stream_id). Without this guard, any
+# fast turn (e.g. command approval) that exits the thread before the on-disk
+# pending clear has flushed gets misdiagnosed as a crashed turn, producing a
+# spurious "Response interrupted." marker.
+#
+# 30s covers the worst-case post-loop persistence window: LLM finishing a tool
+# batch + lock contention with the checkpoint thread + a multi-MB session.save.
+# A legitimately crashed turn whose pending_started_at is < 30s old will not
+# repair on the first get_session() call, but WILL repair on the next call
+# after the grace period elapses (typically the user's next interaction).
+#
+# Missing/falsy pending_started_at (legacy sidecars from before that field
+# existed, or any path that forgot to set it) is treated as "old enough" so
+# repair still recovers them — preserves current behavior for legacy data.
+_REPAIR_STALE_PENDING_GRACE_SECONDS = 30
+
+
+def _has_compression_continuation(session) -> bool:
+    """Return True when ``session`` is an archived compression parent.
+
+    Context compression rotates the live WebUI session id: the old sidecar is
+    preserved for lineage while the new child owns the running/completed turn.
+    Stale-pending repair must not append an interruption marker to that old
+    parent just because its stream bookkeeping disappeared after the rotation.
+    """
+    sid = getattr(session, 'session_id', None)
+    if not sid:
+        return False
+
+    def _row_is_continuation(row) -> bool:
+        if not isinstance(row, dict):
+            return False
+        child_sid = row.get('session_id')
+        if not child_sid or child_sid == sid:
+            return False
+        if row.get('parent_session_id') != sid:
+            return False
+        # Any child row is enough evidence that this pending state belongs to a
+        # compression lineage, not a dead standalone turn. The child may itself
+        # temporarily carry a bad pre_compression_snapshot flag from older code;
+        # do not filter it out here or the guard misses the exact regression.
+        return True
+
+    try:
+        with LOCK:
+            for child in SESSIONS.values():
+                if getattr(child, 'session_id', None) == sid:
+                    continue
+                if getattr(child, 'parent_session_id', None) == sid:
+                    return True
+    except Exception:
+        pass
+
+    try:
+        if SESSION_INDEX_FILE.exists():
+            entries = json.loads(SESSION_INDEX_FILE.read_bytes())
+            if isinstance(entries, list) and any(_row_is_continuation(e) for e in entries):
+                return True
+    except Exception:
+        logger.debug("Failed to inspect session index for compression continuation", exc_info=True)
+
+    # Index rows can lag behind rapid compression/save races. Fall back to a
+    # shallow JSON metadata scan; session files write parent_session_id before
+    # the messages array, so this avoids loading multi-MB transcripts.
+    try:
+        needle = f'"parent_session_id": "{sid}"'
+        for path in SESSION_DIR.glob('*.json'):
+            if path.name.startswith('_') or path.stem == sid:
+                continue
+            try:
+                # Preserve the old read_text()[:4096] CHARACTER-prefix semantics
+                # with bounded I/O: a UTF-8 char is at most 4 bytes, so 4096 chars
+                # fit in <=16384 bytes. Reading bytes then slicing to 4096 chars
+                # avoids a regression where a multi-byte (e.g. emoji) compression
+                # summary written before parent_session_id pushes the needle past a
+                # 4096-BYTE cutoff even though it was within the old 4096-CHAR one.
+                head = _read_file_head(path, max_prefix_bytes=16384)[:4096]
+            except OSError:
+                continue
+            if needle in head:
+                return True
+    except Exception:
+        logger.debug("Failed to scan session files for compression continuation", exc_info=True)
+
+    return False
+
+
+def _repair_stale_pending(session) -> bool:
+    """Recover a sidecar stuck with messages=[] and stale pending state.
+
+    Fires only when messages is empty, pending_user_message is set,
+    active_stream_id is set, the stream is no longer alive, AND the turn is
+    older than _REPAIR_STALE_PENDING_GRACE_SECONDS (#1624).
+
+    Uses a non-blocking lock acquire so a caller that already holds the
+    per-session lock (e.g. retry_last, undo_last, cancel_stream) cannot
+    deadlock when get_session() triggers this on a cache miss.
+
+    Returns True if repair was applied, False otherwise.
+    Must never raise — all errors are caught and logged.
+    """
+    # Capture the stream id seen at pre-check time; the under-lock re-check in
+    # _apply_core_sync_or_error_marker uses this to detect a rotated active_stream_id
+    # (e.g. context compression) or a stream that came back alive.
+    _seen_stream_id = session.active_stream_id
+    if (not session.pending_user_message
+            or not _seen_stream_id
+            or _seen_stream_id in _active_stream_ids()):
+        return False
+    if getattr(session, 'pre_compression_snapshot', False):
+        logger.debug(
+            "_repair_stale_pending: skipping pre-compression snapshot %s",
+            getattr(session, 'session_id', '?'),
+        )
+        return False
+    if _has_compression_continuation(session):
+        logger.debug(
+            "_repair_stale_pending: skipping compression parent %s with continuation",
+            getattr(session, 'session_id', '?'),
+        )
+        return False
+
+    # Grace-period guard: bail if the turn is too fresh to be a real crash.
+    # Falsy pending_started_at (None, 0, missing) means "old enough" — preserve
+    # legacy-data recovery semantics for sessions that pre-date the field.
+    _started = getattr(session, 'pending_started_at', None)
+    if _started:
+        try:
+            _age = time.time() - float(_started)
+        except (TypeError, ValueError):
+            _age = float('inf')
+        if _age < _REPAIR_STALE_PENDING_GRACE_SECONDS:
+            logger.debug(
+                "_repair_stale_pending: skipping repair for session %s — "
+                "pending_started_at age=%.1fs < %ds grace window",
+                session.session_id, _age, _REPAIR_STALE_PENDING_GRACE_SECONDS,
+            )
+            return False
+    else:
+        # Treat missing/falsy pending_started_at as "old enough" (legacy data).
+        _age = float('inf')
+
+    sid = session.session_id
+    if not is_safe_session_id(sid):
+        return False
+
+    try:
+        profile_home = _get_profile_home(session.profile)
+        core_path = profile_home / 'sessions' / f'session_{sid}.json'
+
+        lock = _get_session_agent_lock(sid)
+        # Non-blocking acquire: bail immediately if the caller already holds this
+        # lock (e.g. retry_last, undo_last, cancel_stream). Blocking would deadlock
+        # because _get_session_agent_lock returns a non-reentrant threading.Lock.
+        if not lock.acquire(blocking=False):
+            logger.debug(
+                "_repair_stale_pending: lock contended, skipping repair for session %s", sid,
+            )
+            return False
+        try:
+            # Telemetry (#1624): log legitimate repair firings so the next batch
+            # of user reports tells us whether the underlying race still fires
+            # post-fix. Rate-limit by age (Opus pre-release SHOULD-FIX): WARNING
+            # for the diagnostically valuable race window (< 5 min — actual
+            # leak-path candidates that slipped past the grace guard) and DEBUG
+            # for the long-tail (orphaned sidecars from prior process lifetimes)
+            # so reconnect loops on stuck sessions don't flood the log.
+            _DIAG_WARN_WINDOW_SECONDS = 300  # 5 min
+            _age_str = ('inf' if _age == float('inf') else f'{_age:.1f}s')
+            _log = logger.warning if _age < _DIAG_WARN_WINDOW_SECONDS else logger.debug
+            _log(
+                "_repair_stale_pending firing: session=%s stream_id=%s pending_age=%s",
+                sid, _seen_stream_id, _age_str,
+            )
+            return _apply_core_sync_or_error_marker(
+                session, core_path, stream_id_for_recheck=_seen_stream_id,
+            )
+        finally:
+            lock.release()
+    except Exception:
+        logger.exception("_repair_stale_pending failed for session %s", sid)
+        return False
+
+
+def _sync_sidecar_from_state_db_if_newer(session) -> bool:
+    """Read-side self-heal when WebUI sidecar lags Hermes state.db.
+
+    A WebUI stream can lose its terminal ``done``/``stream_end`` path while the
+    underlying agent continues writing messages to ``state.db``. In that shape
+    the browser briefly shows live SSE output, but a refresh reloads the stale
+    sidecar JSON and the already-produced text appears to vanish. Reconcile the
+    sidecar from state.db whenever the state transcript is visibly newer than
+    the sidecar, even if the sidecar still carries an ``active_stream_id``.
+
+    This deliberately reuses the existing append-only reconciler so workspace
+    prefixes, timestamp drift, compaction watermarks, and tool metadata keep the
+    same semantics as normal WebUI/state.db display merging.
+    """
+    if session is None or getattr(session, '_loaded_metadata_only', False):
+        return False
+    sid = getattr(session, 'session_id', None)
+    if not sid or not is_safe_session_id(sid):
+        return False
+    seen_stream_id = getattr(session, 'active_stream_id', None)
+    has_unfinished_sidecar_turn = bool(
+        seen_stream_id or getattr(session, 'pending_user_message', None)
+    )
+    if not has_unfinished_sidecar_turn:
+        return False
+    # Never reconcile while the sidecar's stream is still a LIVE in-process
+    # worker. A running turn owns the final writeback (it merges the agent
+    # result and clears pending state itself); racing it here would drop its
+    # active_stream_id mid-run and make the normal terminal writeback skip as
+    # "stale". Only self-heal once the worker is gone from both the SSE
+    # (STREAMS) and worker-lifecycle (ACTIVE_RUNS) registries.
+    if seen_stream_id and seen_stream_id in _active_stream_ids():
+        return False
+    # Registration-window grace guard (mirrors _repair_stale_pending). A turn is
+    # registered in STREAMS/ACTIVE_RUNS by the worker thread a moment AFTER the
+    # request handler persists active_stream_id + pending_started_at to the
+    # sidecar. Within that window the stream is legitimately in flight yet not
+    # yet visible in the registries, so the liveness check above would
+    # mis-classify it as a dead stream. A recent pending_started_at means "still
+    # starting up" — bail. This also covers cross-process / gateway turns the
+    # local registries cannot see. Falsy pending_started_at (None/0/missing) is
+    # treated as "old enough" so legacy/orphaned sidecars still self-heal.
+    if seen_stream_id:
+        _started = getattr(session, 'pending_started_at', None)
+        if _started:
+            try:
+                _age = time.time() - float(_started)
+            except (TypeError, ValueError):
+                _age = float('inf')
+            if _age < _REPAIR_STALE_PENDING_GRACE_SECONDS:
+                return False
+
+    try:
+        state_summary = get_state_db_session_summary(
+            sid,
+            profile=getattr(session, 'profile', None),
+        )
+        state_count = int(state_summary.get('message_count') or 0)
+        state_last = float(state_summary.get('last_message_at') or 0.0)
+    except Exception:
+        logger.debug("state.db summary check failed for session %s", sid, exc_info=True)
+        return False
+    if state_count <= 0:
+        return False
+
+    sidecar_messages = list(getattr(session, 'messages', None) or [])
+    sidecar_count = len(sidecar_messages)
+    sidecar_last = _last_message_timestamp(sidecar_messages) or 0.0
+
+    # Fast negative (pre-lock): if state.db is not ahead by either count or
+    # timestamp, do not pay for the lock. This keeps normal reads cheap.
+    if state_count <= sidecar_count and state_last <= sidecar_last:
+        return False
+
+    # ── Under-lock critical section ──────────────────────────────────────────
+    # The merge + sidecar write must hold the per-session lock so a concurrent
+    # worker/checkpoint save can neither (a) be clobbered by a stale full-record
+    # write here, nor (b) revive the stream between our liveness check and our
+    # write. Non-blocking acquire: if a caller already holds the lock (retry_last,
+    # undo_last, cancel_stream, the streaming worker's own finalize), bail rather
+    # than deadlock — a later read will retry the self-heal.
+    lock = _get_session_agent_lock(sid)
+    if not lock.acquire(blocking=False):
+        logger.debug(
+            "state.db newer-sidecar sync: lock contended, skipping for session %s", sid,
+        )
+        return False
+    try:
+        # Re-load the authoritative on-disk session under the lock so we both
+        # validate against (and write back) the very latest sidecar — never a
+        # snapshot captured before the lock that could clobber a newer write.
+        try:
+            locked = Session.load(sid)
+        except Exception:
+            logger.debug(
+                "state.db newer-sidecar sync: locked reload failed for session %s",
+                sid, exc_info=True,
+            )
+            return False
+        if locked is None:
+            return False
+
+        # Re-check liveness conditions against the freshly-loaded state: the
+        # stream may have rotated (compression), come back alive, terminated and
+        # cleared its own pending state, or had its turn finalized while we
+        # waited. Any of these means there is nothing stale to repair.
+        locked_stream_id = getattr(locked, 'active_stream_id', None)
+        if locked_stream_id != seen_stream_id:
+            return False
+        if not (locked_stream_id or getattr(locked, 'pending_user_message', None)):
+            return False
+        if locked_stream_id and locked_stream_id in _active_stream_ids():
+            return False
+        if locked_stream_id:
+            _lstarted = getattr(locked, 'pending_started_at', None)
+            if _lstarted:
+                try:
+                    _lage = time.time() - float(_lstarted)
+                except (TypeError, ValueError):
+                    _lage = float('inf')
+                if _lage < _REPAIR_STALE_PENDING_GRACE_SECONDS:
+                    return False
+
+        locked_messages = list(getattr(locked, 'messages', None) or [])
+        locked_count = len(locked_messages)
+
+        state_messages = get_state_db_session_messages(
+            sid,
+            profile=getattr(locked, 'profile', None),
+        )
+        if not state_messages:
+            return False
+
+        # #7882 (gate round-7 SHOULD-FIX): the Agent core appends a pending
+        # delegation_wakeup user row to state.db WITHOUT its ``_source``
+        # stamp — provenance rides only in the session's pending_user_*
+        # fields until settle. When the WebUI pending-identity proof is
+        # absent (the validator accepts only webui/fork), this repair path
+        # previously merged the plain row as-is: the wakeup persisted
+        # UNSTAMPED on the sidecar, is_hidden_transcript_row stopped
+        # matching, and the hidden handoff rendered as a visible bubble once
+        # the grace window passed. Stamp pending provenance exactly like the
+        # display path before reconciling, so the deferred-window shapes
+        # stay hidden before and after the grace.
+        try:
+            state_messages = _stamp_pending_source_for_display(locked, state_messages)
+        except Exception:
+            logger.debug(
+                "state.db newer-sidecar sync: pending-source stamp failed for session %s",
+                sid, exc_info=True,
+            )
+
+        # The Agent row is intentionally hidden from display while the saved
+        # handoff proof is active. Materialize the exact WebUI-owned prompt
+        # before reconciling that row away, so clearing pending state cannot
+        # erase the only durable copy of the submitted text/attachments.
+        pending_identity = _validated_webui_pending_user_timestamp_identity(
+            locked,
+            getattr(locked, '_webui_pending_user_timestamp_identity', None),
+        )
+        # When a legacy sidecar has no explicit context_messages, the shared
+        # context reconciler falls back to messages. Capture that model-facing
+        # merge before adding the display-only WebUI owner row below.
+        merged_context = (
+            reconciled_state_db_messages_for_session(
+                locked,
+                prefer_context=True,
+                state_messages=state_messages,
+            )
+            if pending_identity is not None
+            else None
+        )
+        if pending_identity is not None:
+            pending_timestamp = pending_identity[1]
+            pending_text = locked.pending_user_message
+            pending_source = getattr(locked, 'pending_user_source', None) or 'webui'
+            pending_attachments = list(getattr(locked, 'pending_attachments', None) or [])
+            pending_row = {
+                'role': 'user',
+                'content': pending_text,
+                'timestamp': pending_timestamp,
+            }
+            stamp_message_source(pending_row, pending_source)
+            if str(pending_source or '').strip().lower() == 'fork':
+                pending_row['_fork_child_turn'] = locked.session_id
+            if pending_attachments:
+                pending_row['attachments'] = pending_attachments
+
+            existing_pending = next((
+                message for message in locked_messages
+                if isinstance(message, dict)
+                and (
+                    _message_exact_timestamp_details(message)
+                    == (pending_timestamp, True)
+                    and (message.get('_source') or 'webui') == pending_source
+                    and _message_matches_pending_text(message, pending_text)
+                )
+            ), None)
+            if existing_pending is not None:
+                # A prior eager checkpoint already owns this exact proved turn;
+                # refresh it from the still-authoritative pending fields.
+                existing_pending.update(pending_row)
+                if pending_attachments:
+                    existing_pending['attachments'] = pending_attachments
+                else:
+                    existing_pending.pop('attachments', None)
+            else:
+                # The proof makes this submitted row authoritative even if a
+                # clock adjustment places it before the surviving sidecar tail.
+                if not _insert_state_message_chronologically(locked_messages, pending_row):
+                    locked_messages.insert(0, pending_row)
+            locked.messages = locked_messages
+
+        display_baseline_count = len(locked_messages)
+        merged_messages = reconciled_state_db_messages_for_session(
+            locked,
+            state_messages=state_messages,
+        )
+        # The baseline includes any proven WebUI-owned pending display row. Only
+        # a later state.db row is an advance worth committing and clearing pending.
+        if len(merged_messages) <= display_baseline_count:
+            return False
+        if merged_context is None:
+            merged_context = reconciled_state_db_messages_for_session(
+                locked,
+                prefer_context=True,
+                state_messages=state_messages,
+            )
+
+        # Mutate + persist the freshly-loaded, locked object. Because we hold the
+        # lock and reloaded under it, this save cannot clobber a concurrent
+        # writer's newer record.
+        locked.messages = merged_messages
+        locked.context_messages = merged_context
+        locked.active_stream_id = None
+        locked.pending_user_message = None
+        locked.pending_attachments = []
+        locked.pending_started_at = None
+        locked.pending_user_source = None
+        try:
+            locked.save(touch_updated_at=True)
+        except Exception:
+            logger.debug(
+                "state.db newer-sidecar sync save failed for session %s",
+                sid, exc_info=True,
+            )
+            return False
+
+        # Durable write succeeded — reflect the reconciled state on the caller's
+        # shared/cached object so the in-flight read returns the recovered data.
+        session.messages = merged_messages
+        session.context_messages = merged_context
+        session.active_stream_id = None
+        session.pending_user_message = None
+        session.pending_attachments = []
+        session.pending_started_at = None
+        session.pending_user_source = None
+        logger.info(
+            "Session %s: synced sidecar from newer state.db transcript (%d -> %d messages)",
+            sid,
+            locked_count,
+            len(merged_messages),
+        )
+        return True
+    finally:
+        lock.release()
+
+
+
+def _last_non_tool_role(messages) -> str:
+    if not isinstance(messages, list):
+        return ''
+    for message in reversed(messages):
+        role = _message_role(message)
+        if role and role != 'tool':
+            return role
+    return ''
+
+
+def _last_non_tool_message(messages):
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        role = _message_role(message)
+        if role and role != 'tool':
+            return message
+    return None
+
+
+def _message_content_text(message) -> str:
+    if not isinstance(message, dict):
+        return ''
+    content = message.get('content')
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get('text'), str):
+                parts.append(item['text'])
+        return ''.join(parts)
+    return ''
+
+
+def _inactive_cache_tail_needs_disk_check(cached) -> bool:
+    if cached is None:
+        return False
+    if getattr(cached, 'active_stream_id', None) or getattr(cached, 'pending_user_message', None):
+        return False
+    return _last_non_tool_role(getattr(cached, 'messages', None) or []) == 'user'
+
+
+def _cache_has_stale_unsaved_user_tail(cached, disk_session) -> bool:
+    """Return True when an inactive cached session has an unsaved user tail.
+
+    A completed turn is saved to the sidecar before the browser reloads it.  In
+    rare compaction/reconnect paths the in-process cache can retain a recovered
+    or optimistic user row after the saved assistant tail even though the row was
+    never persisted.  If /api/session serves that cache entry, the visible
+    transcript appears to end on the old prompt and the saved assistant answer
+    looks missing until a fork/reload resets the cache.
+    """
+    if cached is None or disk_session is None:
+        return False
+    if getattr(cached, 'active_stream_id', None) or getattr(cached, 'pending_user_message', None):
+        return False
+    cached_messages = getattr(cached, 'messages', None) or []
+    disk_messages = getattr(disk_session, 'messages', None) or []
+    if _last_non_tool_role(cached_messages) != 'user':
+        return False
+    if _last_non_tool_role(disk_messages) != 'assistant':
+        return False
+    if len(cached_messages) < len(disk_messages):
+        return True
+    if len(cached_messages) == len(disk_messages):
+        # Same-length divergence is still stale: a completed assistant turn can
+        # be persisted through a sibling Session object while this inactive LRU
+        # entry still ends on the optimistic/recovered user row.
+        #
+        # Keep this narrow: only evict when the shared prefix is the same and
+        # the cached user tail is not newer than the persisted assistant.  A
+        # genuine just-submitted user message can exist briefly before the
+        # stream id is attached, and that must not be replaced by older disk
+        # state.
+        cached_tail = _last_non_tool_message(cached_messages)
+        disk_tail = _last_non_tool_message(disk_messages)
+        cached_prefix = [
+            (_message_role(message), _message_content_text(message))
+            for message in cached_messages[:-1]
+        ]
+        disk_prefix = [
+            (_message_role(message), _message_content_text(message))
+            for message in disk_messages[:-1]
+        ]
+        if cached_prefix != disk_prefix:
+            return False
+        cached_tail_ts = _message_timestamp(cached_tail)
+        disk_tail_ts = _message_timestamp(disk_tail)
+        if cached_tail_ts is not None and disk_tail_ts is not None and cached_tail_ts > disk_tail_ts:
+            return False
+        return True
+
+    cached_tail = _last_non_tool_message(cached_messages)
+    previous_disk_user = None
+    for message in reversed(disk_messages):
+        if _message_role(message) == 'user':
+            previous_disk_user = message
+            break
+    if previous_disk_user is None:
+        return False
+
+    # Only drop tails that look like a duplicated optimistic/recovered user row.
+    # A genuinely new concurrent user edit must stay in memory so stale-session
+    # guards can report and preserve it.
+    return _message_content_text(cached_tail) == _message_content_text(previous_disk_user)
+
+
+def _anchor_scene_index_from_records(records) -> dict:
+    """Build the compact anchor-scene fingerprint {scene_key: updated_at} (#5854).
+
+    This is the freshness signal the sidebar-poll comparison needs — scene keys
+    plus each scene's ``updated_at`` — WITHOUT the 250-480KB bodies. Persisted in
+    the metadata prefix (before ``messages``) so ``load_metadata_only`` and
+    ``_persisted_session_meta_prefix`` stay cheap. Mirrors exactly what
+    ``_anchor_scene_record_keys`` / ``_anchor_scene_records_updated_at`` read off
+    the full records, so the fingerprint comparison is behavior-identical.
+    """
+    if not isinstance(records, dict):
+        return {}
+    index = {}
+    for key, value in records.items():
+        if not key or not isinstance(value, dict):
+            continue
+        try:
+            updated_at = float(value.get('updated_at') or 0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        index[str(key)] = updated_at
+    return index
+
+
+def _disk_scene_fingerprint(disk_meta_prefix: dict):
+    """Resolve the (scene_keys, max_updated_at) freshness signal from a parsed
+    metadata prefix dict, preferring the modern ``anchor_scene_index`` and
+    falling back to the full ``anchor_activity_scenes`` bodies for legacy files.
+
+    Returns ``None`` when the prefix carries NEITHER field, so callers can tell
+    "no scenes" (empty dict/index present) apart from "couldn't determine"
+    (legacy file whose scenes serialize after ``messages`` and so aren't in the
+    prefix) and fall through to the full metadata load instead of assuming zero.
+    """
+    if not isinstance(disk_meta_prefix, dict):
+        return None
+    if 'anchor_scene_index' in disk_meta_prefix:
+        raw = disk_meta_prefix.get('anchor_scene_index')
+        raw = raw if isinstance(raw, dict) else {}
+        keys = {str(k) for k in raw}
+        latest = 0.0
+        for v in raw.values():
+            try:
+                fv = float(v or 0)
+            except (TypeError, ValueError):
+                fv = 0.0
+            if fv > latest:
+                latest = fv
+        return keys, latest
+    if 'anchor_activity_scenes' in disk_meta_prefix:
+        records = disk_meta_prefix.get('anchor_activity_scenes')
+        records = records if isinstance(records, dict) else {}
+        keys = {str(k) for k, val in records.items() if k and isinstance(val, dict)}
+        latest = 0.0
+        for val in records.values():
+            if not isinstance(val, dict):
+                continue
+            try:
+                fv = float(val.get('updated_at') or 0)
+            except (TypeError, ValueError):
+                fv = 0.0
+            if fv > latest:
+                latest = fv
+        return keys, latest
+    return None
+
+
+def _sidecar_stat_signature(path):
+    """Stat signature for a sidecar path, or None if it can't be stat'd.
+
+    Any edit (atomic-rename or in-place) changes at least one component, so a
+    cached entry keyed by this signature is auto-invalidated on the next write.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (str(path), int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1_000_000_000))),
+            int(st.st_size), int(getattr(st, 'st_ctime_ns', int(st.st_ctime * 1_000_000_000))))
+
+
+_MESSAGE_COUNT_MARKER = 1
+
+
+def _prefix_message_count(path):
+    """The sidecar's own persisted ``message_count``, from a bounded prefix.
+
+    The #1558 shrink check in save() needs exactly one integer -- how many
+    messages the file on disk holds -- and the writer puts that integer in the
+    metadata prefix, before ``messages``, precisely so readers can have it
+    without parsing the body (see METADATA_FIELDS). Reading the prefix costs
+    O(64 KiB) against O(file size) for ``read_text`` + ``json.loads`` (measured
+    2026-09-15: 20,377 ms for one integer on a 203,439,398-byte sidecar).
+
+    Content-derived on purpose. A stat identity cannot stand in for it: an
+    in-place rewrite of the same length inside one mtime tick keeps inode, size
+    *and* mtime_ns, so a cached count would read a real shrink as a growth and
+    skip the backup. The count is part of the bytes, so any rewrite of them
+    rewrites it too.
+
+    Gated on the writer marker (``_mc_v``, review 2026-09-22): a count is only
+    trusted when the SAME write that produced the messages array also vouched
+    for the count. Anything unmarked -- a legacy pre-#5854 sidecar, a sidecar
+    materialized by an older recovery writer whose denormalized count could be
+    stale against its rows, any foreign writer -- returns None and the caller
+    falls back to the full read + parse. After one save by the current writer
+    the file carries the marker and the fast path resumes.
+
+    Returns None -- meaning "the caller must fall back to the full read +
+    parse" -- for every shape that does not carry a usable MARKED count: an
+    unmarked or wrong-marker file, a legacy sidecar whose count is not in the
+    prefix, a file with no top-level ``messages`` key at all, a corrupt or
+    truncated prefix, an unreadable path, or metadata alone that overflows the
+    budget.
+    """
+    try:
+        raw = _read_metadata_json_prefix(path)
+    except (OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get('_mc_v') != _MESSAGE_COUNT_MARKER:
+        return None
+    return _parse_nonnegative_int(parsed.get('message_count'))
+
+
+def _legacy_sidecar_facts_get(sid):
+    """Return cached authoritative facts for a LEGACY sidecar, or None (#5854).
+
+    Only returns a hit when the file's current stat signature matches the cached
+    one, so a stale entry can never be served after an edit.
+    """
+    if not is_safe_session_id(sid):
+        return None
+    sig = _sidecar_stat_signature(SESSION_DIR / f'{sid}.json')
+    if sig is None:
+        return None
+    with _LEGACY_SIDECAR_FACTS_LOCK:
+        hit = _LEGACY_SIDECAR_FACTS.get(sig)
+        if hit is not None:
+            _LEGACY_SIDECAR_FACTS.move_to_end(sig)
+            return dict(hit)
+    return None
+
+
+def _legacy_sidecar_facts_put(sid, message_count, scene_index, *, expected_sig):
+    """Cache authoritative facts for a legacy sidecar keyed by its stat signature.
+
+    #5854 TOCTOU guard: ``expected_sig`` (MANDATORY) is the signature captured
+    BEFORE the caller parsed the file. The facts were derived from that snapshot,
+    so we only cache when the file's CURRENT signature still equals it —
+    otherwise the file was atomically replaced during the parse and these facts
+    describe the old content; caching them under the new signature would serve
+    stale data. Pass ``None`` explicitly only if the caller genuinely has no
+    snapshot (then this is a no-op, refusing to cache unverified facts).
+    """
+    if not is_safe_session_id(sid):
+        return
+    if expected_sig is None:
+        return
+    sig = _sidecar_stat_signature(SESSION_DIR / f'{sid}.json')
+    if sig is None:
+        return
+    if sig != expected_sig:
+        # File changed under us during the parse — do not cache stale facts.
+        return
+    entry = {"message_count": message_count,
+             "scene_index": dict(scene_index) if isinstance(scene_index, dict) else {}}
+    with _LEGACY_SIDECAR_FACTS_LOCK:
+        _LEGACY_SIDECAR_FACTS[sig] = entry
+        _LEGACY_SIDECAR_FACTS.move_to_end(sig)
+        while len(_LEGACY_SIDECAR_FACTS) > _LEGACY_SIDECAR_FACTS_MAX:
+            _LEGACY_SIDECAR_FACTS.popitem(last=False)
+
+
+def _anchor_scene_record_keys(session) -> set[str]:
+    records = getattr(session, 'anchor_activity_scenes', None)
+    if not isinstance(records, dict):
+        return set()
+    return {str(key) for key, value in records.items() if key and isinstance(value, dict)}
+
+
+def _anchor_scene_records_updated_at(session) -> float:
+    records = getattr(session, 'anchor_activity_scenes', None)
+    if not isinstance(records, dict):
+        return 0.0
+    latest = 0.0
+    for record in records.values():
+        if not isinstance(record, dict):
+            continue
+        try:
+            updated_at = float(record.get('updated_at') or 0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        if updated_at > latest:
+            latest = updated_at
+    return latest
+
+
+def _session_scene_keys(session) -> set[str]:
+    """Scene keys for a session object, fingerprint-aware (#5854).
+
+    The ``_anchor_scene_index`` fingerprint is authoritative ONLY on a
+    metadata-only stub (whose full ``anchor_activity_scenes`` are not
+    materialized because they serialize after ``messages``). A FULLY-LOADED
+    session carries a load-time fingerprint that goes stale the moment its
+    records are mutated in place (the scene-persist path does exactly that
+    without refreshing it), so for a full session we MUST read the real records.
+    """
+    if getattr(session, '_loaded_metadata_only', False):
+        index = getattr(session, '_anchor_scene_index', None)
+        if isinstance(index, dict):
+            return {str(k) for k in index}
+    return _anchor_scene_record_keys(session)
+
+
+def _session_scene_updated_at(session) -> float:
+    """Max scene ``updated_at`` for a session object, fingerprint-aware (#5854).
+
+    Fingerprint is authoritative only on a metadata-only stub; a fully-loaded
+    session always compares its real records (see ``_session_scene_keys``).
+    """
+    if getattr(session, '_loaded_metadata_only', False):
+        index = getattr(session, '_anchor_scene_index', None)
+        if isinstance(index, dict):
+            latest = 0.0
+            for v in index.values():
+                try:
+                    fv = float(v or 0)
+                except (TypeError, ValueError):
+                    fv = 0.0
+                if fv > latest:
+                    latest = fv
+            return latest
+    return _anchor_scene_records_updated_at(session)
+
+
+def _cached_session_lags_disk(cached) -> bool:
+    """Return True when a cached full session is older than its sidecar.
+
+    Active/reconnect paths can update the persisted sidecar through another
+    Session object while the LRU cache still holds an older object for the same
+    id. Serving the cache then makes recent assistant results disappear from
+    GET /api/session even though disk and _index.json are correct. Compare only
+    cheap metadata here; full reload happens only if disk is strictly ahead.
+
+    perf(webui/session-load-latency) cheap-first ordering: the function used to
+    call Session.load_metadata_only(sid) on every cache hit, which parses the
+    full sidecar JSON (~15-20ms even for 1.3MB sidecars on Celeron+ eMMC).
+    For draft auto-saves that hit get_session() on every keystroke debounce
+    (every ~400ms while typing), that 15-20ms multiplied out to ~75% of the
+    request's wall time on the Chromebook. We now do a single fast check
+    first: read only the JSON metadata prefix to compare message counts.
+    The full Session.load_metadata_only() and its anchor-scene comparisons
+    only run when the count check is inconclusive or when disk appears to be
+    ahead of cache.
+    """
+    if cached is None:
+        return False
+    sid = getattr(cached, 'session_id', None)
+    if not sid:
+        return False
+    cached_count = len(getattr(cached, 'messages', None) or [])
+    # Fast path: prefix read of just the metadata header.
+    disk_count = _persisted_message_count(sid)
+    if disk_count is not None:
+        if disk_count > cached_count:
+            return True
+        # Disk is at most as far as cache. Even when counts match, anchor scene
+        # records can advance independently (api/routes.py saves a session
+        # with `s.save(touch_updated_at=False, skip_index=True)` after editing
+        # only the scene dict; message_count is len(messages) so it stays the
+        # same). Greptile flagged this in PR review. Cheaply check the disk's
+        # scene records from the same prefix we already read.
+        cached_scenes = getattr(cached, 'anchor_activity_scenes', None) or {}
+        if not isinstance(cached_scenes, dict):
+            cached_scenes = {}
+        # Track whether the cheap scene check was inconclusive — when it is,
+        # we must fall through to the full metadata comparison instead of
+        # returning False for inactive sessions with matching counts.
+        _scene_check_inconclusive = False
+        if cached_scenes:
+            disk_meta_quick = _persisted_session_meta_prefix(sid)
+            # #5854: modern prefixes carry only the anchor_scene_index
+            # fingerprint (keys + updated_at), not the full scene bodies (those
+            # now serialize after `messages`). _disk_scene_fingerprint resolves
+            # the (keys, max_updated_at) signal from either the modern
+            # fingerprint or a legacy file's inline bodies, and returns None
+            # when the prefix carries NEITHER (a legacy large-scene file whose
+            # scenes fall after the prefix) so we fall through rather than
+            # assuming "no scenes".
+            disk_fp = _disk_scene_fingerprint(disk_meta_quick) if disk_meta_quick is not None else None
+            if disk_fp is not None:
+                disk_keys, disk_latest = disk_fp
+                if disk_keys:
+                    # Directional: only reload when disk is strictly ahead
+                    # of cache. Mirror master's subset comparison — cache
+                    # that is ahead of disk must NOT force a reload, or
+                    # un-persisted scene data is silently dropped.
+                    cached_keys = _anchor_scene_record_keys(cached)
+                    if not disk_keys.issubset(cached_keys):
+                        return True
+                    # Same key set (or disk is subset): check the latest
+                    # updated_at timestamp.
+                    if disk_latest > _anchor_scene_records_updated_at(cached):
+                        return True
+                # disk has no scenes, cache does -> cache is ahead; keep it.
+            else:
+                # Can't cheaply verify scene freshness from disk (prefix carried
+                # neither fingerprint nor inline scenes, or the prefix read
+                # failed while _persisted_message_count succeeded via index
+                # fallback). Fall through to the full metadata load so we don't
+                # serve stale scenes on the next equal-count inactive path.
+                # Greptile P1.
+                _scene_check_inconclusive = True
+        else:
+            # Cached session has no scene records. Check if disk has gained
+            # the first scene record — without this the fast-path would miss
+            # a newly persisted scene and return the stale cache. Greptile P1.
+            disk_meta_quick = _persisted_session_meta_prefix(sid)
+            disk_fp = _disk_scene_fingerprint(disk_meta_quick) if disk_meta_quick is not None else None
+            if disk_fp is not None:
+                disk_keys, _disk_latest = disk_fp
+                if disk_keys:
+                    return True
+            else:
+                # Prefix read failed / carried no scene signal (may still
+                # succeed via index fallback for message count). Mark
+                # inconclusive so we fall through to the full metadata
+                # comparison instead of returning False with stale cache.
+                # Greptile P1 (discussion_r3548650345).
+                _scene_check_inconclusive = True
+        if getattr(cached, 'active_stream_id', None) or getattr(cached, 'pending_user_message', None):
+            # Active session: messages may be in flight; fall through to the
+            # full check to be safe.
+            pass
+        elif _scene_check_inconclusive:
+            # Could not cheaply verify scene freshness from disk; fall through
+            # to the full metadata comparison rather than returning False
+            # (which would serve a potentially stale cache). Greptile P1.
+            pass
+        else:
+            # Inactive session, count matches, scene records match — cache is
+            # at parity with disk.
+            return False
+    try:
+        disk_meta = Session.load_metadata_only(sid)
+    except Exception:
+        return False
+    if disk_meta is None:
+        return False
+    if disk_count is None:
+        disk_count = _parse_nonnegative_int(getattr(disk_meta, '_metadata_message_count', None))
+        if disk_count is None:
+            disk_count = _lookup_index_message_count(sid)
+        if disk_count is not None and disk_count > cached_count:
+            return True
+    if not getattr(cached, 'active_stream_id', None) and not getattr(cached, 'pending_user_message', None):
+        # #5854: disk_meta is a metadata-only stub whose scenes now live after
+        # `messages` and so are NOT materialized on it — read its scene freshness
+        # from the _anchor_scene_index fingerprint. `cached` is ALWAYS a full
+        # in-memory session (get_session never caches metadata-only stubs), and
+        # its records are mutated in place by the scene-persist path without
+        # refreshing the load-time fingerprint — so the cached side must read the
+        # REAL records (master parity), never the fingerprint, or a parity cache
+        # looks disk-behind after a scene write and forces a spurious full reload.
+        #
+        # A LEGACY stub (no anchor_scene_index fingerprint AND scenes not in the
+        # prefix) carries no scene signal at all — comparing it blind would miss
+        # a genuine disk-ahead scene change (stale worklog served). Full-load the
+        # sidecar once to compare real scene records; the next save() rewrites
+        # the modern layout so this legacy full-load doesn't recur.
+        if (
+            getattr(disk_meta, '_loaded_metadata_only', False)
+            and getattr(disk_meta, '_anchor_scene_index', None) is None
+        ):
+            try:
+                disk_full = Session.load(sid)
+            except Exception:
+                disk_full = None
+            if disk_full is not None:
+                disk_meta = disk_full
+        cached_scene_keys = _anchor_scene_record_keys(cached)
+        disk_scene_keys = _session_scene_keys(disk_meta)
+        if disk_scene_keys and not disk_scene_keys.issubset(cached_scene_keys):
+            return True
+        if (
+            disk_scene_keys
+            and _session_scene_updated_at(disk_meta) > _anchor_scene_records_updated_at(cached)
+        ):
+            return True
+    return False
+
+
+def _persisted_message_count(sid) -> int | None:
+    """Return the on-disk message count for *sid* without a full load (#4765).
+
+    Reads only the sidecar metadata prefix (and falls back to the sidebar
+    ``_index.json`` count) so the eviction safety check stays cheap even while
+    the global ``LOCK`` is held. Returns ``None`` when the sidecar is missing or
+    its count cannot be determined — callers treat that as "do not evict",
+    because we must never drop an in-memory session we cannot prove is on disk.
+    """
+    if not is_safe_session_id(sid):
+        return None
+    p = SESSION_DIR / f'{sid}.json'
+    if not p.exists():
+        return None
+    try:
+        prefix = _read_metadata_json_prefix(p)
+        if prefix:
+            parsed = json.loads(prefix)
+            count = _parse_nonnegative_int(parsed.get('message_count'))
+            if count is not None:
+                return count
+            # #5854: a legacy sidecar (scenes-before-count) yields a prefix with
+            # no message_count and no modern anchor_scene_index. The _index.json
+            # count can lag behind external appends, so trusting it here risks
+            # under-reporting (and dropping an unsaved tail on cache-replace).
+            # Consult the authoritative legacy-facts cache (populated by a full
+            # load) before giving up; only return None (→ caller full-loads) on
+            # a miss. This keeps clean legacy sessions LRU-evictable without
+            # trusting a stale index. A MODERN prefix always carries
+            # message_count, so it returns above.
+            if 'anchor_scene_index' not in parsed:
+                _facts = _legacy_sidecar_facts_get(sid)
+                if _facts is not None:
+                    cached_count = _parse_nonnegative_int(_facts.get('message_count'))
+                    if cached_count is not None:
+                        return cached_count
+                # Cache miss (never full-loaded yet, or the facts LRU evicted
+                # this entry). Returning None here would make the session
+                # non-evictable (the eviction check treats an unknown disk count
+                # as "do not evict"), which can let new_session() evict its own
+                # unsaved session and 404 the first send. Full-parse to get the
+                # authoritative count (Session.load re-caches the facts for
+                # legacy files under a TOCTOU-guarded signature). Re-verify the
+                # stat signature is stable across the parse so we never return a
+                # count from a file that was atomically replaced mid-read; retry
+                # boundedly on mismatch, then fall through to None. Bounded
+                # overall: the next save() rewrites the modern layout.
+                for _attempt in range(3):
+                    sig_before = _sidecar_stat_signature(p)
+                    try:
+                        _full = Session.load(sid)
+                    except Exception:
+                        _full = None
+                    sig_after = _sidecar_stat_signature(p)
+                    if _full is None:
+                        return None
+                    if sig_before is not None and sig_before == sig_after:
+                        return len(getattr(_full, 'messages', None) or [])
+                    # File changed during the parse — the count is uncertain;
+                    # retry with a fresh snapshot.
+                return None
+    except Exception:
+        # Fall through to the index-based fallback below.
+        pass
+    return _parse_nonnegative_int(_lookup_index_message_count(sid))
+
+
+def _persisted_session_meta_prefix(sid) -> dict | None:
+    """Return the parsed metadata prefix dict for *sid*, or None on error.
+
+    Used by ``_cached_session_lags_disk`` to compare additional fields (e.g.
+    anchor scene records) cheaply against the cached in-memory session without
+    paying for a full ``Session.load_metadata_only`` parse. Returns the same
+    shape as ``_persisted_message_count`` callers would expect — a dict that
+    only contains the metadata-prefix fields, NOT ``messages`` / ``tool_calls``.
+    """
+    if not is_safe_session_id(sid):
+        return None
+    p = SESSION_DIR / f'{sid}.json'
+    if not p.exists():
+        return None
+    try:
+        prefix = _read_metadata_json_prefix(p)
+        if not prefix:
+            return None
+        return json.loads(prefix)
+    except Exception:
+        return None
+
+
+def _session_sidecar_exists(sid) -> bool | None:
+    """Return whether *sid*'s sidecar file exists on disk.
+
+    True  = the sidecar is confirmed present.
+    False = the sidecar is confirmed absent (a truly never-persisted session).
+    None  = existence is indeterminate (unsafe id, or the stat raised).
+
+    ``_session_is_evictable`` uses this to distinguish a genuinely
+    never-persisted empty shell (safe to grace-evict once abandoned) from a
+    session whose count merely could not be read this pass (stay resident).
+    """
+    if not is_safe_session_id(sid):
+        return None
+    try:
+        return (SESSION_DIR / f'{sid}.json').exists()
+    except OSError:
+        return None
+
+
+# Grace window (seconds) during which a never-persisted, empty, draftless session
+# shell is protected from LRU eviction. new_session() defers the first disk write
+# only in the SESSIONS cache; evicting it there permanently 404s the chat (#6083).
+# After this window a still-empty, still-draftless, never-saved shell is treated as
+# abandoned and becomes evictable again, so these shells can't grow unbounded past
+# the cache cap. Generous (30 min) so a user composing slowly is never dropped;
+# a real draft persists to disk on the first keystroke and is reloadable anyway.
+_UNSAVED_SHELL_GRACE_S = 1800
+
+
+def _session_is_evictable(s) -> bool:
+    """Return True only when *s* can be safely dropped from the LRU (#4765).
+
+    Eviction must never lose data or interrupt a live turn. A session is
+    evictable ONLY when ALL of the following hold:
+
+      * It is not streaming (no ``active_stream_id``).
+      * It has no in-flight/queued turn (no ``pending_user_message`` and no
+        ``pending_started_at``).
+      * Its full state is already persisted to the JSON sidecar, proven by the
+        on-disk ``message_count`` being at least the in-memory message count.
+        A metadata-only stub is inherently backed by disk, so it is evictable.
+
+    The persistence requirement holds even for a session with ZERO messages,
+    but only for a bounded grace window. ``new_session()`` deliberately does not
+    touch disk until the first message (#1171), so between "New Conversation" and
+    the first send this cache is the session's ONLY copy. Evicting it there
+    discards an un-recreatable shell: ``get_session()`` has no recreate path and
+    raises ``KeyError``, so the very next ``/api/session/draft`` or
+    ``/api/chat/start`` 404s and the session can never be started (#6083). We
+    therefore protect a never-persisted empty shell while it is fresh (the user
+    just opened it and is composing) OR while it has an active composer draft.
+
+    A never-persisted empty shell that is BOTH stale (older than
+    ``_UNSAVED_SHELL_GRACE_S``) AND draftless is treated as an abandoned
+    "New Conversation" tab the user opened and walked away from — it becomes
+    evictable again so ``sessions_cache_max`` still bounds these shells and they
+    cannot accumulate without limit (a slow leak / OOM on installs that open many
+    empty chats). Anything the user is actually composing persists a draft via
+    ``s.save()`` on the first keystroke, so it is disk-backed and reloadable well
+    before the grace window expires; the window only covers the empty-and-untouched
+    gap right after "New Conversation".
+
+    Anything else we cannot positively prove is safe stays resident. Using
+    slightly more RAM for a session we are unsure about is strictly better than
+    evicting an active or unsaved session (task safety invariant: a half-done
+    memory fix that loses a session is worse than none).
+    """
+    if s is None:
+        return True  # nothing to protect; let the caller drop it
+    if getattr(s, 'active_stream_id', None):
+        return False
+    if getattr(s, 'pending_user_message', None):
+        return False
+    if getattr(s, 'pending_started_at', None):
+        return False
+    sid = getattr(s, 'session_id', None)
+    if not sid:
+        return False
+    # Metadata-only stubs never carry unsaved messages (messages=[] by design),
+    # so they are always disk-backed and safe to drop.
+    if getattr(s, '_loaded_metadata_only', False):
+        return True
+    in_memory_count = len(getattr(s, 'messages', None) or [])
+    disk_count = _persisted_message_count(sid)
+    if disk_count is None:
+        # disk_count is None for TWO distinct reasons: the sidecar is confirmed
+        # absent (truly never persisted → this cache is the only copy), OR the
+        # sidecar exists but its count could not be read this pass (transient I/O,
+        # mid-write). Only the CONFIRMED-ABSENT case is eligible for grace-based
+        # shell eviction; an indeterminate existing-sidecar session stays resident
+        # (conservative — never grace-evict something we cannot prove is gone).
+        if in_memory_count > 0:
+            return False  # holds unsaved messages → never drop
+        composer_draft = getattr(s, 'composer_draft', None)
+        if composer_draft:
+            return False  # user is composing (draft present) → keep resident
+        if _session_sidecar_exists(sid) is not False:
+            # Sidecar present or existence indeterminate → not a never-persisted
+            # shell; do not enter the abandoned-shell grace path.
+            return False
+        # Confirmed never-persisted empty draftless shell. Protect it while fresh
+        # (the compose window right after "New Conversation"); once stale it is an
+        # abandoned tab and becomes evictable so these shells cannot accumulate
+        # unbounded past the cache cap (#6083 follow-up).
+        created_at = getattr(s, 'created_at', None)
+        if isinstance(created_at, (int, float)):
+            if (time.time() - created_at) <= _UNSAVED_SHELL_GRACE_S:
+                return False  # fresh empty shell → protect the compose window
+            return True  # stale, empty, draftless, never-saved → abandoned, evictable
+        # No usable created_at timestamp → be conservative, keep it resident.
+        return False
+    if in_memory_count == 0:
+        # Persisted and empty → trivially clean, nothing to lose.
+        return True
+    return disk_count >= in_memory_count
+
+
+def _evict_sessions_over_cap(cap: int | None = None) -> int:
+    """Evict clean, persisted, non-active sessions until len(SESSIONS) <= cap.
+
+    Replaces the previous blind ``SESSIONS.popitem(last=False)`` loops (#4765).
+    The blind loops could evict the least-recently-used entry even if it was
+    actively streaming or held unsaved messages, risking a dropped turn or lost
+    conversation. This walks the LRU from oldest to newest and removes only
+    entries that ``_session_is_evictable()`` proves are safe. An evicted session
+    transparently lazily reloads from its sidecar on the next ``get_session()``.
+
+    CALLER CONTRACT: the global ``LOCK`` MUST already be held (every call site
+    mutates ``SESSIONS`` under ``LOCK``). This function never acquires ``LOCK``
+    or any stream lock itself, so it cannot introduce a lock-ordering deadlock.
+    Under that same held ``LOCK`` it publishes the cap it enforced into
+    ``api.config._LAST_APPLIED_SESSIONS_CACHE_MAX`` for nonblocking diagnostics
+    (#6351); any future edit that can change ``cap`` after that point must move
+    the publish down with it.
+
+    Returns the number of sessions evicted. If every over-cap candidate is
+    active/unsaved, the cache may temporarily exceed ``cap`` — that is the
+    intended safe behavior (never lose an active/unsaved session).
+    """
+    if cap is None:
+        try:
+            cap = _cfg.get_sessions_cache_max()
+        except Exception:
+            cap = SESSIONS_MAX
+    if not isinstance(cap, int) or cap < 1:
+        cap = SESSIONS_MAX if isinstance(SESSIONS_MAX, int) and SESSIONS_MAX >= 1 else 1
+    # Diagnostics owns the field; this function owns the decision. Publishing the
+    # normalized cap here, rather than from the resolver, is what makes the health
+    # payload report a cap eviction actually applied — including the getter-failure
+    # fallback and explicit/normalized calls, which never reach the resolver (#6351).
+    _cfg._LAST_APPLIED_SESSIONS_CACHE_MAX = cap
+    evicted = 0
+    # Iterate over a snapshot of ids in LRU order (oldest first). We stop as
+    # soon as we are at/below the cap. Skipping a non-evictable oldest entry and
+    # moving on lets us reclaim a slightly-newer clean entry instead of blocking
+    # eviction entirely behind one pinned active session.
+    for sid in list(SESSIONS.keys()):
+        if len(SESSIONS) <= cap:
+            break
+        candidate = SESSIONS.get(sid)
+        if _session_is_evictable(candidate):
+            SESSIONS.pop(sid, None)
+            evicted += 1
+    if len(SESSIONS) > cap:
+        logger.debug(
+            "SESSIONS cache above cap (%d > %d) after eviction pass: remaining "
+            "entries are active or unsaved and were preserved (#4765)",
+            len(SESSIONS), cap,
+        )
+    return evicted
+
+
+def get_session_for_scan(sid):
+    """Read a session for a one-pass scan without disturbing the LRU.
+
+    The scan uses the full canonical resolver so stale sidecars, pending journal
+    recovery, and newer state.db transcript rows remain searchable. It only
+    differs from ``get_session`` in cache policy: no hit promotion, no cold-load
+    insertion, and therefore no scan-triggered eviction.
+    """
+    try:
+        return _resolve_session(sid, promote_cache=False, cache_on_miss=False)
+    except Exception:
+        logger.debug("scan load failed for session %s", sid, exc_info=True)
+        return None
+
+
+class _FullSessionResolveRequired(RuntimeError):
+    """Internal signal that a full sidecar load must enter the bounded path."""
+
+
+def _read_max_session_resolve_concurrent() -> int:
+    """#7421: env override for the heavy session-resolve cap. The
+    hardcoded literal 2 is too low for high-concurrency
+    deployments where several parallel active sessions all need
+    a full-transcript resolve; operators can set
+    ``HERMES_WEBUI_MAX_SESSION_RESOLVE`` to a positive int to
+    raise the cap without code changes. A bad or missing value
+    falls back to the previous default of 2, so an operator who
+    sets ``HERMES_WEBUI_MAX_SESSION_RESOLVE=0`` or a non-numeric
+    value does not regress to a blocked or unbounded state.
+
+    The cap is a *safety bound* (per-resolve cost tracked in
+    #7310), not a user preference — a typo like ``=999999``
+    must fall back to the safe default, never to the permissive
+    extreme. Every other bad input in this function falls back
+    to ``2``; out-of-range values do too. The previously
+    accepted upper bound (64) is reachable only via an explicit
+    in-range operator value; a profile's ``.env`` cannot reach
+    it at all (see ``_PROTECTED_ENV_KEYS``).
+    """
+    raw = (os.getenv("HERMES_WEBUI_MAX_SESSION_RESOLVE") or "").strip()
+    if not raw:
+        return 2
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 2
+    if n < 1:
+        return 2
+    if n > 64:
+        return 2  # #7656 round-3: typo-safe fallback, not clamp-up-to-64
+    return n
+
+
+_FULL_SESSION_RESOLVE_MAX_CONCURRENT = _read_max_session_resolve_concurrent()
+_FULL_SESSION_RESOLVE_SLOTS = threading.BoundedSemaphore(
+    _FULL_SESSION_RESOLVE_MAX_CONCURRENT
+)
+_FULL_SESSION_RESOLVE_INFLIGHT: dict[str, threading.Event] = {}
+_FULL_SESSION_RESOLVE_INFLIGHT_LOCK = threading.Lock()
+_FULL_SESSION_RESOLVE_LOCAL = threading.local()
+# A cold load re-reads at most this many times when another writer replaces
+# the sidecar mid-read (#8267), then publishes its last read as before.
+_COLD_PUBLISH_ATTEMPTS = 3
+
+
+def _claim_full_session_resolve(session_id: str) -> tuple[bool, threading.Event]:
+    """Return whether this caller owns the single-flight for ``session_id``."""
+    with _FULL_SESSION_RESOLVE_INFLIGHT_LOCK:
+        event = _FULL_SESSION_RESOLVE_INFLIGHT.get(session_id)
+        if event is not None:
+            return False, event
+        event = threading.Event()
+        _FULL_SESSION_RESOLVE_INFLIGHT[session_id] = event
+        return True, event
+
+
+def _finish_full_session_resolve(session_id: str, event: threading.Event) -> None:
+    """Release one single-flight owner and wake every waiter."""
+    with _FULL_SESSION_RESOLVE_INFLIGHT_LOCK:
+        if _FULL_SESSION_RESOLVE_INFLIGHT.get(session_id) is event:
+            _FULL_SESSION_RESOLVE_INFLIGHT.pop(session_id, None)
+    event.set()
+
+
+def _resolve_session_once(
+    sid,
+    metadata_only=False,
+    *,
+    promote_cache=True,
+    cache_on_miss=True,
+    allow_full_load=False,
+):
+    """Resolve a session through the canonical freshness/recovery path.
+
+    ``get_session_for_scan`` shares this resolver with normal reads so that
+    content search sees the same disk freshness, journal-retry, and state.db
+    recovery behavior. Its policy merely suppresses LRU promotion and cold-load
+    caching; reconciliation still updates an already-resident entry when normal
+    resolution replaces stale contents.
+    """
+    with LOCK:
+        cached = SESSIONS.get(sid)
+        if cached is not None and promote_cache:
+            SESSIONS.move_to_end(sid)  # LRU: mark as recently used
+    if cached is not None:
+        # Defensive cache ownership check: compression/continuation and recovery
+        # paths can temporarily juggle Session objects across lineage ids.  A
+        # stale object stored under the wrong key makes GET /api/session return
+        # a different transcript than the requested sid, which looks exactly
+        # like a disappeared session.  Evict instead of trusting the LRU.
+        if str(getattr(cached, 'session_id', '') or '') != str(sid):
+            logger.warning(
+                "evicting mismatched cached session: requested %s but cached object is %s",
+                sid,
+                getattr(cached, 'session_id', None),
+            )
+            with LOCK:
+                if SESSIONS.get(sid) is cached:
+                    SESSIONS.pop(sid, None)
+            cached = None
+    if cached is not None:
+        if not metadata_only and _cached_session_lags_disk(cached):
+            if not allow_full_load:
+                raise _FullSessionResolveRequired
+            try:
+                disk_session = Session.load(sid)
+                with LOCK:
+                    SESSIONS[sid] = disk_session
+                    if promote_cache:
+                        SESSIONS.move_to_end(sid)
+                cached = disk_session
+            except Exception:
+                logger.debug(
+                    "cached session disk-freshness check failed for session %s", sid, exc_info=True,
+                )
+        if not metadata_only and _inactive_cache_tail_needs_disk_check(cached):
+            if not allow_full_load:
+                raise _FullSessionResolveRequired
+            try:
+                disk_session = Session.load(sid)
+                if _cache_has_stale_unsaved_user_tail(cached, disk_session):
+                    with LOCK:
+                        SESSIONS[sid] = disk_session
+                        if promote_cache:
+                            SESSIONS.move_to_end(sid)
+                    cached = disk_session
+            except Exception:
+                logger.debug(
+                    "stale cached user-tail check failed for session %s", sid, exc_info=True,
+                )
+        if not metadata_only and _session_has_pending_journal_retry(cached):
+            try:
+                _try_retry_journal_recovery_in_place(cached)
+            except Exception:
+                logger.debug(
+                    "lazy journal-retry failed on cache hit for session %s", sid, exc_info=True,
+                )
+        if not metadata_only:
+            try:
+                _sync_sidecar_from_state_db_if_newer(cached)
+            except Exception:
+                logger.debug(
+                    "state.db newer-sidecar sync failed on cache hit for session %s", sid, exc_info=True,
+                )
+        return cached
+    if metadata_only:
+        s = Session.load_metadata_only(sid)
+        if s:
+            return s
+    else:
+        if not allow_full_load:
+            raise _FullSessionResolveRequired
+        for attempt in range(_COLD_PUBLISH_ATTEMPTS):
+            before = _sidecar_write_generation(sid)
+            s = Session.load(sid)
+            if not s or not cache_on_miss:
+                break
+            with LOCK:
+                if not (SESSION_DIR / f"{sid}.json").exists():
+                    raise KeyError(sid)
+                resident = SESSIONS.get(sid)
+                now = _sidecar_write_generation(sid)
+                # Writes by this thread (a self-heal save inside load) are
+                # part of what it read; only other writers make it stale.
+                unchanged = (now[0] - before[0]) == (now[1] - before[1])
+                last_attempt = attempt == _COLD_PUBLISH_ATTEMPTS - 1
+                if resident is None and (unchanged or last_attempt):
+                    if not unchanged:
+                        logger.debug(
+                            "session %s kept changing during cold load; publishing the last read", sid,
+                        )
+                    SESSIONS[sid] = s
+                    if promote_cache:
+                        SESSIONS.move_to_end(sid)
+                    _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+                    break
+            if resident is not None:
+                # Another writer published this id while the sidecar was read
+                # (#8267). Serve that object through the cache-hit path instead
+                # of replacing it with an older read: one object per session id.
+                return _resolve_session_once(
+                    sid,
+                    metadata_only=False,
+                    promote_cache=promote_cache,
+                    cache_on_miss=cache_on_miss,
+                    allow_full_load=True,
+                )
+            # Another writer replaced the sidecar during the read: read it again.
+    if s:
+        if not metadata_only:
+            try:
+                synced_from_state = _sync_sidecar_from_state_db_if_newer(s)
+                repaired = False if synced_from_state else _repair_stale_pending(s)
+                # If the stale-pending repair did not fire but the session
+                # already carries a pending-journal-retry marker (e.g. set on
+                # a previous repair pass), give the lazy-retry path one
+                # chance to self-heal on this read.
+                if not repaired and not synced_from_state and _session_has_pending_journal_retry(s):
+                    try:
+                        _try_retry_journal_recovery_in_place(s)
+                    except Exception:
+                        logger.debug(
+                            "lazy journal-retry failed on cold load for session %s", sid, exc_info=True,
+                        )
+                # If repair had to bail because the per-session lock was held,
+                # do not pin the still-stale sidecar in the LRU cache forever.
+                # Leaving it cached would prevent future get_session() calls from
+                # re-entering the cache-miss repair path after the lock holder exits.
+                if cache_on_miss and not repaired and (len(s.messages) == 0
+                        and s.pending_user_message
+                        and s.active_stream_id
+                        and s.active_stream_id not in _active_stream_ids()):
+                    with LOCK:
+                        if SESSIONS.get(sid) is s:
+                            SESSIONS.pop(sid, None)
+            except Exception:
+                pass  # repair is best-effort
+        return s
+    raise KeyError(sid)
+
+
+def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_miss=True):
+    """Resolve a session while single-flighting heavyweight full sidecar loads.
+
+    Metadata-only reads and full sessions that remain current in the cache take
+    the lock-free path. A cache miss or stale cache entry elects one leader per
+    session; waiters retry the canonical resolver after that leader publishes its
+    result. Leaders for different sessions share a small global slot budget so
+    concurrent JSON parses cannot multiply a large sidecar's transient memory.
+    """
+    if metadata_only:
+        return _resolve_session_once(
+            sid,
+            metadata_only=True,
+            promote_cache=promote_cache,
+            cache_on_miss=cache_on_miss,
+        )
+
+    session_id = str(sid)
+    while True:
+        try:
+            return _resolve_session_once(
+                sid,
+                metadata_only=False,
+                promote_cache=promote_cache,
+                cache_on_miss=cache_on_miss,
+            )
+        except _FullSessionResolveRequired:
+            pass
+
+        active: set[str] = set(
+            getattr(_FULL_SESSION_RESOLVE_LOCAL, "active", ()) or ()
+        )
+        if active:
+            # Nested resolution already owns one global slot. Re-enter directly
+            # instead of waiting on this thread's own flight or consuming a
+            # second slot; the canonical resolver still owns all cache checks.
+            return _resolve_session_once(
+                sid,
+                metadata_only=False,
+                promote_cache=promote_cache,
+                cache_on_miss=cache_on_miss,
+                allow_full_load=True,
+            )
+
+        leader, event = _claim_full_session_resolve(session_id)
+        if not leader:
+            event.wait()
+            continue
+
+        active.add(session_id)
+        _FULL_SESSION_RESOLVE_LOCAL.active = active
+        try:
+            with _FULL_SESSION_RESOLVE_SLOTS:
+                return _resolve_session_once(
+                    sid,
+                    metadata_only=False,
+                    promote_cache=promote_cache,
+                    cache_on_miss=cache_on_miss,
+                    allow_full_load=True,
+                )
+        finally:
+            active.discard(session_id)
+            _FULL_SESSION_RESOLVE_LOCAL.active = active
+            _finish_full_session_resolve(session_id, event)
+
+
+def get_session(sid, metadata_only=False):
+    """Load a session, optionally with metadata only (skipping messages)."""
+    return _resolve_session(sid, metadata_only=metadata_only)
+
+
+def get_session_profile_readonly(sid):
+    """Read ownership without repairing sidecars or publishing/promoting cache entries."""
+    if not is_safe_session_id(sid):
+        raise KeyError(sid)
+    with LOCK:
+        cached = SESSIONS.get(sid)
+        if cached is not None and str(getattr(cached, 'session_id', '') or '') == sid:
+            profile = getattr(cached, 'profile', None)
+            if profile is not None and not isinstance(profile, str):
+                raise ValueError('Invalid session profile')
+            return profile
+    path = SESSION_DIR / f'{sid}.json'
+    try:
+        prefix = _read_metadata_json_prefix(path)
+        data = json.loads(prefix) if prefix else None
+        # Legacy layouts may put profile after messages/scenes. Read the JSON
+        # directly: Session.load() can collapse partials and save a shrink backup.
+        if not isinstance(data, dict) or 'profile' not in data:
+            data = json.loads(path.read_bytes())
+    except FileNotFoundError:
+        raise KeyError(sid) from None
+    if not isinstance(data, dict) or data.get('session_id') != sid:
+        raise ValueError('Invalid session ownership metadata')
+    profile = data.get('profile')
+    if profile is not None and not isinstance(profile, str):
+        raise ValueError('Invalid session profile')
+    return profile
+
+
+_COMPRESSION_RECOVERY_PROFILE_UNSET = object()
+
+
+def _compression_recovery_child_matches(
+    session,
+    source_session_id: str,
+    action: str,
+    source_profile=_COMPRESSION_RECOVERY_PROFILE_UNSET,
+) -> bool:
+    if source_profile is not _COMPRESSION_RECOVERY_PROFILE_UNSET:
+        try:
+            from api.profiles import _profiles_match
+        except (ImportError, AttributeError):
+            logger.debug("Failed to profile-check compression recovery session", exc_info=True)
+            return False
+        if not _profiles_match(getattr(session, "profile", None), source_profile):
+            return False
+    return (
+        str(getattr(session, "compression_recovery_source_session_id", "") or "").strip() == source_session_id
+        and str(getattr(session, "compression_recovery_action", "") or "").strip() == action
+    )
+
+
+def find_compression_recovery_session(
+    source_session_id: str,
+    action: str,
+    source_profile=_COMPRESSION_RECOVERY_PROFILE_UNSET,
+):
+    """Return an existing focused recovery child for ``source_session_id``.
+
+    The recovery-start endpoint is a retryable UI action. A persisted marker on
+    the child session makes double-clicks, repeated calls, and cache reloads
+    converge on the same continuation instead of creating duplicate siblings.
+    """
+
+    source_sid = str(source_session_id or "").strip()
+    recovery_action = str(action or "").strip()
+    if not source_sid or not recovery_action:
+        return None
+
+    matches = []
+    seen_ids: set[str] = set()
+    try:
+        with LOCK:
+            memory_sessions = list(SESSIONS.values())
+        for session in memory_sessions:
+            sid = str(getattr(session, "session_id", "") or "").strip()
+            if sid:
+                seen_ids.add(sid)
+            if _compression_recovery_child_matches(session, source_sid, recovery_action, source_profile):
+                matches.append(session)
+    except Exception:
+        logger.debug("Failed to scan cached compression recovery sessions", exc_info=True)
+
+    try:
+        persisted_ids = _persisted_session_ids_snapshot()
+    except Exception:
+        persisted_ids = frozenset()
+    for sid in persisted_ids:
+        if sid in seen_ids:
+            continue
+        try:
+            meta = Session.load_metadata_only(sid)
+        except Exception:
+            logger.debug("Failed to inspect compression recovery session %s", sid, exc_info=True)
+            continue
+        if not meta or not _compression_recovery_child_matches(meta, source_sid, recovery_action, source_profile):
+            continue
+        try:
+            matches.append(get_session(sid))
+        except Exception:
+            matches.append(meta)
+
+    if not matches:
+        return None
+
+    def _sort_key(session):
+        try:
+            created_at = float(getattr(session, "created_at", 0) or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        try:
+            updated_at = float(getattr(session, "updated_at", 0) or 0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        return (created_at, updated_at, str(getattr(session, "session_id", "") or ""))
+
+    return sorted(matches, key=_sort_key)[0]
+
+
+def _profile_default_model_state(profile=None):
+    """Return the default model/provider configured for *profile*."""
+    default_model = ""
+    default_provider = None
+    try:
+        from api.profiles import get_hermes_home_for_profile
+        config_path = Path(get_hermes_home_for_profile(profile)) / "config.yaml"
+        config_data = _cfg._load_yaml_config_file(config_path)
+    except Exception:
+        config_data = {}
+
+    model_cfg = config_data.get("model", {}) if isinstance(config_data, dict) else {}
+    if isinstance(model_cfg, str):
+        default_model = model_cfg.strip()
+    elif isinstance(model_cfg, dict):
+        default_model = str(model_cfg.get("default") or "").strip()
+        default_provider = str(model_cfg.get("provider") or "").strip() or None
+
+    return default_model or get_effective_default_model(), default_provider
+
+
+def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None, enabled_toolsets=None):
+    """Create a new in-memory session.
+
+    The session lives in the SESSIONS dict only — no disk write happens until
+    the first message is appended (#1171 follow-up).  This avoids the
+    "ghost Untitled session on disk" pile-up that occurred when users clicked
+    New Conversation, reloaded the page, or completed onboarding without ever
+    sending a message.  Subsequent code paths that populate state immediately
+    (btw / background agent at api/routes.py) call ``s.save()`` themselves
+    after setting title/messages, and ``_handle_chat_start`` saves the
+    session as soon as the user actually sends a message — both are the
+    natural first-write moments for a real session.
+
+    Crash-safety: if the process exits between session creation and first
+    message, the session is lost.  Since it had no messages, there is
+    nothing to lose.  Worktree-backed sessions are the exception: they are
+    saved immediately because creating the session also creates real
+    filesystem state that must remain discoverable after restart.
+
+    *profile* — when supplied by the caller (e.g. from the request body sent
+    by the active browser tab), it is used directly so that concurrent clients
+    on different profiles don't fight over a shared process-global.  If not
+    supplied, we fall back to the process-level active profile (the pre-#798
+    behaviour, preserved for calls that originate outside a request context).
+    """
+    if profile is None:
+        # Fallback: read process-level global (single-client or startup path)
+        try:
+            from api.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+        except ImportError:
+            profile = None
+    if model:
+        effective_model = model
+        effective_model_provider = model_provider
+    else:
+        effective_model, effective_model_provider = _profile_default_model_state(profile)
+        if model_provider:
+            effective_model_provider = model_provider
+
+    wt = worktree_info if isinstance(worktree_info, dict) else None
+    workspace_path = (wt.get('path') if wt and wt.get('path') else workspace) if wt else workspace
+    s = Session(
+        workspace=workspace_path or get_last_workspace(profile=profile),
+        model=effective_model,
+        model_provider=effective_model_provider,
+        profile=profile,
+        project_id=project_id,
+        personality=None,
+        worktree_path=wt.get('path') if wt else None,
+        worktree_branch=wt.get('branch') if wt else None,
+        worktree_repo_root=wt.get('repo_root') if wt else None,
+        worktree_created_at=wt.get('created_at') if wt else None,
+        enabled_toolsets=enabled_toolsets,
+    )
+    # #4985: defensive — auto-generated uuids don't collide with the
+    # tombstone, but if a future caller ever passes an explicit id that
+    # was previously pruned, clear the entry so the new session isn't
+    # shadowed on the next poll. Wrapped because a tombstone failure
+    # must never block new-session creation.
+    try:
+        _clear_webui_zero_message_orphan_tombstone(s.session_id)
+        _clear_webui_deleted_session_tombstone(s.session_id)
+    except Exception:
+        logger.debug(
+            "Failed to clear webui tombstone for %s",
+            s.session_id,
+            exc_info=True,
+        )
+    with LOCK:
+        SESSIONS[s.session_id] = s
+        SESSIONS.move_to_end(s.session_id)
+        _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+    if wt:
+        s.save()
+    return s
+
+def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False, show_webhook: bool = False, show_kanban: bool = False) -> bool:
+    """Return True for internal/background sessions hidden from the default list."""
+    sid = str(session.get('session_id') or '')
+    source = (
+        session.get('source_tag')
+        or session.get('source')
+        or session.get('raw_source')
+        or session.get('session_source')
+    )
+    if not show_cron and (source == 'cron' or sid.startswith('cron_')):
+        return True
+    if not show_webhook and source == 'webhook':
+        return True
+    if not show_kanban and source == 'kanban':
+        return True
+    if bool(session.get('pre_compression_snapshot')):
+        return not bool(session.get('_show_pre_compression_snapshot'))
+    return False
+
+
+def _sidebar_message_count(session: dict) -> int:
+    for key in ('message_count', 'actual_message_count'):
+        try:
+            value = int(session.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def _sidebar_lineage_root_id(session: dict, sessions_by_id: dict[str, dict]) -> str:
+    sid = str(session.get('session_id') or '')
+    explicit = str(session.get('_lineage_root_id') or '').strip()
+    if explicit:
+        return explicit
+    relationship_type = str(session.get('relationship_type') or '').strip().lower()
+    if relationship_type == 'child_session':
+        return sid
+    root = sid
+    parent = session.get('parent_session_id')
+    source = str(session.get('session_source') or '').strip().lower()
+    seen = {sid}
+    if source == 'fork':
+        return root
+    while parent and parent not in seen and parent in sessions_by_id:
+        root = str(parent)
+        seen.add(root)
+        parent = sessions_by_id.get(root, {}).get('parent_session_id')
+    return root
+
+
+def _has_live_sidebar_state(session: dict) -> bool:
+    return bool(
+        session.get('active_stream_id')
+        or session.get('has_pending_user_message')
+        or session.get('pending_user_message')
+    )
+
+
+def _is_intentionally_background_sidebar_session(session: dict) -> bool:
+    sid = str(session.get('session_id') or '')
+    source = (
+        session.get('source_tag')
+        or session.get('source')
+        or session.get('raw_source')
+        or session.get('session_source')
+    )
+    return source in {'cron', 'webhook', 'kanban'} or sid.startswith('cron_')
+
+
+def _include_project_hidden_background_sidebar_sessions(
+    candidates: list[dict],
+    visible: list[dict],
+) -> list[dict]:
+    """Keep project-assigned background sessions addressable by project chips.
+
+    Cron and webhook sessions stay hidden from the default sidebar, but if they
+    have a project assignment they must still be present in the client cache so
+    their dedicated project chips can reveal them (#3019).
+    """
+    visible_ids = {
+        str(session.get('session_id'))
+        for session in visible
+        if session.get('session_id')
+    }
+    out = list(visible)
+    for session in candidates:
+        sid = str(session.get('session_id') or '')
+        if not sid or sid in visible_ids:
+            continue
+        if not _is_intentionally_background_sidebar_session(session):
+            continue
+        if not session.get('project_id'):
+            continue
+        if _sidebar_message_count(session) <= 0:
+            continue
+        row = dict(session)
+        row['default_hidden'] = True
+        out.append(row)
+    return out
+
+
+def _preserve_messageful_sidebar_discoverability(
+    candidates: list[dict],
+    visible: list[dict],
+) -> list[dict]:
+    """Keep at least one messageful row per non-background conversation visible.
+
+    The normal sidebar filters intentionally hide empty drafts, cron/background
+    rows, and duplicate pre-compression snapshots. They must not make the only
+    messageful representative of a conversation disappear. If every visible row
+    for a lineage was filtered out, rescue the best hidden messageful row and
+    mark it so callers can surface or audit the degraded state.
+    """
+    sessions_by_id = {
+        str(session.get('session_id')): session
+        for session in candidates
+        if session.get('session_id')
+    }
+    covered_roots = {
+        _sidebar_lineage_root_id(session, sessions_by_id)
+        for session in visible
+        if _sidebar_message_count(session) > 0
+    }
+    visible_ids = {
+        str(session.get('session_id'))
+        for session in visible
+        if session.get('session_id')
+    }
+    rescue_by_root: dict[str, dict] = {}
+    for session in candidates:
+        sid = str(session.get('session_id') or '')
+        if not sid or sid in visible_ids:
+            continue
+        if _sidebar_message_count(session) <= 0:
+            continue
+        if _is_intentionally_background_sidebar_session(session):
+            continue
+        root = _sidebar_lineage_root_id(session, sessions_by_id)
+        if root in covered_roots:
+            continue
+        current = rescue_by_root.get(root)
+        if current is None or (
+            _sidebar_message_count(session), _session_sort_timestamp(session)
+        ) > (
+            _sidebar_message_count(current), _session_sort_timestamp(current)
+        ):
+            rescued = dict(session)
+            rescued['discoverability_warning'] = 'rescued_messageful_hidden_session'
+            rescue_by_root[root] = rescued
+    if not rescue_by_root:
+        return visible
+    rescued_rows = sorted(
+        rescue_by_root.values(),
+        key=lambda session: (session.get('pinned', False), _session_sort_timestamp(session)),
+        reverse=True,
+    )
+    return visible + rescued_rows
+
+
+def _prefer_fuller_snapshots_for_sidebar(sessions: list[dict]) -> list[dict]:
+    """Expose a hidden snapshot when it is the fuller transcript for a lineage.
+
+    Pre-compression snapshots are normally hidden so archived compression
+    segments do not duplicate the current continuation in the sidebar. If a
+    snapshot row has more messages than the visible continuation for the same
+    lineage, hiding it makes the conversation look truncated. In that case,
+    show the fuller snapshot and suppress the shorter inactive continuation.
+    """
+    sessions_by_id = {
+        str(session.get('session_id')): session
+        for session in sessions
+        if session.get('session_id')
+    }
+    groups: dict[str, list[dict]] = {}
+    for session in sessions:
+        sid = str(session.get('session_id') or '')
+        source = session.get('source_tag') or session.get('source')
+        if source == 'cron' or sid.startswith('cron_'):
+            continue
+        root = _sidebar_lineage_root_id(session, sessions_by_id)
+        groups.setdefault(root, []).append(session)
+
+    snapshot_ids_to_show: set[str] = set()
+    continuation_ids_to_hide: set[str] = set()
+    for group in groups.values():
+        visible = [session for session in group if not session.get('pre_compression_snapshot')]
+        snapshots = [session for session in group if session.get('pre_compression_snapshot')]
+        if not visible or not snapshots:
+            continue
+        if any(_has_live_sidebar_state(session) for session in visible):
+            continue
+
+        best_visible_count = max(_sidebar_message_count(session) for session in visible)
+        best_snapshot = max(
+            snapshots,
+            key=lambda session: (_sidebar_message_count(session), _session_sort_timestamp(session)),
+        )
+        if _sidebar_message_count(best_snapshot) <= best_visible_count:
+            continue
+
+        newest_visible_ts = max(_session_sort_timestamp(session) for session in visible)
+        snapshot_ts = _session_sort_timestamp(best_snapshot)
+        snapshot_id = str(best_snapshot.get('session_id') or '')
+        if not snapshot_id:
+            continue
+
+        snapshot_ids_to_show.add(snapshot_id)
+        # If the continuation is newer, keep it visible too. That means the
+        # lineage is split-brain-ish: the snapshot has more transcript rows, but
+        # the continuation may still contain the newest post-compression turn.
+        # Showing both is less tidy than hiding one, but it preserves every
+        # reachable message. Tidy and wrong is how users start doubting reality.
+        if newest_visible_ts > snapshot_ts:
+            continue
+
+        messageful_visible = [
+            session for session in visible
+            if _sidebar_message_count(session) > 0
+        ]
+        if len(messageful_visible) > 1:
+            continue
+
+        continuation_ids_to_hide.update(
+            str(session.get('session_id'))
+            for session in visible
+            if session.get('session_id')
+        )
+
+    if not snapshot_ids_to_show and not continuation_ids_to_hide:
+        return sessions
+
+    out = []
+    for session in sessions:
+        sid = str(session.get('session_id') or '')
+        if sid in continuation_ids_to_hide:
+            continue
+        if sid in snapshot_ids_to_show:
+            session = dict(session)
+            session['_show_pre_compression_snapshot'] = True
+        out.append(session)
+    return out
+
+
+def _strip_sidebar_internal_flags(sessions: list[dict]) -> None:
+    for session in sessions:
+        session.pop('_show_pre_compression_snapshot', None)
+
+
+def _looks_like_stale_zero_message_row(session: dict) -> bool:
+    """Return True for indexed rows that likely need sidecar metadata repair."""
+    return bool(
+        int(session.get('message_count') or 0) == 0
+        and int(session.get('user_message_count') or 0) > 0
+    )
+
+
+def _row_may_need_sidecar_metadata_refresh(
+    session: dict,
+    *,
+    stale_snapshot_ids: set[str] | None = None,
+) -> bool:
+    """Return True when a row needs canonical sidecar runtime/snapshot metadata.
+
+    Compression lineage fields are enriched from state.db in one batched query
+    later in all_sessions(). Loading hundreds of lineage sidecars on every
+    /api/sessions poll turns the sidebar into molasses, so keep this refresh
+    limited to rows with transient runtime state, missing snapshot sidebar
+    metadata, or a stale snapshot candidate that can affect the visibility
+    decision for its lineage.
+    """
+    is_runtime_row = bool(
+        session.get('active_stream_id')
+        or session.get('has_pending_user_message')
+        or session.get('pending_user_message')
+    )
+    if is_runtime_row:
+        return True
+    sid = str(session.get('session_id') or '')
+    if not session.get('pre_compression_snapshot'):
+        # Refresh a stale-indexed COMPRESSION CONTINUATION row from its sidecar.
+        # Gate tightly: a plain /branch fork also carries parent_session_id
+        # (#1342) but has no compression sidecar drift to correct, and its file
+        # mtime routinely exceeds the indexed logical last_message_at — so
+        # including forks here would call load_metadata_only() on every fork row
+        # on every /api/sessions poll (the molasses #3770 guards against, per the
+        # #3789 release gate). Exclude session_source == 'fork'
+        # (the marker /api/session/branch stamps; see _is_continuation_session)
+        # so only true continuations are eligible.
+        if str(session.get('session_source') or '').strip().lower() == 'fork':
+            return False
+        if session.get('message_count') is None or session.get('last_message_at') is None:
+            return True
+        # Lineage fields are enriched from state.db in a batched pass later in
+        # all_sessions(). A complete indexed lineage row must not be reloaded
+        # from its sidecar merely because the filesystem mtime is newer than the
+        # logical message timestamp; that pattern is common after compression
+        # and turns each /api/sessions poll into hundreds of JSON prefix scans.
+        # Keep the mtime repair path only for rows whose counters are known bad
+        # or incomplete enough that the index cannot be trusted.
+        lineage_shaped = bool(
+            session.get('parent_session_id')
+            or session.get('_lineage_root_id')
+            or session.get('_compression_segment_count')
+        )
+        needs_mtime_check = bool(
+            sid
+            and (
+                _looks_like_stale_zero_message_row(session)
+                or (lineage_shaped and session.get('user_message_count') is None)
+            )
+        )
+        if needs_mtime_check and _sidecar_mtime_after_index_timestamp(session):
+            return True
+        return False
+    if (
+        sid
+        and _looks_like_stale_zero_message_row(session)
+        and str(session.get('session_source') or '').strip().lower() != 'fork'
+        and _sidecar_mtime_after_index_timestamp(session)
+    ):
+        return True
+    if session.get('message_count') is None or session.get('last_message_at') is None:
+        return True
+    return bool(sid and stale_snapshot_ids and sid in stale_snapshot_ids)
+
+
+def _sidecar_mtime_after_index_timestamp(session: dict) -> bool:
+    sid = str(session.get('session_id') or '')
+    if not sid or not is_safe_session_id(sid):
+        return False
+    try:
+        sidecar_mtime = (SESSION_DIR / f'{sid}.json').stat().st_mtime
+    except OSError:
+        return False
+    indexed_ts = _session_sort_timestamp(session)
+    return sidecar_mtime > indexed_ts + 0.001
+
+
+def _stale_snapshot_metadata_refresh_ids(sessions: list[dict]) -> set[str]:
+    """Return pre-compression snapshots worth a sidecar metadata refresh.
+
+    Most snapshot rows can be decided from the index: either their indexed count
+    already beats the visible continuation, or they are normal older snapshots
+    that should remain hidden. Only stat candidate sidecars when a hidden
+    snapshot has a visible continuation in the same lineage and its indexed
+    metadata would otherwise fail to expose it.
+    """
+    sessions_by_id = {
+        str(session.get('session_id')): session
+        for session in sessions
+        if session.get('session_id')
+    }
+    groups: dict[str, list[dict]] = {}
+    for session in sessions:
+        sid = str(session.get('session_id') or '')
+        source = session.get('source_tag') or session.get('source')
+        if source == 'cron' or sid.startswith('cron_'):
+            continue
+        root = _sidebar_lineage_root_id(session, sessions_by_id)
+        groups.setdefault(root, []).append(session)
+
+    refresh_ids: set[str] = set()
+    for group in groups.values():
+        visible = [session for session in group if not session.get('pre_compression_snapshot')]
+        snapshots = [session for session in group if session.get('pre_compression_snapshot')]
+        if not visible or not snapshots:
+            continue
+        if any(_has_live_sidebar_state(session) for session in visible):
+            continue
+        best_visible_count = max(_sidebar_message_count(session) for session in visible)
+        for snapshot in snapshots:
+            sid = str(snapshot.get('session_id') or '')
+            if not sid:
+                continue
+            if _sidebar_message_count(snapshot) > best_visible_count:
+                continue
+            # Modern index rows already carry enough sidebar summary data to
+            # decide snapshot visibility. Only legacy/incomplete rows need the
+            # sidecar mtime rescue; otherwise every historical snapshot whose
+            # file mtime is newer than its logical timestamp is re-read on every
+            # sidebar poll. Treat stale-zero-message rows as incomplete even
+            # when user_message_count/last_message_at are present; their sidecar
+            # may hold the real count that makes the snapshot visible.
+            if (
+                snapshot.get('user_message_count') is not None
+                and int(snapshot.get('message_count') or 0) > 0
+                and snapshot.get('last_message_at') is not None
+            ):
+                continue
+            if _sidecar_mtime_after_index_timestamp(snapshot):
+                refresh_ids.add(sid)
+    return refresh_ids
+
+
+def _refresh_index_rows_from_sidecar_metadata(
+    sessions: list[dict],
+    *,
+    index_message_counts: dict[str, int] | None = None,
+) -> list[dict]:
+    """Overlay fuller sidecar metadata onto stale sidebar index rows.
+
+    ``_index.json`` is a cache and can lag behind the canonical session sidecar
+    during compression/continuation writes. Keep this read-only and limited to
+    lineage/runtime-shaped rows so ordinary sidebar refreshes do not scan every
+    historical transcript.
+    """
+    out: list[dict] = []
+    stale_snapshot_ids = _stale_snapshot_metadata_refresh_ids(sessions)
+    for session in sessions:
+        if not _row_may_need_sidecar_metadata_refresh(
+            session,
+            stale_snapshot_ids=stale_snapshot_ids,
+        ):
+            out.append(session)
+            continue
+        sid = session.get('session_id')
+        if not sid:
+            out.append(session)
+            continue
+        sidecar = Session.load_metadata_only(
+            sid,
+            index_message_counts=index_message_counts,
+        )
+        if not sidecar:
+            out.append(session)
+            continue
+        compact = sidecar.compact(include_runtime=True)
+        refreshed = dict(session)
+        for key in (
+            'message_count', 'updated_at', 'last_message_at', 'title', 'workspace',
+            'model', 'model_provider', 'created_at', 'pinned', 'archived', 'project_id',
+            'profile', 'pre_compression_snapshot', 'parent_session_id', 'source_tag',
+            'raw_source', 'session_source', 'source_label', 'active_stream_id',
+            'has_pending_user_message', 'pending_user_message', 'pending_started_at',
+            'visible_message_count',
+        ):
+            value = compact.get(key)
+            if value is not None:
+                refreshed[key] = value
+        try:
+            refreshed['message_count'] = max(
+                int(session.get('message_count') or 0),
+                int(compact.get('message_count') or 0),
+            )
+        except (TypeError, ValueError):
+            pass
+        if _session_sort_timestamp(compact) > _session_sort_timestamp(session):
+            refreshed['updated_at'] = compact.get('updated_at', refreshed.get('updated_at'))
+            refreshed['last_message_at'] = compact.get('last_message_at', refreshed.get('last_message_at'))
+        out.append(refreshed)
+    return out
+
+
+def _strict_active_state_db_path() -> Path | None:
+    """Return the active profile's state.db, or None when it cannot resolve.
+
+    Unlike _active_state_db_path() this never degrades to HERMES_HOME: a caller
+    that would act destructively on a missing row must not read the wrong
+    database while the real profile is merely unresolved.
+    """
+    try:
+        from api.profiles import get_active_hermes_home
+        hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
+    except Exception:
+        return None
+    return hermes_home / 'state.db'
+
+
+def state_db_session_presence(sid):
+    """True/False when the active state.db can answer for *sid*, None if it cannot.
+
+    ``delete_cli_session`` returns False both for an aborted transaction and for
+    a commit whose transcript cleanup is still pending (the cleanup manifest
+    keeps retrying it). Callers deciding whether user files are still safe to
+    remove need the difference: only a missing row proves the delete already
+    committed, and a missing or unreadable database proves nothing at all.
+    """
+    if not sid:
+        return False
+    db_path = _strict_active_state_db_path()
+    if db_path is None or not db_path.exists():
+        return None
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (str(sid),))
+            return cur.fetchone() is not None
+    except Exception:
+        return None
+
+
+def state_db_has_session(sid: str) -> bool:
+    """Return True when ``sid`` exists in the active state.db sessions table.
+
+    Used by file-manager handlers to fall back to a state.db lookup when
+    ``get_session`` raises ``KeyError`` because the session was created by
+    Telegram/CLI (external) rather than the WebUI (issue #3280). The state.db
+    schema stores only metadata (id/title/model/source/...), not a workspace
+    path — the workspace is shared across session storage backends and is
+    resolved separately via ``get_last_workspace()``.
+    """
+    return state_db_session_presence(sid) is True
+
+
+class _ExternalSessionView:
+    """Minimal session-shaped view for external (Telegram/CLI) sessions.
+
+    Only exposes the fields file-manager handlers need (``session_id`` and
+    ``workspace``). The workspace falls back to the WebUI's last-used
+    workspace because state.db does not persist a per-session workspace path
+    and the file browser is intentionally workspace-scoped, not
+    session-storage-scoped (issue #3280).
+    """
+
+    __slots__ = ("session_id", "workspace")
+
+    def __init__(self, session_id: str, workspace: str):
+        self.session_id = session_id
+        self.workspace = workspace
+
+
+class WorkspaceBindingPersistenceError(ValueError):
+    """A recovered workspace could not be durably bound to its WebUI session."""
+
+
+_EXPECTED_WORKSPACE_UNSET = object()
+
+
+def persist_recovered_workspace_binding(
+    session,
+    workspace: str | Path,
+    *,
+    expected_workspace=_EXPECTED_WORKSPACE_UNSET,
+):
+    """Atomically persist only a recovered session's workspace binding.
+
+    Existing sidecars are patched as raw JSON so metadata-only callers never
+    reserialize (or otherwise clobber) the transcript. Missing sidecars fail
+    closed so recovery cannot resurrect a concurrently deleted session. The
+    per-session mutation lock keeps compare-and-replace ordered with other
+    compliant session writers.
+    """
+    sid = str(getattr(session, "session_id", "") or "").strip()
+    if not sid or not is_safe_session_id(sid):
+        raise WorkspaceBindingPersistenceError(
+            "Failed to persist recovered workspace: invalid session id"
+        )
+    resolved = str(Path(workspace).expanduser().resolve())
+    expected_value = (
+        getattr(session, "workspace", "")
+        if expected_workspace is _EXPECTED_WORKSPACE_UNSET
+        else expected_workspace
+    )
+    expected = str(expected_value or "")
+    path = SESSION_DIR / f"{sid}.json"
+    lock = _get_session_agent_lock(sid)
+    with lock:
+        if not path.exists():
+            # Recovery only repairs an existing WebUI sidecar. Creating a new
+            # sidecar here can resurrect a session that was deleted after the
+            # recovery decision but before this lock was acquired.
+            raise WorkspaceBindingPersistenceError(
+                "Failed to persist recovered workspace: session sidecar is missing"
+            )
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise WorkspaceBindingPersistenceError(
+                "Failed to persist recovered workspace: unreadable session sidecar"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise WorkspaceBindingPersistenceError(
+                "Failed to persist recovered workspace: invalid session sidecar"
+            )
+        current = str(payload.get("workspace") or "")
+        if current != resolved:
+            if current != expected:
+                raise WorkspaceBindingPersistenceError(
+                    "Failed to persist recovered workspace: session workspace changed"
+                )
+            payload["workspace"] = resolved
+            tmp = path.with_suffix(
+                f".tmp.{os.getpid()}.{threading.current_thread().ident}"
+            )
+            try:
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                _replace_session_sidecar(tmp, path, sid)
+            except Exception as exc:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise WorkspaceBindingPersistenceError(
+                    "Failed to persist recovered workspace"
+                ) from exc
+
+        session.workspace = resolved
+        with LOCK:
+            cached = SESSIONS.get(sid)
+            if cached is not None:
+                cached.workspace = resolved
+        try:
+            _write_session_index(updates=[cached or session])
+        except Exception:
+            logger.debug(
+                "Failed to refresh session index after workspace recovery for %s",
+                sid,
+                exc_info=True,
+            )
+        return cached or session
+
+
+def get_session_for_file_ops(sid: str):
+    """Return a profile-authorized session-like object for file-manager handlers.
+
+    Tries ``get_session`` first (preserves all existing behavior for WebUI
+    sessions) and only returns that session when its stored profile belongs to
+    the active request profile.  If that lookup fails, checks state.db; when the
+    session exists there, returns an ``_ExternalSessionView`` whose ``workspace``
+    is the active WebUI workspace. If neither has the session, re-raises
+    ``KeyError`` so callers continue to return their existing 404.
+    """
+    try:
+        session = get_session(sid, metadata_only=True)
+    except KeyError:
+        if state_db_has_session(sid):
+            return _ExternalSessionView(str(sid), str(get_last_workspace()))
+        raise
+
+    from api.profiles import _profiles_match, get_active_profile_name
+
+    session_profile = getattr(session, 'profile', None)
+    active_profile = get_active_profile_name()
+    if not _profiles_match(session_profile, active_profile):
+        logger.debug(
+            "Rejected file-manager session for foreign profile: "
+            "session_id=%s session_profile=%r active_profile=%r",
+            sid,
+            session_profile,
+            active_profile,
+        )
+        raise KeyError(sid)
+    try:
+        from api.workspace import resolve_implicit_workspace_with_recovery
+
+        stored_workspace = getattr(session, "workspace", None)
+        workspace, recovered = resolve_implicit_workspace_with_recovery(
+            stored_workspace,
+            get_last_workspace,
+            profile=session_profile or None,
+        )
+    except ValueError:
+        # Preserve the existing file-handler behavior for non-missing trust or
+        # access errors. Recovery is deliberately limited to deleted paths.
+        return session
+    if recovered:
+        return persist_recovered_workspace_binding(
+            session,
+            workspace,
+            expected_workspace=stored_workspace,
+        )
+    return session
+
+
+def _active_state_db_path() -> Path:
+    """Return state.db for the active Hermes profile, degrading to HERMES_HOME."""
+    try:
+        from api.profiles import get_active_hermes_home
+        hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
+    except Exception:
+        hermes_home = Path(os.getenv('HERMES_HOME', str(HOME / '.hermes'))).expanduser().resolve()
+    return hermes_home / 'state.db'
+
+
+def _agent_state_db_path(*, profile=None) -> Path | None:
+    """Return agent ``state.db`` for *profile*, or ``None`` when unavailable."""
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / 'state.db'
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not db_path.exists():
+        return None
+    return db_path
+
+
+def agent_session_rows_existing(
+    session_ids: list[str] | set[str] | frozenset[str],
+    *,
+    profile=None,
+) -> frozenset[str]:
+    """Return session ids confirmed present in the agent ``sessions`` table.
+
+    Used by the sidebar orphan-prune path (#3238) to batch existence probes
+    instead of opening one SQLite connection per candidate row.
+
+    Degrades safely to ``frozenset(wanted)`` (assume all present) on any error,
+    when the DB is missing, or when the ``sessions`` table is absent — matching
+    ``agent_session_row_exists()`` so a transient failure never causes pruning.
+    """
+    wanted = {str(sid).strip() for sid in (session_ids or []) if str(sid or "").strip()}
+    if not wanted:
+        return frozenset()
+    try:
+        import sqlite3
+    except ImportError:
+        return frozenset(wanted)
+    db_path = _agent_state_db_path(profile=profile)
+    if db_path is None:
+        return frozenset(wanted)
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            cols = {str(row[1]) for row in cur.fetchall()}
+            if 'id' not in cols:
+                return frozenset(wanted)
+            existing: set[str] = set()
+            ids = list(wanted)
+            chunk_size = 500
+            for i in range(0, len(ids), chunk_size):
+                chunk = ids[i:i + chunk_size]
+                placeholders = ','.join('?' * len(chunk))
+                cur.execute(
+                    f"SELECT id FROM sessions WHERE id IN ({placeholders})",
+                    chunk,
+                )
+                existing.update(str(row[0]).strip() for row in cur.fetchall())
+            return frozenset(existing)
+    except Exception:
+        logger.debug(
+            "agent_session_rows_existing probe failed for %d ids",
+            len(wanted),
+            exc_info=True,
+        )
+        return frozenset(wanted)
+
+
+def agent_session_zero_message_sids(
+    session_ids: list[str] | set[str] | frozenset[str],
+    *,
+    profile=None,
+) -> frozenset[str]:
+    """Return session ids confirmed to have zero rows in the agent ``messages`` table.
+
+    Used by the sidebar orphan-prune path (#4985) to detect native-WebUI sessions
+    whose backing agent row exists but was never written to (boot-time ``+`` click,
+    profile switch that resets the active id, sidebar nav that opens a session then
+    closes the tab before the first message commits). Such rows linger in the
+    sidebar forever because the WebUI delete affordance is not exposed for them,
+    and the existing #3238/#4591 orphan prune explicitly excludes webui sources.
+
+    Mirrors ``agent_session_rows_existing``'s batched chunked probe, safe-degrade
+    contract (returns ``frozenset()`` on any error so a transient failure NEVER
+    causes a stale-prune data loss), and ``messages`` table absence handling.
+    """
+    wanted = {str(sid).strip() for sid in (session_ids or []) if str(sid or "").strip()}
+    if not wanted:
+        return frozenset()
+    try:
+        import sqlite3
+    except ImportError:
+        return frozenset()
+    db_path = _agent_state_db_path(profile=profile)
+    if db_path is None:
+        return frozenset()
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            sessions_cols = {str(row[1]) for row in cur.fetchall()}
+            if 'id' not in sessions_cols:
+                return frozenset()
+            cur.execute("PRAGMA table_info(messages)")
+            messages_cols = {str(row[1]) for row in cur.fetchall()}
+            if 'session_id' not in messages_cols:
+                return frozenset()
+            zero_message: set[str] = set()
+            ids = list(wanted)
+            chunk_size = 500
+            for i in range(0, len(ids), chunk_size):
+                chunk = ids[i:i + chunk_size]
+                placeholders = ','.join('?' * len(chunk))
+                cur.execute(
+                    f"SELECT s.id FROM sessions s "
+                    f"WHERE s.id IN ({placeholders}) "
+                    f"AND NOT EXISTS ("
+                    f"  SELECT 1 FROM messages m WHERE m.session_id = s.id"
+                    f")",
+                    chunk,
+                )
+                zero_message.update(str(row[0]).strip() for row in cur.fetchall())
+            return frozenset(zero_message)
+    except Exception:
+        logger.debug(
+            "agent_session_zero_message_sids probe failed for %d ids",
+            len(wanted),
+            exc_info=True,
+        )
+        return frozenset()
+
+
+def agent_session_row_exists(session_id: str, *, profile=None) -> bool:
+    """Return True if ``session_id`` still has a backing row in the agent state.db.
+
+    Used to detect orphaned imported-CLI sidecars (#3238): the WebUI sidebar
+    must NOT rely on the session's presence in ``get_cli_sessions()`` to decide
+    whether its backing CLI row still exists, because that helper caps at
+    ``CLI_VISIBLE_SESSION_LIMIT`` (20) rows — a still-existing session can fall
+    out of the recent window and look "deleted." This is an exact, uncapped
+    existence probe against the ``sessions`` table.
+
+    Degrades safely to ``True`` (assume present) on any error or when the DB is
+    unreadable, so a transient failure never causes a stale-pruning data loss.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    return sid in agent_session_rows_existing([sid], profile=profile)
+
+
+def _sidebar_title_is_generic_webui(title: str | None) -> bool:
+    text = ' '.join(str(title or '').split())
+    if text == 'Hermes WebUI':
+        return True
+    prefix = 'Hermes WebUI #'
+    return text.startswith(prefix) and text[len(prefix):].isdigit()
+
+
+def _read_state_db_sidebar_overrides(
+    db_path: Path,
+    session_ids: set[str],
+    count_session_ids: set[str] | None = None,
+) -> dict[str, dict]:
+    """Return cheap state.db source/title overrides for sidebar rows.
+
+    This intentionally does not chase lineage parents/children. It is used on
+    the /api/sessions hot path before CLI filtering so state.db can correct
+    stale JSON source flags without paying the full lineage-enrichment cost.
+
+    Two-tier cost split (#5132): the ``sessions``-table lookup (source/title/
+    message_count) is an indexed primary-key fetch and is run for ALL
+    ``session_ids`` — its result feeds the source classification that
+    ``/api/sessions`` filters on BEFORE the lazy lineage correction, so capping
+    it would silently drop rows (e.g. a stale ``cli`` JSON row whose state.db
+    source is ``webui``) from the default sidebar. The expensive part is the
+    ``messages`` aggregation (``COUNT(*)``/``MAX(timestamp)`` GROUP BY), which is
+    what blocked /api/sessions for 5-18s on power users; that scan is restricted
+    to ``count_session_ids`` (the top-N paint-priority rows). When
+    ``count_session_ids`` is None, both tiers cover the full set (caller opted
+    out of the cap).
+    """
+    wanted = {str(sid) for sid in (session_ids or set()) if sid}
+    if count_session_ids is None:
+        count_wanted = set(wanted)
+    else:
+        count_wanted = {str(sid) for sid in count_session_ids if sid} & wanted
+    if not wanted or not db_path.exists():
+        return {}
+    try:
+        import sqlite3
+    except ImportError:
+        return {}
+    ids = list(wanted)
+    chunk_size = 500
+    overrides: dict[str, dict] = {}
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            session_cols = {row[1] for row in cur.fetchall()}
+            if 'id' not in session_cols:
+                return {}
+            source_expr = 's.source' if 'source' in session_cols else 'NULL AS source'
+            session_source_expr = 's.session_source' if 'session_source' in session_cols else 'NULL AS session_source'
+            title_expr = 's.title' if 'title' in session_cols else 'NULL AS title'
+            message_count_expr = 's.message_count' if 'message_count' in session_cols else 'NULL AS message_count'
+
+            cur.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'messages'")
+            has_messages_table = cur.fetchone() is not None
+            messages_has_session_id = False
+            messages_has_timestamp = False
+            messages_has_title_fields = False
+            if has_messages_table:
+                cur.execute("PRAGMA table_info(messages)")
+                message_cols = {str(row[1]) for row in cur.fetchall()}
+                messages_has_session_id = 'session_id' in message_cols
+                messages_has_timestamp = 'timestamp' in message_cols
+                messages_has_title_fields = {'session_id', 'role', 'content', 'timestamp'}.issubset(message_cols)
+
+            delegated_title_ids: set[str] = set()
+            for i in range(0, len(ids), chunk_size):
+                chunk = ids[i:i + chunk_size]
+                placeholders = ','.join('?' * len(chunk))
+                cur.execute(
+                    f"""
+                    SELECT s.id, {source_expr}, {session_source_expr}, {title_expr}, {message_count_expr}
+                    FROM sessions s
+                    WHERE s.id IN ({placeholders})
+                    """,
+                    chunk,
+                )
+                for row in cur.fetchall():
+                    sid = str(row['id'])
+                    entry: dict[str, object] = {}
+                    state_title = str(row['title'] or '').strip()
+                    if state_title:
+                        entry['_state_db_title'] = state_title
+                    state_source = str(row['source'] or '').strip().lower()
+                    if (
+                        state_source == 'subagent'
+                        and sid in count_wanted
+                        and ' '.join(state_title.split()) == 'Subagent Session'
+                    ):
+                        delegated_title_ids.add(sid)
+                    if state_source:
+                        entry['_state_db_source'] = state_source
+                        source_meta = normalize_agent_session_source(state_source)
+                        entry['_state_db_source_tag'] = state_source
+                        entry['_state_db_raw_source'] = source_meta.get('raw_source')
+                        entry['_state_db_session_source'] = source_meta.get('session_source')
+                        entry['_state_db_source_label'] = source_meta.get('source_label')
+                    if row['message_count'] is not None:
+                        try:
+                            entry['_state_db_message_count'] = max(0, int(row['message_count'] or 0))
+                        except (TypeError, ValueError):
+                            pass
+                    if entry:
+                        overrides[sid] = entry
+                if has_messages_table and messages_has_session_id:
+                    count_chunk = [sid for sid in chunk if sid in count_wanted]
+                    if not count_chunk:
+                        continue
+                    count_placeholders = ','.join('?' * len(count_chunk))
+                    last_at_expr = "MAX(timestamp) AS last_message_at" if messages_has_timestamp else "NULL AS last_message_at"
+                    cur.execute(
+                        f"""
+                        SELECT session_id, COUNT(*) AS actual_message_count, {last_at_expr}
+                        FROM messages
+                        WHERE session_id IN ({count_placeholders})
+                        GROUP BY session_id
+                        """,
+                        count_chunk,
+                    )
+                    for row in cur.fetchall():
+                        sid = str(row['session_id'])
+                        entry = overrides.setdefault(sid, {})
+                        try:
+                            entry['_state_db_message_count'] = max(
+                                int(entry.get('_state_db_message_count') or 0),
+                                int(row['actual_message_count'] or 0),
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                        if row['last_message_at'] is not None:
+                            try:
+                                entry['_state_db_last_message_at'] = float(row['last_message_at'] or 0)
+                            except (TypeError, ValueError):
+                                pass
+            if messages_has_title_fields and delegated_title_ids:
+                seen_user_messages: set[str] = set()
+                delegated_title_ids = list(delegated_title_ids)
+                for i in range(0, len(delegated_title_ids), chunk_size):
+                    chunk = delegated_title_ids[i:i + chunk_size]
+                    placeholders = ','.join('?' * len(chunk))
+                    cur.execute(
+                        f"""
+                        SELECT session_id, role, content, timestamp
+                        FROM messages
+                        WHERE session_id IN ({placeholders}) AND role = 'user'
+                        ORDER BY session_id, timestamp ASC
+                        """,
+                        chunk,
+                    )
+                    for row in cur.fetchall():
+                        sid = str(row['session_id'])
+                        if sid in seen_user_messages:
+                            continue
+                        display_title = title_from([dict(row)], fallback='')
+                        if display_title:
+                            seen_user_messages.add(sid)
+                            overrides.setdefault(sid, {})['_state_db_display_title'] = display_title
+            return overrides
+    except Exception:
+        missing_source_ids = [
+            sid for sid in ids
+            if not overrides.get(sid, {}).get('_state_db_source')
+        ]
+        if not missing_source_ids:
+            return overrides
+        try:
+            with closing(open_state_db_readonly(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                for i in range(0, len(missing_source_ids), chunk_size):
+                    chunk = missing_source_ids[i:i + chunk_size]
+                    placeholders = ','.join('?' * len(chunk))
+                    cur.execute(
+                        f"SELECT id, source FROM sessions WHERE id IN ({placeholders})",
+                        chunk,
+                    )
+                    for row in cur.fetchall():
+                        sid = str(row['id'])
+                        state_source = str(row['source'] or '').strip().lower()
+                        if not state_source:
+                            continue
+                        entry = overrides.setdefault(sid, {})
+                        entry['_state_db_source'] = state_source
+                        source_meta = normalize_agent_session_source(state_source)
+                        entry['_state_db_source_tag'] = state_source
+                        entry['_state_db_raw_source'] = source_meta.get('raw_source')
+                        entry['_state_db_session_source'] = source_meta.get('session_source')
+                        entry['_state_db_source_label'] = source_meta.get('source_label')
+                return overrides
+        except Exception:
+            return overrides
+
+
+def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
+    """Apply state.db source/title overrides without full lineage enrichment.
+
+    Source classification (source/title) is corrected for ALL rows because it
+    feeds the CLI/WebUI sidebar filter that runs BEFORE the lazy lineage
+    correction — capping it would silently drop rows whose stale JSON source
+    disagrees with state.db (#5132 regression guard). Only the expensive
+    ``messages`` count/last-message aggregation is capped to the top-N most
+    recent (paint-priority) rows, which is what actually blocked /api/sessions
+    for 5-18s on power users reading state.db for 2400+ rows on every
+    concurrent poll (#5132). The cap is env-configurable and fails open; rows
+    beyond it keep their JSON message-count/last-message until the history panel
+    opens (lazily corrected, exactly as with the lineage cap #4638).
+    """
+    import os as _os
+    try:
+        _cap = int(_os.environ.get("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "300"))
+    except (TypeError, ValueError):
+        _cap = 300
+    all_ids = {str(s.get('session_id')) for s in sessions if s.get('session_id')}
+    if _cap > 0 and len(sessions) > _cap:
+        count_ids = {str(s.get('session_id')) for s in sessions[:_cap] if s.get('session_id')}
+    else:
+        count_ids = None  # cap disabled / under cap -> count every row too
+    try:
+        metadata = _read_state_db_sidebar_overrides(
+            _active_state_db_path(),
+            all_ids,
+            count_session_ids=count_ids,
+        )
+    except Exception:
+        return
+    _apply_sidebar_state_db_override_metadata(sessions, metadata)
+
+
+def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: dict[str, dict]) -> None:
+    for session in sessions:
+        sid = session.get('session_id')
+        if sid not in metadata:
+            continue
+        entry = dict(metadata[sid])
+        state_db_title = entry.pop('_state_db_title', None)
+        state_db_source = entry.pop('_state_db_source', None)
+        state_db_source_tag = entry.pop('_state_db_source_tag', None)
+        state_db_raw_source = entry.pop('_state_db_raw_source', None)
+        state_db_session_source = entry.pop('_state_db_session_source', None)
+        state_db_source_label = entry.pop('_state_db_source_label', None)
+        state_db_message_count = entry.pop('_state_db_message_count', None)
+        state_db_last_message_at = entry.pop('_state_db_last_message_at', None)
+        state_db_display_title = entry.pop('_state_db_display_title', None)
+        if state_db_source in ('webui', 'subagent'):
+            session['source_tag'] = state_db_source_tag
+            session['raw_source'] = state_db_raw_source
+            session['session_source'] = state_db_session_source
+            session['source_label'] = state_db_source_label
+            session['is_cli_session'] = False
+            if state_db_source == 'subagent':
+                session['read_only'] = True
+        # Overlay the real state.db message count for WebUI-owned rows AND for
+        # delegated subagent children (#5308). A subagent child
+        # (state_db_source == 'subagent') is backed by the delegate runner's
+        # state.db session, but its sidebar row is built from a stale sidecar
+        # that often reports message_count == 0. Without overlaying the true
+        # count, the front-end visibility predicate
+        # (_sidebarRowHasVisibleMessages) drops the row and the subagent
+        # session vanishes from the sidebar entirely (regression seam behind
+        # #5308, same state.db-blind-metadata root as the #5307 transcript
+        # recovery). The count overlay keeps the same conservative
+        # anti-resurrection guard used for WebUI rows. Source metadata is
+        # authoritative for WebUI rows and delegated subagent children;
+        # foreign CLI sources retain their existing flags.
+        if state_db_source in ('webui', 'subagent'):
+            try:
+                current_count = max(0, int(session.get('message_count') or 0))
+                state_count = max(0, int(state_db_message_count or 0))
+            except (TypeError, ValueError):
+                current_count = 0
+                state_count = 0
+            try:
+                current_last = max(
+                    float(session.get('last_message_at') or 0),
+                    float(session.get('updated_at') or 0),
+                )
+            except (TypeError, ValueError):
+                current_last = 0.0
+            try:
+                state_last = float(state_db_last_message_at or 0)
+            except (TypeError, ValueError):
+                state_last = 0.0
+            # ``current_last`` intentionally includes ``updated_at``: if a
+            # sidecar metadata-only write happened after the state.db append,
+            # keep the conservative anti-resurrection guard and wait for a
+            # newer settled state.db message before overlaying counts again.
+            if state_count > current_count and (state_last <= 0 or state_last > current_last):
+                try:
+                    existing_actual = max(0, int(session.get('actual_message_count') or 0))
+                except (TypeError, ValueError):
+                    existing_actual = 0
+                session['message_count'] = state_count
+                session['actual_message_count'] = max(state_count, existing_actual)
+                # #7882 re-gate should-fix 3 (greptile follow-up): the visible
+                # count must follow state.db growth, but a delegation wakeup
+                # turn adds a hidden user row the Agent core appends to
+                # state.db WITHOUT its provenance stamp (``_source`` rides
+                # only in the session's pending_user_* fields until settle).
+                # Crediting the whole raw delta as visible reported "4
+                # visible" for three provenance-stamped rows + one pending
+                # wakeup. The pending turn's source arrives on the row via
+                # compact() (pending_user_source, emitted only when set), so
+                # a pending HIDDEN turn credits zero visible rows for its
+                # user row; any other pending turn (webui/fork/unknown) keeps
+                # the monotone raw-delta bump. A settled wakeup re-walk on
+                # the next full save re-derives the exact value either way.
+                try:
+                    raw_visible = session.get('visible_message_count')
+                    old_visible = int(raw_visible) if raw_visible is not None else None
+                    current_visible = old_visible if (old_visible is not None and old_visible >= 0) else None
+                except (TypeError, ValueError):
+                    current_visible = None
+                if current_visible is not None:
+                    pending_source = str(
+                        session.get('pending_user_source') or ''
+                    ).strip().lower()
+                    # #7882 re-gate round-3 must-fix 2: derive the visible
+                    # total from the reconciled, provenance-stamped rows for
+                    # the owning profile instead of delta arithmetic. The
+                    # raw-delta bump cannot distinguish WHICH new state.db
+                    # row is hidden: in eager-save mode the sidecar already
+                    # contains AND excludes the hidden wakeup user row, so
+                    # subtracting the pending hidden row again when the
+                    # assistant reply lands undercounts (visible 3 where the
+                    # reconciled transcript has 4). The reconciled walk is
+                    # the same authority the full save uses; the raw delta
+                    # remains the fallback when rows can't be read.
+                    reconciled_visible = _reconciled_visible_count_for_sidebar(
+                        session.get('session_id')
+                    )
+                    if reconciled_visible is not None:
+                        session['visible_message_count'] = min(
+                            state_count, max(current_visible, reconciled_visible)
+                        )
+                    else:
+                        # The outer guard already ensures state_count > current_count.
+                        hidden_pending_delta = 1 if pending_source == 'delegation_wakeup' else 0
+                        session['visible_message_count'] = min(
+                            state_count,
+                            max(
+                                current_visible,
+                                current_visible
+                                + max(0, state_count - current_count - hidden_pending_delta),
+                            ),
+                        )
+                if state_last > 0:
+                    session['last_message_at'] = max(float(session.get('last_message_at') or 0), state_last)
+                    session['updated_at'] = max(float(session.get('updated_at') or 0), state_last)
+        title = session.get('title')
+        if (
+            state_db_title
+            and state_db_title != title
+            and _sidebar_title_is_generic_webui(title)
+        ):
+            session['_state_db_title'] = state_db_title
+            session['display_title'] = state_db_title
+        if (
+            state_db_display_title
+            and state_db_source == 'subagent'
+            and ' '.join(str(title or '').split()) == 'Subagent Session'
+        ):
+            session['display_title'] = state_db_display_title
+
+
+def _enrich_sidebar_lineage_metadata(sessions: list[dict]) -> None:
+    """Attach state.db compression lineage metadata used by sidebar collapse.
+
+    Cap the DB lookup to the top-N most recent sessions to bound wall-clock
+    on power users with thousands of sessions. The sidebar paints chronologically
+    newest first; older sessions almost never have visible lineage to collapse
+    (parents are themselves stale and rarely surface in the same render).
+    Lineage enrichment for those is loaded lazily when the user opens the
+    history panel. Issue #38914 / 2026-06-21 triage: /api/sessions was spending
+    4.9s on lineage_metadata across 2400+ rows.
+    """
+    # 2026-06-21: configurable via env to ease A/B and rollback without a redeploy.
+    import os as _os
+    try:
+        _cap = int(_os.environ.get("HERMES_WEBUI_LINEAGE_TOP_N", "300"))
+    except (TypeError, ValueError):
+        _cap = 300
+    if _cap > 0 and len(sessions) > _cap:
+        candidates = sessions[:_cap]
+    else:
+        candidates = sessions
+    try:
+        metadata = read_session_lineage_metadata(
+            _active_state_db_path(),
+            {str(s.get('session_id')) for s in candidates if s.get('session_id')},
+        )
+    except Exception:
+        return
+    _apply_sidebar_state_db_override_metadata(sessions, metadata)
+    for session in sessions:
+        sid = session.get('session_id')
+        if sid in metadata:
+            entry = dict(metadata[sid])
+            for key in (
+                '_state_db_title',
+                '_state_db_source',
+                '_state_db_source_tag',
+                '_state_db_raw_source',
+                '_state_db_session_source',
+                '_state_db_source_label',
+            ):
+                entry.pop(key, None)
+            # Importer rows carry parent_source (null = parent outside its window); keep it,
+            # since the sidebar reads it as "parent was imported".
+            if 'parent_source' in session:
+                entry.pop('parent_source', None)
+            session.update(entry)
+
+
+def _diag_stage(diag, name: str) -> None:
+    if diag is not None:
+        try:
+            diag.stage(name)
+        except Exception:
+            pass
+
+
+def all_sessions(
+    diag=None,
+    *,
+    include_lineage_metadata: bool = True,
+    sidebar_metadata_only: bool = False,
+):
+    _diag_stage(diag, "all_sessions.active_streams")
+    active_stream_ids = _active_stream_ids()
+    # Phase C: try index first for O(1) read; fall back to full scan
+    _diag_stage(diag, "all_sessions.index_exists")
+    if not SESSION_INDEX_FILE.exists():
+        _diag_stage(diag, "all_sessions.start_index_rebuild")
+        _start_session_index_rebuild_thread()
+    if SESSION_INDEX_FILE.exists():
+        try:
+            _diag_stage(diag, "all_sessions.read_index")
+            index = json.loads(SESSION_INDEX_FILE.read_bytes())
+            _diag_stage(diag, "all_sessions.prune_index")
+            with LOCK:
+                in_memory_ids = set(SESSIONS.keys())
+            persisted_ids = _persisted_session_ids_snapshot()
+            if not index and _session_dir_has_persisted_session_files():
+                raise ValueError("empty session index while session files exist")
+            index = [
+                s for s in index
+                if (
+                    str(s.get('session_id') or '') in in_memory_ids
+                    or (
+                        persisted_ids is not None
+                        and str(s.get('session_id') or '') in persisted_ids
+                    )
+                    or (
+                        persisted_ids is None
+                        and _index_entry_exists(s.get('session_id'), in_memory_ids=in_memory_ids)
+                    )
+                )
+            ]
+            if not index and _session_dir_has_persisted_session_files():
+                raise ValueError("session index has no live rows while session files exist")
+            backfilled = []
+            for i, s in enumerate(index):
+                if 'last_message_at' not in s:
+                    _diag_stage(diag, "all_sessions.backfill_load")
+                    full = Session.load(s.get('session_id'))
+                    if full:
+                        index[i] = full.compact(sidebar_metadata_only=sidebar_metadata_only)
+                        backfilled.append(full)
+            if backfilled:
+                try:
+                    _diag_stage(diag, "all_sessions.backfill_write")
+                    _write_session_index(updates=backfilled)
+                except Exception:
+                    logger.debug("Failed to persist last_message_at backfill")
+            _diag_stage(diag, "all_sessions.mark_streaming")
+            for s in index:
+                s['is_streaming'] = _is_streaming_session(
+                    s.get('active_stream_id'),
+                    active_stream_ids,
+                )
+            # Overlay any in-memory sessions that may be newer than the index
+            _diag_stage(diag, "all_sessions.overlay_lock")
+            index_map = {s['session_id']: s for s in index}
+            with LOCK:
+                for s in SESSIONS.values():
+                    index_map[s.session_id] = s.compact(
+                        include_runtime=True,
+                        active_stream_ids=active_stream_ids,
+                        sidebar_metadata_only=sidebar_metadata_only,
+                    )
+            missing_persisted_ids = []
+            if persisted_ids is not None:
+                indexed_ids = {str(sid) for sid in index_map.keys() if sid}
+                missing_persisted_ids = sorted(
+                    str(sid) for sid in persisted_ids
+                    if sid and str(sid) not in indexed_ids
+                )
+            # #4985: the tombstone is intentionally NOT a blind-drop filter
+            # on missing_persisted_ids. A tombstoned sid whose sidecar is
+            # still on disk is recovered into the index here so the
+            # post-recovery prune helper (``_prune_orphaned_webui_zero_message_sessions``
+            # below) gets a chance to self-heal: if the row's state.db.messages
+            # is still empty the helper leaves the tombstone in place (no
+            # redundant re-prune); if state.db.messages now has rows the
+            # helper clears the tombstone and the row stays visible. A
+            # blind-drop here would be strictly worse than the orphan it
+            # suppresses — it would silently swallow a legitimately-resurfaced
+            # row forever, even after the user actually sent messages.
+            recovered_sidecars = []
+            if missing_persisted_ids:
+                _diag_stage(diag, "all_sessions.recover_missing_index_sidecars")
+                for sid in missing_persisted_ids:
+                    try:
+                        sidecar = Session.load_metadata_only(sid)
+                    except Exception:
+                        sidecar = None
+                    if not sidecar:
+                        continue
+                    index_map[sidecar.session_id] = sidecar.compact(
+                        include_runtime=True,
+                        active_stream_ids=active_stream_ids,
+                        sidebar_metadata_only=sidebar_metadata_only,
+                    )
+                    recovered_sidecars.append(sidecar)
+                if recovered_sidecars:
+                    try:
+                        _diag_stage(diag, "all_sessions.recover_missing_index_write")
+                        _write_session_index(updates=recovered_sidecars)
+                    except Exception:
+                        logger.debug("Failed to persist recovered sidebar index rows")
+            _diag_stage(diag, "all_sessions.refresh_sidecar_metadata")
+            index_message_counts = _index_message_count_map(index)
+            refreshed_index_rows = _refresh_index_rows_from_sidecar_metadata(
+                list(index_map.values()),
+                index_message_counts=index_message_counts,
+            )
+            index_map = {
+                row['session_id']: row
+                for row in refreshed_index_rows
+                if row.get('session_id')
+            }
+            _diag_stage(diag, "all_sessions.sort_filter")
+            result = sorted(index_map.values(), key=lambda s: (s.get('pinned', False), _session_sort_timestamp(s)), reverse=True)
+            # Hide empty Untitled sessions from the UI entirely — they are ephemeral
+            # scratch pads that only become real once the first message is sent (#1171).
+            # No grace window: a 0-message Untitled session is never shown in the list
+            # regardless of age. This means page refreshes and accidental New Conversation
+            # clicks never leave orphan entries in the sidebar.
+            #
+            # Exception: sessions with active_stream_id set are actively streaming (#1327).
+            # #1184 deferred the first save() until the first message, so during the
+            # initial streaming turn the session still looks like Untitled+0-messages.
+            # Without this exemption, navigating away during a long first turn causes
+            # the session to vanish from the sidebar.
+            result = [s for s in result if not (
+                s.get('title', 'Untitled') == 'Untitled'
+                and s.get('message_count', 0) == 0
+                and not s.get('active_stream_id')
+                and not s.get('has_pending_user_message')
+                and not s.get('worktree_path')
+            )]
+            if include_lineage_metadata:
+                _diag_stage(diag, "all_sessions.lineage_metadata")
+                _enrich_sidebar_lineage_metadata(result)
+            else:
+                _diag_stage(diag, "all_sessions.state_db_overrides")
+                _apply_sidebar_state_db_overrides(result)
+                _diag_stage(diag, "all_sessions.lineage_metadata_skipped")
+            result = _prefer_fuller_snapshots_for_sidebar(result)
+            sidebar_candidates = result
+            visible_result = [s for s in sidebar_candidates if not _hide_from_default_sidebar(s)]
+            result = _preserve_messageful_sidebar_discoverability(sidebar_candidates, visible_result)
+            result = _include_project_hidden_background_sidebar_sessions(sidebar_candidates, result)
+            _strip_sidebar_internal_flags(result)
+            # Backfill: sessions created before Sprint 22 have no profile tag.
+            # Attribute them to 'default' so the client profile filter works correctly.
+            for s in result:
+                if not s.get('profile'):
+                    s['profile'] = 'default'
+            if sidebar_metadata_only:
+                for s in result:
+                    _strip_sidebar_heavy_metadata(s)
+            return result
+        except Exception:
+            logger.debug("Failed to load session index, falling back to full scan")
+    # Full scan fallback
+    _diag_stage(diag, "all_sessions.full_scan")
+    out = []
+    # #4985: the tombstone is intentionally NOT a blind-drop filter on the
+    # full-scan fallback either. A tombstoned sid whose sidecar is still
+    # on disk must be loaded here so the post-recovery prune helper
+    # (``_prune_orphaned_webui_zero_message_sessions`` in api/routes) gets a
+    # chance to self-heal: if state.db.messages is still empty the helper
+    # leaves the tombstone in place; if state.db.messages now has rows the
+    # helper clears the tombstone and the row stays visible. A blind-drop
+    # here would be strictly worse than the orphan it suppresses — silently
+    # swallowing a legitimately-resurfaced row forever.
+    for p in SESSION_DIR.glob('*.json'):
+        if p.name.startswith('_'): continue
+        try:
+            s = Session.load(p.stem)
+            if s: out.append(s)
+        except Exception:
+            logger.debug("Failed to load session from %s", p)
+    _diag_stage(diag, "all_sessions.full_scan_overlay")
+    for s in SESSIONS.values():
+        if all(s.session_id != x.session_id for x in out): out.append(s)
+    _diag_stage(diag, "all_sessions.full_scan_sort_filter")
+    out.sort(key=lambda s: (getattr(s, 'pinned', False), _session_sort_timestamp(s)), reverse=True)
+    # Hide empty Untitled sessions from the UI entirely — kept consistent with the
+    # index-path filter above. No grace window: a 0-message Untitled session is
+    # never shown regardless of age (#1171).  Same streaming exemption as above (#1327).
+    result = [s.compact(
+        include_runtime=True,
+        active_stream_ids=active_stream_ids,
+        sidebar_metadata_only=sidebar_metadata_only,
+    ) for s in out if not (
+        s.title == 'Untitled'
+        and len(s.messages) == 0
+        and not s.active_stream_id
+        and not s.pending_user_message
+        and not getattr(s, 'worktree_path', None)
+    )]  # fmt: skip
+    if include_lineage_metadata:
+        _diag_stage(diag, "all_sessions.lineage_metadata")
+        _enrich_sidebar_lineage_metadata(result)
+    else:
+        _diag_stage(diag, "all_sessions.state_db_overrides")
+        _apply_sidebar_state_db_overrides(result)
+        _diag_stage(diag, "all_sessions.lineage_metadata_skipped")
+    result = _prefer_fuller_snapshots_for_sidebar(result)
+    sidebar_candidates = result
+    visible_result = [s for s in sidebar_candidates if not _hide_from_default_sidebar(s)]
+    result = _preserve_messageful_sidebar_discoverability(sidebar_candidates, visible_result)
+    result = _include_project_hidden_background_sidebar_sessions(sidebar_candidates, result)
+    _strip_sidebar_internal_flags(result)
+    for s in result:
+        if not s.get('profile'):
+            s['profile'] = 'default'
+    if sidebar_metadata_only:
+        for s in result:
+            _strip_sidebar_heavy_metadata(s)
+    return result
+
+
+def _strip_attached_files_marker(text: str) -> str:
+    return re.sub(r"\n\n\[Attached files: [^\]]+\]$", "", str(text or "")).strip()
+
+
+def title_from(messages, fallback: str='Untitled'):
+    """Derive a session title from the first user message."""
+    for m in messages:
+        if not isinstance(m, dict) or m.get('role') != 'user':
+            continue
+        # Hidden internal rows (delegation_wakeup) never name a session — the
+        # title would be the internal handoff prompt instead of the human's
+        # first real message (#quiet-delegation gate review).
+        if is_hidden_transcript_row(m):
+            continue
+        c = m.get('content', '')
+        if c is None:
+            continue
+        if isinstance(c, list):
+            c = ' '.join(p.get('text', '') for p in c if isinstance(p, dict) and p.get('type') == 'text')
+        text = _strip_attached_files_marker(str(c))
+        if text:
+            return text[:64]
+    return fallback
+
+
+# ── Project helpers ──────────────────────────────────────────────────────────
+
+_PROJECTS_MIGRATION_LOCK = threading.Lock()
+_projects_migrated = False
+
+
+def _backfill_project_profiles_if_needed(projects: list) -> bool:
+    """Tag any legacy untagged projects (`profile` missing) with a sensible default.
+
+    Strategy:
+      1. For each untagged project, look at the sessions assigned to it via
+         the session index. If any session carries a profile, take that
+         profile.  Most installs are single-profile so this picks up the
+         right answer for everyone.
+      2. Otherwise default to 'default'.
+
+    Returns True if any project was mutated. Safe to call repeatedly — once
+    every project is tagged, this is a no-op. Runs at most once per process
+    (cached via the module-level _projects_migrated flag) but the result is
+    persisted so it's a one-time write.
+    """
+    untagged = [p for p in projects if not p.get('profile')]
+    if not untagged:
+        return False
+
+    # Build session_id -> profile map for the untagged project_ids.
+    session_profile_by_project: dict[str, str] = {}
+    if SESSION_INDEX_FILE.exists():
+        try:
+            entries = json.loads(SESSION_INDEX_FILE.read_bytes())
+            untagged_ids = {p['project_id'] for p in untagged if p.get('project_id')}
+            for e in entries:
+                pid = e.get('project_id')
+                if pid in untagged_ids and e.get('profile'):
+                    # First session profile wins for the project.
+                    session_profile_by_project.setdefault(pid, e['profile'])
+        except Exception:
+            logger.debug("Failed to read session index for project profile backfill")
+
+    mutated = False
+    for p in untagged:
+        inferred = session_profile_by_project.get(p.get('project_id'), 'default')
+        p['profile'] = inferred
+        mutated = True
+    return mutated
+
+
+def load_projects(*, _migrate: bool = True) -> list:
+    """Load project list from disk. Returns list of project dicts.
+
+    On first call, runs a one-time migration to back-fill the `profile` field
+    on legacy untagged projects (#1614). Disable via `_migrate=False` for
+    callsites that want the raw on-disk shape (test fixtures, e.g.).
+    """
+    global _projects_migrated
+    if not PROJECTS_FILE.exists():
+        return []
+    try:
+        projects = json.loads(PROJECTS_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        return []
+    if _migrate and not _projects_migrated:
+        with _PROJECTS_MIGRATION_LOCK:
+            # Re-check inside the lock — another thread may have raced.
+            if _projects_migrated:
+                # Per Opus advisor on stage-293: another thread completed
+                # migration and wrote new state to disk while we waited for
+                # the lock. Our `projects` snapshot is the pre-migration
+                # version; re-read so the caller doesn't see stale untagged
+                # rows (which a mutation route could then write back,
+                # silently overwriting the migration).
+                try:
+                    return json.loads(PROJECTS_FILE.read_text(encoding='utf-8'))
+                except Exception:
+                    return projects
+            if _backfill_project_profiles_if_needed(projects):
+                try:
+                    save_projects(projects)
+                    _projects_migrated = True
+                except Exception:
+                    logger.debug("Failed to persist project profile backfill")
+                    # Leave _projects_migrated False so a future call retries.
+            else:
+                # Nothing to migrate — already tagged.
+                _projects_migrated = True
+    return projects
+
+def save_projects(projects) -> None:
+    """Write project list to disk."""
+    PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+# ── Projects catalog lock ────────────────────────────────────────────────────
+# ONE lock for every load → modify → save pair of projects.json, wherever the
+# pair lives: the /api/projects/* mutation routes (which import this object as
+# ``_PROJECTS_CATALOG_LOCK``), the system-project bookkeeping below, and the
+# implicit assignment the bind path performs. Per-caller locks silently lost
+# writes — a cron/webhook scan that read the catalog first and saved last put
+# back its stale copy and erased a workspace / model / auto_assign binding the
+# user had just saved (Greptile P1 2026-10-10T13:00:52Z). Reentrant because a
+# caller may nest a catalog helper inside its own critical section.
+PROJECTS_CATALOG_LOCK = threading.RLock()
+
+
+CRON_PROJECT_NAME = 'Cron Jobs'
+_CRON_PROJECT_LOCK = threading.Lock()
+
+
+def ensure_cron_project(create: bool = True, profile: str | None = None) -> str | None:
+    """Return the project_id of the system "Cron Jobs" project for the active profile.
+
+    Each profile gets its own "Cron Jobs" project so cron-spawned sessions in
+    profile A don't surface under the cron chip of profile B (#1614). Lookup
+    keys on (name, profile) — a legacy untagged "Cron Jobs" project (no
+    `profile` field) is treated as belonging to whichever profile first calls
+    this in a given install, then re-tagged.
+
+    When `create` is False, only an EXISTING per-profile cron project is
+    resolved (exact tag, renamed-root alias, or legacy-untagged back-tag);
+    no new project is minted and None is returned instead. Callers gate
+    `create` on `_profile_has_user_projects()` so cron sessions don't force
+    a "Cron Jobs" chip onto installs that never opted into project
+    organization (#5379). Direct callers that omit `create` keep today's
+    unconditional-create behavior.
+
+    Thread-safe and idempotent.  Returns a 12-char hex project_id string, or
+    None if `create` is False and no existing cron project resolves.
+
+    The load → modify → save pair runs under ``PROJECTS_CATALOG_LOCK`` (the
+    catalog-wide lock shared with the /api/projects/* routes), so a scan can no
+    longer write back a catalog copy it read before a user's bind/save landed
+    (Greptile P1 2026-10-10T13:00:52Z). ``_CRON_PROJECT_LOCK`` is kept as the
+    inner, cron-only serialization.
+    """
+    from api.profiles import get_active_profile_name, _is_root_profile
+
+    # `profile` is the owner of the state.db being projected; the active
+    # profile is only a fallback so a cross-profile scan never tags another
+    # profile's system project onto the one currently selected.
+    active = profile or get_active_profile_name() or 'default'
+    with PROJECTS_CATALOG_LOCK, _CRON_PROJECT_LOCK:
+        projects = load_projects()
+        # Look for an existing per-profile cron project. Match either an exact
+        # profile tag or the renamed-root alias (a 'default'-tagged project
+        # under a renamed root, or a renamed-root-tagged project under
+        # 'default'). _is_root_profile is the canonical alias check.
+        for p in projects:
+            if p.get('name') != CRON_PROJECT_NAME:
+                continue
+            row_profile = p.get('profile')
+            if row_profile == active:
+                return p['project_id']
+            if _is_root_profile(row_profile or 'default') and _is_root_profile(active):
+                return p['project_id']
+        # Reuse a legacy untagged cron project — back-tag it to the active profile.
+        for p in projects:
+            if p.get('name') == CRON_PROJECT_NAME and not p.get('profile'):
+                p['profile'] = active
+                save_projects(projects)
+                return p['project_id']
+        if not create:
+            return None
+        # Otherwise create a new one tagged with the active profile.
+        project_id = uuid.uuid4().hex[:12]
+        projects.append({
+            'project_id': project_id,
+            'name': CRON_PROJECT_NAME,
+            'color': '#6366f1',
+            'profile': active,
+            'created_at': time.time(),
+        })
+        save_projects(projects)
+        return project_id
+
+
+WEBHOOK_PROJECT_NAME = 'Webhooks'
+_WEBHOOK_PROJECT_LOCK = threading.Lock()
+
+
+def ensure_webhook_project(profile: str | None = None) -> str:
+    """Return the project_id of the system "Webhooks" project for `profile` (default: active).
+
+    Like ``ensure_cron_project``, the load → modify → save pair runs under
+    ``PROJECTS_CATALOG_LOCK`` so a background scan cannot save a stale catalog
+    over a binding the user just saved (Greptile P1 2026-10-10T13:00:52Z).
+    """
+    from api.profiles import get_active_profile_name, _is_root_profile
+
+    # Owner of the scanned state.db wins over the selected profile (see ensure_cron_project).
+    active = profile or get_active_profile_name() or 'default'
+    with PROJECTS_CATALOG_LOCK, _WEBHOOK_PROJECT_LOCK:
+        projects = load_projects()
+        for p in projects:
+            if p.get('name') != WEBHOOK_PROJECT_NAME:
+                continue
+            row_profile = p.get('profile')
+            if row_profile == active:
+                return p['project_id']
+            if _is_root_profile(row_profile or 'default') and _is_root_profile(active):
+                return p['project_id']
+        for p in projects:
+            if p.get('name') == WEBHOOK_PROJECT_NAME and not p.get('profile'):
+                p['profile'] = active
+                save_projects(projects)
+                return p['project_id']
+        project_id = uuid.uuid4().hex[:12]
+        projects.append({
+            'project_id': project_id,
+            'name': WEBHOOK_PROJECT_NAME,
+            'color': '#0ea5e9',
+            'profile': active,
+            'created_at': time.time(),
+        })
+        save_projects(projects)
+        return project_id
+
+
+def _profile_has_user_projects(profile: str | None = None) -> bool:
+    """True if the active profile already has at least one real (non-system) project.
+
+    "Opted into project organization" means `load_projects()` contains a
+    project whose name is not a reserved system name (`CRON_PROJECT_NAME`,
+    `WEBHOOK_PROJECT_NAME`), tagged to the active profile or its renamed-root
+    alias. Profile/alias matching mirrors `ensure_cron_project`'s own lookup
+    so the two never disagree about which profile a project belongs to.
+
+    Read-only: never mutates projects.json, safe to call as often as needed.
+    """
+    from api.profiles import get_active_profile_name, _is_root_profile
+
+    active = profile or get_active_profile_name() or 'default'
+    reserved = {CRON_PROJECT_NAME, WEBHOOK_PROJECT_NAME}
+    for p in load_projects():
+        if p.get('name') in reserved:
+            continue
+        row_profile = p.get('profile')
+        if row_profile == active:
+            return True
+        if _is_root_profile(row_profile or 'default') and _is_root_profile(active):
+            return True
+    return False
+
+
+# Sentinel for profile_scoped_project_ids(): "no profile given, use the active
+# one". A bare None cannot mean that, because None is a legitimate profile value
+# (_profiles_match reads it as the root profile).
+_ACTIVE_PROFILE = object()
+
+
+def profile_scoped_project_ids(profile=_ACTIVE_PROFILE) -> frozenset[str]:
+    """Project IDs that currently exist for ``profile`` (default: the active one).
+
+    A state.db ``project_id`` is an opaque string the agent wrote; the project
+    it names can since have been deleted, or can belong to a different profile.
+    Callers resolve against this set and treat a miss as "unassigned" so a stale
+    assignment can never HIDE a session: an unresolved id would otherwise drop
+    the row out of "Unassigned" and turn it into a ``default_hidden`` row with no
+    project chip left to reveal it (#6659 review finding 3).
+
+    ``profile`` must be the SESSION's profile, not the process-wide active one,
+    wherever the two can differ. The all-profiles sidebar view scans one state.db
+    per profile in a single request, so resolving every context against the active
+    profile made another profile's LIVE assignment look unresolvable and dropped
+    the row from the payload entirely — while its chip stayed selectable in that
+    same view (#6659 review finding 3).
+
+    Profile/alias matching is delegated to ``api.profiles._profiles_match``,
+    the canonical helper every other profile-scoped read already uses, so this
+    set cannot disagree with the rest of the app about which profile owns a
+    project (renamed root, legacy ``'default'`` tag, and a missing ``profile``
+    key are all its business, not ours). Read-only.
+    """
+    from api.profiles import get_active_profile_name, _profiles_match
+
+    active = get_active_profile_name() if profile is _ACTIVE_PROFILE else profile
+    resolved: set[str] = set()
+    for p in load_projects():
+        project_id = str(p.get('project_id') or '').strip()
+        if not project_id:
+            continue
+        if _profiles_match(p.get('profile'), active):
+            resolved.add(project_id)
+    return frozenset(resolved)
+
+
+def is_cron_session(session_id: str, source_tag: str | None = None) -> bool:
+    """Return True if a session originates from a cron job."""
+    if source_tag == 'cron':
+        return True
+    sid = str(session_id or '')
+    return sid.startswith('cron_')
+
+
+def is_webhook_session(session_id: str, source_tag: str | None = None) -> bool:
+    """Return True if a session originates from a webhook route."""
+    return str(source_tag or '').strip().lower() == 'webhook'
+
+
+
+def import_cli_session(
+    session_id: str,
+    title: str,
+    messages,
+    model: str='unknown',
+    profile=None,
+    created_at=None,
+    updated_at=None,
+    parent_session_id=None,
+):
+    """Create a new WebUI session populated with CLI/agent messages.
+
+    Preserve parent_session_id from state.db so imported continuation segments
+    keep their lineage in the WebUI store and sidebar instead of reappearing as
+    detached orphan chats.
+    """
+    s = Session(
+        session_id=session_id,
+        title=title,
+        workspace=get_last_workspace(profile=profile),
+        model=model,
+        messages=messages,
+        profile=profile,
+        created_at=created_at,
+        updated_at=updated_at,
+        parent_session_id=parent_session_id,
+    )
+    # #4985: import_cli_session uses an explicit sid (the CLI sidecar's id).
+    # If that sid was previously tombstoned as a webui zero-message orphan,
+    # clear the tombstone entry so the freshly-imported session is visible
+    # on the next poll. Wrapped because a tombstone failure must never block
+    # an import.
+    try:
+        _clear_webui_zero_message_orphan_tombstone(s.session_id)
+        _clear_webui_deleted_session_tombstone(s.session_id)
+    except Exception:
+        logger.debug(
+            "Failed to clear webui tombstone for %s",
+            s.session_id,
+            exc_info=True,
+        )
+    s.save(touch_updated_at=False)
+    return s
+
+
+# ── CLI session bridge ──────────────────────────────────────────────────────
+
+CLAUDE_CODE_SOURCE = 'claude_code'
+CLAUDE_CODE_SOURCE_LABEL = 'Claude Code'
+CLAUDE_CODE_MAX_FILES = 200
+CLAUDE_CODE_MAX_FILE_BYTES = 10 * 1024 * 1024
+CLAUDE_CODE_MAX_MESSAGES_PER_FILE = 1000
+CLAUDE_CODE_MAX_CONTENT_CHARS = 200_000
+
+
+def _normalize_cli_session_source_filter(source_filter) -> str | None:
+    normalized = str(source_filter or '').strip().lower()
+    if not normalized or normalized in {'all', 'any', '*'}:
+        return None
+    if normalized == 'claude-code':
+        return CLAUDE_CODE_SOURCE
+    return normalized
+
+
+def _default_claude_code_projects_dir() -> Path | None:
+    """Resolve the Claude Code projects directory without touching real home in tests."""
+    override = os.getenv('HERMES_WEBUI_CLAUDE_PROJECTS_DIR')
+    if override:
+        return Path(override).expanduser()
+    if os.getenv('HERMES_WEBUI_TEST_STATE_DIR'):
+        return None
+    return Path.home() / '.claude' / 'projects'
+
+
+def _claude_code_session_id(path: Path) -> str:
+    digest = hashlib.sha256(str(path.expanduser().resolve()).encode('utf-8')).hexdigest()[:24]
+    return f'{CLAUDE_CODE_SOURCE}_{digest}'
+
+
+def _parse_claude_code_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp()
+    except Exception:
+        return None
+
+
+def _extract_claude_code_text(content) -> str:
+    if content is None:
+        return ''
+    if isinstance(content, str):
+        return content[:CLAUDE_CODE_MAX_CONTENT_CHARS]
+    if isinstance(content, list):
+        parts = []
+        used = 0
+        for item in content:
+            text = ''
+            if isinstance(item, str):
+                text = item
+            elif isinstance(item, dict):
+                text = item.get('text') or item.get('content') or ''
+            if not text:
+                continue
+            text = str(text)
+            remaining = CLAUDE_CODE_MAX_CONTENT_CHARS - used
+            if remaining <= 0:
+                break
+            parts.append(text[:remaining])
+            used += len(parts[-1])
+        return '\n'.join(parts)
+    if isinstance(content, dict):
+        return _extract_claude_code_text(content.get('text') or content.get('content'))
+    return str(content)[:CLAUDE_CODE_MAX_CONTENT_CHARS]
+
+
+def _parse_claude_code_jsonl(path: Path, *, max_messages: int = CLAUDE_CODE_MAX_MESSAGES_PER_FILE) -> tuple[list[dict], str | None, float | None, float | None]:
+    messages: list[dict] = []
+    summary_title = None
+    first_ts = None
+    last_ts = None
+    try:
+        with path.open('r', encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                if len(messages) >= max_messages:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                if not summary_title:
+                    summary = raw.get('summary') or raw.get('title')
+                    if isinstance(summary, str) and summary.strip():
+                        summary_title = ' '.join(summary.split())[:80]
+                records = raw.get('messages') if isinstance(raw.get('messages'), list) else None
+                if records is None:
+                    records = [raw.get('message') if isinstance(raw.get('message'), dict) else raw]
+                for record in records:
+                    if len(messages) >= max_messages:
+                        break
+                    if not isinstance(record, dict):
+                        continue
+                    msg = record.get('message') if isinstance(record.get('message'), dict) else record
+                    role = str(msg.get('role') or record.get('role') or raw.get('role') or raw.get('type') or '').strip().lower()
+                    if role == 'human':
+                        role = 'user'
+                    if role not in {'user', 'assistant', 'system', 'tool'}:
+                        continue
+                    content = _extract_claude_code_text(msg.get('content') if 'content' in msg else record.get('content'))
+                    if not content.strip():
+                        continue
+                    ts = _parse_claude_code_timestamp(
+                        msg.get('timestamp')
+                        or record.get('timestamp')
+                        or raw.get('timestamp')
+                        or raw.get('created_at')
+                    )
+                    if ts is not None:
+                        first_ts = ts if first_ts is None else min(first_ts, ts)
+                        last_ts = ts if last_ts is None else max(last_ts, ts)
+                    item = {'role': role, 'content': content}
+                    if ts is not None:
+                        item['timestamp'] = ts
+                    messages.append(item)
+    except Exception:
+        return [], None, None, None
+    return messages, summary_title, first_ts, last_ts
+
+
+def _parse_claude_code_jsonl_cached(
+    path: Path, *, max_messages: int = CLAUDE_CODE_MAX_MESSAGES_PER_FILE
+) -> tuple[list[dict], str | None, float | None, float | None]:
+    """``_parse_claude_code_jsonl`` memoized by the file's (path, mtime_ns, size, ctime_ns).
+
+    The transcript files under ``~/.claude/projects`` are global and rarely
+    change between sidebar builds, but parsing them dominates the cold
+    /api/sessions latency (and repeats on every profile switch). Caching the
+    parse result keyed by the file's stat signature collapses the warm cost to a
+    single ``os.stat`` per file. A genuine append/edit bumps ``mtime_ns``/``size``
+    /``ctime_ns`` and misses the cache, so staleness is impossible without
+    re-parsing.
+
+    ``max_messages`` is part of the key so a caller asking for a different cap
+    never reads a result truncated to a smaller one.
+    """
+    try:
+        st = path.stat()
+        # Key on mtime_ns + size + ctime_ns: size is the strong discriminator for
+        # append-only JSONL (any write changes it), and ctime_ns guards the rare
+        # same-size, same-mtime in-place edit so a content change can never serve
+        # a stale parse. A spurious ctime bump only costs one harmless re-parse.
+        key = (str(path), st.st_mtime_ns, st.st_size, st.st_ctime_ns, int(max_messages))
+    except OSError:
+        # Can't stat -> fall back to a direct (uncached) parse; it will also
+        # likely fail and return the empty tuple, matching prior behavior.
+        return _parse_claude_code_jsonl(path, max_messages=max_messages)
+
+    with _CLAUDE_CODE_PARSE_CACHE_LOCK:
+        hit = _CLAUDE_CODE_PARSE_CACHE.get(key)
+        if hit is not None:
+            _CLAUDE_CODE_PARSE_CACHE.move_to_end(key)
+            messages, summary_title, first_ts, last_ts = hit
+            # Return a shallow copy of the message list so a caller mutating it
+            # can't corrupt the cached entry; the per-message dicts are treated
+            # as read-only by all current callers.
+            return list(messages), summary_title, first_ts, last_ts
+
+    parsed = _parse_claude_code_jsonl(path, max_messages=max_messages)
+
+    with _CLAUDE_CODE_PARSE_CACHE_LOCK:
+        # Re-check under lock in case a concurrent build populated it; either
+        # entry is equally valid for the same stat signature.
+        existing = _CLAUDE_CODE_PARSE_CACHE.get(key)
+        if existing is None:
+            _CLAUDE_CODE_PARSE_CACHE[key] = parsed
+            _CLAUDE_CODE_PARSE_CACHE.move_to_end(key)
+            while len(_CLAUDE_CODE_PARSE_CACHE) > _CLAUDE_CODE_PARSE_CACHE_MAX:
+                _CLAUDE_CODE_PARSE_CACHE.popitem(last=False)
+    messages, summary_title, first_ts, last_ts = parsed
+    return list(messages), summary_title, first_ts, last_ts
+
+
+def clear_claude_code_parse_cache() -> None:
+    """Drop all memoized Claude Code transcript parses (test/lifecycle hook)."""
+    with _CLAUDE_CODE_PARSE_CACHE_LOCK:
+        _CLAUDE_CODE_PARSE_CACHE.clear()
+
+
+def _iter_claude_code_jsonl_files(projects_dir: Path | str | None = None, *, max_files: int = CLAUDE_CODE_MAX_FILES, max_file_bytes: int = CLAUDE_CODE_MAX_FILE_BYTES):
+    root = Path(projects_dir).expanduser() if projects_dir is not None else _default_claude_code_projects_dir()
+    if root is None:
+        return
+    try:
+        if root.is_symlink():
+            return
+        root = root.resolve(strict=False)
+        if not root.exists() or not root.is_dir():
+            return
+        yielded = 0
+        for project_dir in sorted(root.iterdir(), key=lambda p: p.name):
+            if yielded >= max_files:
+                return
+            try:
+                if project_dir.is_symlink() or not project_dir.is_dir():
+                    continue
+                for path in sorted(project_dir.iterdir(), key=lambda p: p.name):
+                    if yielded >= max_files:
+                        return
+                    if path.is_symlink() or not path.is_file() or path.suffix.lower() != '.jsonl':
+                        continue
+                    try:
+                        if path.stat().st_size > max_file_bytes:
+                            continue
+                    except OSError:
+                        continue
+                    yielded += 1
+                    yield path
+            except OSError:
+                continue
+    except OSError:
+        return
+
+
+def _claude_code_title(messages: list[dict], summary_title: str | None) -> str:
+    if summary_title:
+        return summary_title
+    for msg in messages:
+        if msg.get('role') == 'user':
+            text = ' '.join(str(msg.get('content') or '').split())
+            if text:
+                return text[:80]
+    return 'Claude Code Session'
+
+
+def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_files: int = CLAUDE_CODE_MAX_FILES, max_file_bytes: int = CLAUDE_CODE_MAX_FILE_BYTES) -> list:
+    """Read Claude Code JSONL sessions as read-only external-agent rows.
+
+    The bridge is additive and defensive: it skips symlinks, oversized files,
+    malformed lines, and per-file errors rather than crashing WebUI session
+    listing. Tests pass ``projects_dir`` fixtures so Michael's real ~/.claude is
+    never read during test runs.
+    """
+    sessions = []
+    # ``get_last_workspace()`` is loop-invariant (the same active workspace for
+    # every Claude Code row) but internally stats config.yaml + probes terminal
+    # cwd, so calling it once per row was ~200 redundant stat()s on the cold
+    # sidebar build (#4718). Resolve it a single time.
+    cc_workspace = str(get_last_workspace())
+    for path in _iter_claude_code_jsonl_files(projects_dir, max_files=max_files, max_file_bytes=max_file_bytes) or []:
+        messages, summary_title, first_ts, last_ts = _parse_claude_code_jsonl_cached(path)
+        if not messages:
+            continue
+        sid = _claude_code_session_id(path)
+        # Match the truthiness fallback used in the assignments below: the old
+        # inline code was ``first_ts or last_ts or path.stat().st_mtime``, which
+        # also fell back to mtime for a falsy-but-not-None ``0.0`` timestamp
+        # (epoch-0 / 1970 transcripts). An identity (``is None``) guard would
+        # leave those rows with ``None`` instead of the file mtime, so use the
+        # same ``not`` test the assignments use to stay bug-for-bug compatible.
+        if not first_ts and not last_ts:
+            try:
+                _mtime = path.stat().st_mtime
+            except OSError:
+                _mtime = 0.0
+        else:
+            _mtime = None
+        created_at = first_ts or last_ts or _mtime
+        updated_at = last_ts or first_ts or _mtime
+        sessions.append({
+            'session_id': sid,
+            'title': _claude_code_title(messages, summary_title),
+            'workspace': cc_workspace,
+            'model': 'claude-code',
+            'message_count': len(messages),
+            'created_at': created_at,
+            'updated_at': updated_at,
+            'last_message_at': updated_at,
+            'pinned': False,
+            'archived': False,
+            'project_id': None,
+            'profile': None,
+            'source_tag': CLAUDE_CODE_SOURCE,
+            'raw_source': CLAUDE_CODE_SOURCE,
+            'session_source': 'external_agent',
+            'source_label': CLAUDE_CODE_SOURCE_LABEL,
+            'is_cli_session': True,
+            'read_only': True,
+        })
+    sessions.sort(key=lambda s: s.get('last_message_at') or s.get('updated_at') or 0, reverse=True)
+    return sessions
+
+
+def get_claude_code_session_messages(sid, projects_dir: Path | str | None = None) -> list:
+    """Return messages for one read-only Claude Code JSONL session."""
+    sid = str(sid or '')
+    if not sid.startswith(f'{CLAUDE_CODE_SOURCE}_'):
+        return []
+    for path in _iter_claude_code_jsonl_files(projects_dir) or []:
+        if _claude_code_session_id(path) != sid:
+            continue
+        messages, _summary_title, _first_ts, _last_ts = _parse_claude_code_jsonl_cached(path)
+        return messages
+    return []
+
+
+def clear_cli_sessions_cache() -> None:
+    with _CLI_SESSIONS_CACHE_LOCK:
+        global _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
+        _CLI_SESSIONS_CACHE_INVALIDATION_VERSION += 1
+        _CLI_SESSIONS_CACHE.clear()
+        _CLI_SESSIONS_LAST_KNOWN_GOOD.clear()
+    # The sidecar-metadata projection cache is stat-keyed (self-invalidating on
+    # any file change), but clear it alongside the CLI cache so an explicit
+    # reset — a mutating sidebar action or test isolation — starts fully cold.
+    clear_sidecar_metadata_cache()
+
+
+def _copy_cli_sessions(sessions: list) -> list:
+    return copy.deepcopy(sessions)
+
+
+def _cli_sessions_cache_invalidation_stamp() -> int:
+    with _CLI_SESSIONS_CACHE_LOCK:
+        return int(_CLI_SESSIONS_CACHE_INVALIDATION_VERSION)
+
+
+def _cli_sessions_cache_claim_rebuild(cache_key: tuple) -> tuple[threading.Event, bool]:
+    with _CLI_SESSIONS_CACHE_LOCK:
+        current = _CLI_SESSIONS_CACHE_INFLIGHT.get(cache_key)
+        if current is not None:
+            return current, False
+        event = threading.Event()
+        _CLI_SESSIONS_CACHE_INFLIGHT[cache_key] = event
+        return event, True
+
+
+def _cli_sessions_cache_done(cache_key: tuple, event: threading.Event | None) -> None:
+    with _CLI_SESSIONS_CACHE_LOCK:
+        if event is None:
+            return
+        if _CLI_SESSIONS_CACHE_INFLIGHT.get(cache_key) is event:
+            _CLI_SESSIONS_CACHE_INFLIGHT.pop(cache_key, None)
+    if event is not None:
+        event.set()
+
+
+def _cli_sessions_stable_cache_identity(cache_key: tuple) -> tuple:
+    """Remove volatile state.db revisions from a CLI cache identity."""
+    if cache_key and cache_key[0] == 'all_profiles':
+        # Index 4 is the explicit profile-home/profile-name ownership key. It
+        # stays stable across idle and streaming-frozen primary cache modes.
+        return (*cache_key[:3], cache_key[4], *cache_key[5:])
+    # Single-profile keys place the volatile DB fingerprint at index 4.
+    return (*cache_key[:4], *cache_key[5:]) if len(cache_key) > 4 else cache_key
+
+
+def _copy_last_known_good_cli_sessions(stable_key: tuple, invalidation_stamp: int):
+    with _CLI_SESSIONS_CACHE_LOCK:
+        entry = _CLI_SESSIONS_LAST_KNOWN_GOOD.get(stable_key)
+        if entry is None or entry[0] != invalidation_stamp:
+            return None
+        _CLI_SESSIONS_LAST_KNOWN_GOOD.move_to_end(stable_key)
+        return _copy_cli_sessions(entry[1])
+
+
+def _cache_cli_sessions_if_current(
+    cache_key: tuple,
+    ttl: float,
+    invalidation_stamp: int,
+    sessions: list,
+) -> bool:
+    with _CLI_SESSIONS_CACHE_LOCK:
+        if _CLI_SESSIONS_CACHE_INVALIDATION_VERSION != invalidation_stamp:
+            return False
+        copied_sessions = _copy_cli_sessions(sessions)
+        _CLI_SESSIONS_CACHE[cache_key] = (
+            time.monotonic() + ttl,
+            invalidation_stamp,
+            copied_sessions,
+        )
+        stable_key = _cli_sessions_stable_cache_identity(cache_key)
+        _CLI_SESSIONS_LAST_KNOWN_GOOD[stable_key] = (
+            invalidation_stamp,
+            _copy_cli_sessions(copied_sessions),
+        )
+        _CLI_SESSIONS_LAST_KNOWN_GOOD.move_to_end(stable_key)
+        while len(_CLI_SESSIONS_LAST_KNOWN_GOOD) > _CLI_SESSIONS_LAST_KNOWN_GOOD_MAX_ENTRIES:
+            _CLI_SESSIONS_LAST_KNOWN_GOOD.popitem(last=False)
+        _CLI_SESSIONS_CACHE.move_to_end(cache_key)
+        while len(_CLI_SESSIONS_CACHE) > _CLI_SESSIONS_CACHE_MAX_ENTRIES:
+            _CLI_SESSIONS_CACHE.popitem(last=False)
+    return True
+
+
+def _copy_fresh_cli_sessions_cache_entry(cache_key: tuple):
+    with _CLI_SESSIONS_CACHE_LOCK:
+        cached_entry = _CLI_SESSIONS_CACHE.get(cache_key)
+        if cached_entry is None:
+            return None
+        if len(cached_entry) == 3:
+            cached_expires_at, cached_stamp, cached_sessions = cached_entry
+        else:
+            cached_expires_at, cached_sessions = cached_entry
+            cached_stamp = _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
+        if cached_stamp != _CLI_SESSIONS_CACHE_INVALIDATION_VERSION:
+            _CLI_SESSIONS_CACHE.pop(cache_key, None)
+            return None
+        if cached_expires_at <= time.monotonic():
+            return None
+        # LRU: a fresh hit is the most-recently-used entry.
+        _CLI_SESSIONS_CACHE.move_to_end(cache_key)
+        return _copy_cli_sessions(cached_sessions)
+
+
+@dataclass(frozen=True)
+class _CliSessionsLoadResult:
+    sessions: list
+    complete: bool = True
+    fresh_when_incomplete: bool = False
+
+
+def _load_and_cache_cli_sessions(
+    *,
+    cache_key: tuple,
+    ttl: float,
+    invalidation_stamp: int,
+    load_sessions,
+    stale_sessions,
+    stale_stamp,
+    all_profiles: bool,
+    db_path,
+) -> list:
+    stable_cache_key = _cli_sessions_stable_cache_identity(cache_key)
+    try:
+        loaded = load_sessions()
+        if isinstance(loaded, _CliSessionsLoadResult):
+            sessions = loaded.sessions
+            complete = loaded.complete
+        else:
+            sessions = loaded
+            complete = True
+    except Exception as _cli_err:
+        logger.warning(
+            "get_cli_sessions() failed — check state.db schema or path (%s): %s",
+            "all profiles" if all_profiles else db_path, _cli_err,
+        )
+        if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
+            return stale_sessions
+        stable_sessions = _copy_last_known_good_cli_sessions(
+            stable_cache_key, invalidation_stamp
+        )
+        if stable_sessions is not None:
+            return stable_sessions
+        return []
+    if not complete:
+        if isinstance(loaded, _CliSessionsLoadResult) and loaded.fresh_when_incomplete:
+            # Optional source passes are additive. If one cannot be read, the
+            # primary rows already loaded are newer and more useful than a stale
+            # complete snapshot. Serve them for this request only; never publish
+            # an incomplete projection to either cache.
+            return _copy_cli_sessions(sessions)
+        if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
+            return stale_sessions
+        stable_sessions = _copy_last_known_good_cli_sessions(
+            stable_cache_key, invalidation_stamp
+        )
+        if stable_sessions is not None:
+            return stable_sessions
+        # Expose a first partial attempt, but never publish it as authoritative.
+        return _copy_cli_sessions(sessions)
+    _cache_cli_sessions_if_current(
+        cache_key,
+        ttl,
+        invalidation_stamp,
+        sessions,
+    )
+    return _copy_cli_sessions(sessions)
+
+
+def _reload_cli_sessions_after_inflight(
+    *,
+    cache_key: tuple,
+    ttl: float,
+    stale_sessions,
+    stale_stamp,
+    load_sessions,
+    all_profiles: bool,
+    db_path: str,
+) -> list:
+    while True:
+        event, is_owner = _cli_sessions_cache_claim_rebuild(cache_key)
+        if is_owner:
+            break
+        wait_finished = False
+        try:
+            wait_finished = bool(
+                event.wait(
+                    _CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS
+                    if stale_sessions is not None
+                    else _CLI_SESSIONS_CACHE_WAIT_SECONDS
+                )
+            )
+        except Exception:
+            pass
+        cached_sessions = _copy_fresh_cli_sessions_cache_entry(cache_key)
+        if cached_sessions is not None:
+            return cached_sessions
+        if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
+            return stale_sessions
+        if not wait_finished:
+            fallback_invalidation_stamp = _cli_sessions_cache_invalidation_stamp()
+            return _load_and_cache_cli_sessions(
+                cache_key=cache_key,
+                ttl=ttl,
+                invalidation_stamp=fallback_invalidation_stamp,
+                load_sessions=load_sessions,
+                stale_sessions=stale_sessions,
+                stale_stamp=stale_stamp,
+                all_profiles=all_profiles,
+                db_path=db_path,
+            )
+    try:
+        invalidation_stamp = _cli_sessions_cache_invalidation_stamp()
+        return _load_and_cache_cli_sessions(
+            cache_key=cache_key,
+            ttl=ttl,
+            invalidation_stamp=invalidation_stamp,
+            load_sessions=load_sessions,
+            stale_sessions=stale_sessions,
+            stale_stamp=stale_stamp,
+            all_profiles=all_profiles,
+            db_path=db_path,
+        )
+    finally:
+        _cli_sessions_cache_done(cache_key, event)
+
+
+def _cli_sessions_cache_ttl_seconds() -> float:
+    # #4842: widen the freshness window while a turn is streaming so the fixed
+    # streaming poll cadence doesn't force a rebuild on every poll. Paired
+    # with the streaming-freeze cache key (so the key is stable across polls
+    # mid-stream), this bounds the heavy CLI/cron projection to one rebuild per
+    # streaming-TTL window instead of one per poll. Mirrors the route-level
+    # #4808 TTL widening.
+    try:
+        if _cli_sessions_streaming_freeze_marker() is not None:
+            return max(0.0, float(_CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return max(0.0, float(_CLI_SESSIONS_CACHE_TTL_SECONDS))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def _path_cache_key(path) -> str | None:
+    if path is None:
+        return None
+    try:
+        return str(Path(path).expanduser().resolve(strict=False))
+    except Exception:
+        return str(path)
+
+
+def _path_stat_cache_key(path):
+    if path is None:
+        return None
+    try:
+        st = Path(path).stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _callable_accepts_include_claude_code(callable_obj) -> bool:
+    return _callable_accepts_keyword(callable_obj, 'include_claude_code')
+
+
+def _callable_accepts_keyword(callable_obj, keyword: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return True
+    if keyword in signature.parameters:
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _sqlite_content_fingerprint(db_path: Path):
+    """Return a commit-reliable content fingerprint for a state.db.
+
+    The stat-only key below (mtime_ns + size of the .db/-wal/-shm files) is NOT
+    reliable for cache invalidation: in WAL mode a commit lands in the -wal file,
+    and under fast sequential writes the (mtime_ns, size) of the sidecars can
+    COLLIDE with a previously cached stamp (same nanosecond bucket + a WAL frame
+    that lands at the same offset/size after a prior checkpoint truncation), so a
+    freshly-committed gateway/CLI session is intermittently served from the stale
+    Python cache. PRAGMA data_version does NOT help here either — read from a
+    fresh per-request connection it always reports that connection's own initial
+    value and never advances (verified). A cheap content fingerprint over the
+    sessions/messages tables, read on a fresh connection, DOES advance on every
+    commit (incl. external gateway writes) and is immune to mtime granularity.
+    Cost is a pair of indexed COUNT/MAX queries (sub-ms), far cheaper than the
+    full uncached session scan this key gates.
+    """
+    try:
+        if not Path(db_path).exists():
+            return None
+    except OSError:
+        return None
+    try:
+        import sqlite3
+        # Read-only + a tiny busy timeout: a fingerprint read must NEVER stall the
+        # /api/sessions hot path when state.db is briefly locked by a writer.
+        # On lock (or any error) we return None and the caller falls back to the
+        # cheap file-stat stamp, so correctness degrades gracefully to the prior
+        # behavior rather than blocking for the default multi-second busy timeout.
+        try:
+            conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True, timeout=0.05
+            )
+        except Exception:
+            return None
+        try:
+            conn.execute("PRAGMA busy_timeout=50")
+            parts = []
+            for table in ("sessions", "messages"):
+                try:
+                    # MAX(rowid) is an O(1) index lookup (no table scan) and
+                    # advances on every INSERT. Pair it with the table's largest
+                    # rowid + a count-free total: we deliberately avoid COUNT(*)
+                    # which forces a full SCAN on large messages tables (~tens of
+                    # ms per sidebar refresh on a big store). MAX(rowid) misses a
+                    # pure DELETE-without-insert, but the file-stat fallback in
+                    # _sqlite_file_stat_cache_key still moves on a delete commit,
+                    # and a delete never makes a MISSING row appear (the flake we
+                    # fix is an ADDED row not showing up). It also misses a plain
+                    # `UPDATE sessions SET title/message_count` with no message
+                    # insert (state_sync.py sync) — those fall back to the stat
+                    # stamp + 5s TTL, i.e. the prior behavior (a title-only rename
+                    # can lag <=5s); no regression vs the old stat-only key.
+                    row = conn.execute(
+                        f"SELECT MAX(rowid) FROM {table}"
+                    ).fetchone()
+                    parts.append(row[0] if row else None)
+                except Exception:
+                    parts.append(None)
+            return tuple(parts)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+def _sqlite_file_stat_cache_key(db_path: Path):
+    """Return a commit-reliable invalidation key for a SQLite DB.
+
+    Combines a content fingerprint (the authoritative signal — advances on every
+    commit, immune to mtime-granularity collisions that flaked the gateway_sync
+    test) with the cheap file stat stamps as a belt-and-suspenders fallback for
+    the case where the fingerprint can't be read.
+    """
+    return (
+        _sqlite_content_fingerprint(db_path),
+        _path_stat_cache_key(db_path),
+        _path_stat_cache_key(Path(f"{db_path}-wal")),
+        _path_stat_cache_key(Path(f"{db_path}-shm")),
+    )
+
+
+def _cli_sessions_streaming_freeze_marker():
+    """Return a stable cache-key marker while any turn is actively streaming.
+
+    The CLI/cron sidebar projection (``_load_cli_sessions_uncached``) is gated by
+    ``_CLI_SESSIONS_CACHE``, whose key folds in ``_sqlite_file_stat_cache_key`` →
+    ``_sqlite_content_fingerprint`` (``MAX(rowid) FROM messages``). During an
+    active chat turn the gateway/CLI writes a message row per streamed delta, so
+    that fingerprint advances on essentially every ``/api/sessions`` poll — busting
+    the CLI cache and re-running the expensive candidate-join + projection (and the
+    lineage-metadata pass) on every poll, while contending for the same SQLite/global
+    lock the streaming worker holds. That is the multi-second ``get_cli_sessions``
+    in #4842 (and #4672/#4808).
+
+    The route-level session-list cache already freezes its own key during streaming
+    (#4808 ``_session_list_cache_streaming_freeze_marker``), but that freeze never
+    reached this *inner* CLI-sessions cache, so the heavy CLI/cron query still
+    re-ran whenever the outer cache validated. This marker mirrors the route-level
+    one: keyed only on the *set* of active stream ids, it is constant while the same
+    turn(s) stream (so the projection is reused across polls) and changes the instant
+    a stream starts/stops (so the just-finished turn's rows are picked up promptly).
+    A streaming session's own CLI/cron title/count is not what this projection
+    returns (the streaming session is overlaid live by the route layer), and any
+    in-app structural mutation invalidates the cache directly via
+    ``clear_cli_sessions_cache``. Externally-driven changes that don't fire that
+    listener (a scheduled cron completing, an external CLI writing rows) surface
+    after the streaming TTL expires and a subsequent refresh occurs rather than
+    instantly — a bounded, self-healing lag that is the deliberate latency/CPU
+    trade-off of the freeze. (#4842)
+    """
+    try:
+        active = _active_stream_ids()
+    except Exception:
+        return None
+    if not active:
+        return None
+    try:
+        return ("streaming", tuple(sorted(str(x) for x in active)))
+    except Exception:
+        return ("streaming",)
+
+
+def _resolve_cli_sessions_context(source_filter=None, include_claude_code: bool = True):
+    # Use the active WebUI profile's HERMES_HOME to find state.db.
+    # The active profile is determined by what the user has selected in the UI
+    # (stored in the server's runtime config). This means:
+    #   - default profile  -> ~/.hermes/state.db
+    #   - named profile X  -> ~/.hermes/profiles/X/state.db
+    # We resolve the active profile's home directory rather than just using
+    # HERMES_HOME (which is the server's launch profile, not necessarily the
+    # active one after a profile switch).
+    try:
+        from api.profiles import get_active_hermes_home
+        hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
+    except Exception:
+        hermes_home = Path(os.getenv('HERMES_HOME', str(HOME / '.hermes'))).expanduser().resolve()
+
+    try:
+        from api.profiles import get_active_profile_name
+        cli_profile = get_active_profile_name()
+    except Exception:
+        cli_profile = None
+
+    db_path = hermes_home / 'state.db'
+    projects_dir = _default_claude_code_projects_dir()
+    # #4842: while a turn streams, freeze the volatile state.db component of the
+    # key so per-message writes don't bust the CLI cache and re-run the heavy
+    # CLI/cron projection on every poll (mirrors the route-level #4808 freeze).
+    # The wider streaming TTL in get_cli_sessions() still permits a periodic
+    # rebuild after that window, and structural mutations invalidate via
+    # clear_cli_sessions_cache().
+    _streaming_marker = _cli_sessions_streaming_freeze_marker()
+    db_state_key = _streaming_marker if _streaming_marker is not None else _sqlite_file_stat_cache_key(db_path)
+    cache_key = (
+        str(hermes_home),
+        str(cli_profile or ''),
+        str(db_path),
+        str(source_filter or ''),
+        db_state_key,
+        bool(include_claude_code),
+        _path_cache_key(projects_dir),
+        _path_stat_cache_key(projects_dir),
+        _path_stat_cache_key(SESSION_INDEX_FILE),
+    )
+    return hermes_home, db_path, cli_profile, cache_key
+
+
+def _all_profiles_cli_contexts() -> tuple[list[tuple[Path, Path, str | None]], tuple]:
+    """Return per-profile CLI scan contexts plus a cache key fragment."""
+    try:
+        from api.profiles import (
+            _profiles_root,
+            get_active_profile_name,
+            get_hermes_home_for_profile,
+        )
+    except Exception:
+        return [], ()
+
+    contexts: list[tuple[Path, Path, str | None]] = []
+    cache_entries: list[tuple[str, str, object]] = []
+    seen_homes: set[str] = set()
+
+    def _add_context(profile_name) -> None:
+        try:
+            hermes_home = Path(get_hermes_home_for_profile(profile_name)).expanduser().resolve()
+        except Exception:
+            return
+        home_key = _path_cache_key(hermes_home)
+        if not home_key or home_key in seen_homes:
+            return
+        seen_homes.add(home_key)
+        db_path = hermes_home / 'state.db'
+        profile_value = str(profile_name or 'default').strip() or 'default'
+        contexts.append((hermes_home, db_path, profile_value))
+        cache_entries.append((home_key, profile_value, _sqlite_file_stat_cache_key(db_path)))
+
+    try:
+        _add_context(get_active_profile_name())
+    except Exception:
+        pass
+    # The root profile, then one home per directory under the named-profile
+    # root. Deliberately not list_profiles_api(): that builds the picker's rows,
+    # skill counts included, and this scan needs only the homes (#7940).
+    _add_context('default')
+    try:
+        for entry in sorted(_profiles_root().iterdir()):
+            if not entry.is_dir():
+                continue
+            _add_context(entry.name)
+    except Exception:
+        logger.debug("All-profiles CLI directory enumeration failed", exc_info=True)
+
+    return contexts, tuple(cache_entries)
+
+
+def clear_sidecar_metadata_cache() -> None:
+    """Drop all memoized sidebar-projection sidecar metadata (test/lifecycle hook)."""
+    with _SIDECAR_METADATA_CACHE_LOCK:
+        _SIDECAR_METADATA_CACHE.clear()
+
+
+def _state_projection_sidecar_metadata(sid: str) -> dict:
+    """Return UI-owned metadata (title + archived + project_id) for a state row.
+
+    ``project_id`` is UI-owned in exactly the same way as the other two:
+    ``/api/session/move`` writes it onto the sidecar and NOTHING writes
+    ``state.db.sessions.project_id``. Reading it here is what lets the sidebar
+    projection agree with the assignment ``all_sessions()`` re-surfaces, instead
+    of counting a moved conversation against the unassigned window (#6659 review
+    finding 2).
+
+    Memoized by the sidecar file's (path, mtime_ns, size, ctime_ns) stat
+    signature so the sidebar projection — which calls this once per row in both
+    the visible pass and the up-to-200-row cron pass — pays a single os.stat per
+    file on a warm build instead of an open() + 64KB read + JSON-key scan
+    (#4842). A rename/archive/edit bumps the signature and invalidates just that
+    entry, so a stale title/archived flag is impossible without re-reading.
+    Returns a COPY so callers can't mutate the cached dict.
+
+    NOTE: this stat-gates on ``SESSION_DIR / f'{sid}.json'`` because that file is
+    ``Session.load_metadata_only``'s sole source for title+archived+project_id. If
+    that ever stops being true (metadata moves to another store), this gate would
+    short-circuit before the real source — update both together.
+    """
+    default = {"title": None, "archived": None, "project_id": None}
+    if not is_safe_session_id(sid):
+        return dict(default)
+    p = SESSION_DIR / f'{sid}.json'
+    try:
+        st = p.stat()
+        key = (str(p), st.st_mtime_ns, st.st_size, st.st_ctime_ns)
+    except OSError:
+        # No sidecar file (the common case for a pure state.db row) or it
+        # vanished mid-build — nothing to project, and nothing worth caching.
+        return dict(default)
+
+    with _SIDECAR_METADATA_CACHE_LOCK:
+        hit = _SIDECAR_METADATA_CACHE.get(key)
+        if hit is not None:
+            _SIDECAR_METADATA_CACHE.move_to_end(key)
+            return dict(hit)
+
+    metadata = dict(default)
+    try:
+        webui_meta = Session.load_metadata_only(sid)
+    except Exception:
+        webui_meta = None
+    if webui_meta:
+        title = getattr(webui_meta, 'title', None)
+        if title:
+            metadata["title"] = title
+        metadata["archived"] = bool(getattr(webui_meta, 'archived', False))
+        project_id = str(getattr(webui_meta, 'project_id', None) or '').strip()
+        metadata["project_id"] = project_id or None
+
+    with _SIDECAR_METADATA_CACHE_LOCK:
+        # Re-check under lock in case a concurrent build populated it; either
+        # entry is equally valid for the same stat signature.
+        if key not in _SIDECAR_METADATA_CACHE:
+            _SIDECAR_METADATA_CACHE[key] = metadata
+            _SIDECAR_METADATA_CACHE.move_to_end(key)
+            while len(_SIDECAR_METADATA_CACHE) > _SIDECAR_METADATA_CACHE_MAX:
+                _SIDECAR_METADATA_CACHE.popitem(last=False)
+    return dict(metadata)
+
+
+def _state_db_supports_project_ids(db_path: Path) -> bool:
+    """Return whether the agent session schema can persist project assignments."""
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            rows = conn.execute("PRAGMA table_info(sessions)").fetchall()
+    except Exception:
+        return False
+    return any(str(row[1]) == "project_id" for row in rows)
+
+
+@profile_home_resolve_cache_scope()
+def _load_cli_sessions_uncached(
+    hermes_home: Path,
+    db_path: Path,
+    _cli_profile,
+    source_filter=None,
+    *,
+    visible_session_limit: int | None = None,
+    project_assigned_limit: int | None | bool = PROJECT_ASSIGNED_CLI_LIMIT,
+    cron_project_limit: int | None | bool = CRON_PROJECT_CHIP_LIMIT,
+    webhook_project_limit: int | None | bool = WEBHOOK_PROJECT_CHIP_LIMIT,
+    kanban_project_limit: int | None | bool = KANBAN_PROJECT_CHIP_LIMIT,
+    include_claude_code: bool = True,
+    _with_completeness: bool = False,
+    session_ids: tuple[str, ...] | None = None,
+) -> list | _CliSessionsLoadResult:
+    cli_sessions = []
+    projection_complete = True
+
+    def _result():
+        if _with_completeness:
+            return _CliSessionsLoadResult(
+                cli_sessions,
+                complete=projection_complete,
+                fresh_when_incomplete=not projection_complete,
+            )
+        return cli_sessions
+
+    if source_filter in (None, CLAUDE_CODE_SOURCE) and include_claude_code:
+        try:
+            cli_sessions.extend(get_claude_code_sessions())
+        except Exception:
+            logger.debug("Claude Code session scan failed", exc_info=True)
+
+    if source_filter == CLAUDE_CODE_SOURCE:
+        return _result()
+
+
+    if not db_path.exists():
+        return _result()
+
+    # Memoize the cron project ID for this scan so we don't pay a lock-acquire +
+    # disk-read of projects.json per cron session in the loop below.
+    # Resolved lazily on the first cron session we encounter.
+    # [resolved, project_id_or_None] — a plain `[None]` sentinel can't tell
+    # "not yet resolved" apart from "resolved to None" (the gated-closed
+    # case), which would re-pay the load_projects() read on every cron row
+    # in a cron-heavy zero-user-project scan — the exact I/O blowup #4842
+    # fixed, reintroduced by this gate if left as a bare None check.
+    _cron_pid_cache: list = [False, None]
+    def _cron_pid():
+        if not _cron_pid_cache[0]:
+            _cron_pid_cache[0] = True
+            _cron_pid_cache[1] = ensure_cron_project(
+                create=_profile_has_user_projects(_cli_profile), profile=_cli_profile,
+            )
+        return _cron_pid_cache[1]
+
+    # Memoize the cron jobs.json job_id -> name map for this scan. The two row
+    # loops below each looked up a cron job's friendly name by re-reading and
+    # re-parsing hermes_home/cron/jobs.json PER untitled cron row — up to ~200
+    # full-file JSON parses on a cron-heavy profile (#4842). Parse it once,
+    # lazily, on the first untitled cron row we hit. {} when absent/unreadable.
+    _cron_job_names_cache: list = [None]  # list-as-cell; None = not yet resolved
+    def _cron_job_names():
+        if _cron_job_names_cache[0] is None:
+            names: dict[str, str] = {}
+            try:
+                _jobs_path = hermes_home / 'cron' / 'jobs.json'
+                if _jobs_path.exists():
+                    _jobs_data = json.loads(_jobs_path.read_text(encoding='utf-8'))
+                    for _j in _jobs_data.get('jobs', []):
+                        _jid = _j.get('id')
+                        _jname = _j.get('name')
+                        if _jid and _jname:
+                            names[str(_jid)] = _jname
+            except Exception:
+                pass  # degrade gracefully — fall back to the generic title
+            _cron_job_names_cache[0] = names
+        return _cron_job_names_cache[0]
+
+    def _cron_title_from_jobs(sid: str):
+        """Friendly cron job name for a cron_{job_id}_{ts} sid, or None."""
+        if not sid.startswith('cron_'):
+            return None
+        parts = sid.split('_')
+        if len(parts) < 3:
+            return None
+        return _cron_job_names().get(parts[1])
+
+    # get_last_workspace() reads up to two files + an is_dir()/remote probe and
+    # returns the SAME active workspace for every projected row, so calling it
+    # per row was redundant I/O on the cold sidebar build (#4842; mirrors the
+    # #4718 hoist on the Claude Code path). Resolve it once for this scan.
+    _cli_workspace_cache: list = [None]  # list-as-cell; None = not yet resolved
+    def _cli_workspace():
+        if _cli_workspace_cache[0] is None:
+            try:
+                _cli_workspace_cache[0] = str(get_last_workspace(profile=_cli_profile))
+            except TypeError:
+                _cli_workspace_cache[0] = str(get_last_workspace())
+        return _cli_workspace_cache[0]
+
+    _webhook_pid_cache: list[str | None] = [None]
+    def _webhook_pid():
+        if _webhook_pid_cache[0] is None:
+            _webhook_pid_cache[0] = ensure_webhook_project(profile=_cli_profile)
+        return _webhook_pid_cache[0]
+
+    # The live project catalog for THIS SCAN'S profile, read lazily and at most
+    # once per scan (same [resolved, value] cell pattern as _cron_pid above, for
+    # the same #4842 reason: a per-row load_projects() is a cold-sidebar I/O
+    # blowup).
+    #
+    # Scoped to ``_cli_profile`` — the profile whose state.db this scan is
+    # reading — not to the process-wide active profile. The all-profiles view
+    # calls this loader once per profile context in a single request, so the
+    # active-profile catalog would misread another profile's LIVE assignment as
+    # unresolvable and drop the row from the payload (#6659 review finding 3).
+    _known_project_ids_cache: list = [False, frozenset()]
+    def _known_project_ids() -> frozenset[str]:
+        if not _known_project_ids_cache[0]:
+            _known_project_ids_cache[0] = True
+            try:
+                _known_project_ids_cache[1] = profile_scoped_project_ids(_cli_profile)
+            except Exception:
+                logger.debug("Project catalog read failed for CLI projection", exc_info=True)
+        return _known_project_ids_cache[1]
+
+    def _resolved_project_id(raw) -> str | None:
+        """A state.db assignment, or None when its project no longer resolves.
+
+        Coercing an unresolved (deleted or cross-profile) id to None BEFORE
+        either cap runs is what keeps the row in the default "Unassigned" window
+        instead of exiling it to a ``default_hidden`` row whose project chip does
+        not exist any more — the mirror of the bug this PR fixes (#6659).
+        """
+        project_id = str(raw or '').strip()
+        if not project_id:
+            return None
+        return project_id if project_id in _known_project_ids() else None
+
+    def _state_row_project_id(sid: str, source: str | None) -> str | None:
+        """Dedicated system-source chip for a background row, else None.
+
+        cron and webhook own an auto-provisioned project; kanban deliberately
+        does not, so it falls through to None (upstream behaviour) and is
+        reachable through the normal sidebar list instead of a chip.
+        """
+        if is_cron_session(sid, source):
+            return _cron_pid()
+        if is_webhook_session(sid, source):
+            return _webhook_pid()
+        return None
+
+    # Sidecar-carried assignments, memoized per sid for this scan.
+    # _state_projection_sidecar_metadata is already stat-cached, but
+    # _interactive_row_project_id is called several times per row (budget
+    # seeding, the unassigned count, the projection), and one os.stat per call
+    # per row is the kind of cold-sidebar I/O #4842 removed.
+    _sidecar_pid_cache: dict[str, str | None] = {}
+    def _sidecar_row_project_id(sid: str) -> str | None:
+        if sid not in _sidecar_pid_cache:
+            _sidecar_pid_cache[sid] = _state_projection_sidecar_metadata(sid).get('project_id')
+        return _sidecar_pid_cache[sid]
+
+    def _interactive_row_project_id(row: dict) -> str | None:
+        """Project chip for an interactive (CLI/TUI/ACP) state.db row.
+
+        Single resolved value for both the cap decisions below and the projected
+        payload, so the code that budgets a row and the code that renders it can
+        never disagree about which project it belongs to.
+
+        The WebUI sidecar is consulted when state.db carries no assignment,
+        because ``/api/session/move`` writes ``project_id`` onto the sidecar ONLY
+        — nothing writes ``state.db.sessions.project_id``. Without this the
+        "``CLI_VISIBLE_SESSION_LIMIT`` unassigned conversations" guarantee counted
+        a WebUI-side assignment as unassigned while the route (which sees the
+        sidecar's value through ``all_sessions()``) classified the same
+        conversation as ASSIGNED, so three moved sessions silently shortened
+        everyone's sidebar to 17 rows (#6659 review finding 2). state.db wins when
+        it has an assignment of its own: it is the agent's own record.
+
+        Background sources keep the system-chip answer even when a
+        ``source_filter`` routes them through this loop, so one kanban row cannot
+        report a resolved ``project_id`` here and ``None`` from its own bounded
+        second pass further down.
+        """
+        sid = row['id']
+        source = row.get('source')
+        if (
+            str(source or '').strip().lower() in BACKGROUND_CLI_SOURCES
+            or is_cron_session(sid, source)
+            or is_webhook_session(sid, source)
+        ):
+            return _state_row_project_id(sid, source)
+        resolved = _resolved_project_id(row.get('project_id'))
+        if resolved is None:
+            resolved = _resolved_project_id(_sidecar_row_project_id(sid))
+        return resolved
+
+    profile_value = _cli_profile or 'default'
+    # A deleted WebUI session is tombstoned (see _record_webui_deleted_session_tombstone)
+    # so recovery/audit/claim treat it as gone. The sidebar's own state.db projection
+    # must honor the same tombstone, or a deleted WebUI session reappears here as an
+    # "Agent" ghost the moment non-WebUI sessions are shown (#5498, second path). Only
+    # suppress genuine WebUI rows with no live sidecar — a re-created/re-imported sid
+    # (live {sid}.json) always beats a stale tombstone.
+    try:
+        _deleted_webui_tombstone = _load_webui_deleted_session_tombstone()
+    except Exception:
+        _deleted_webui_tombstone = frozenset()
+    state_rows = read_importable_agent_session_rows(
+        db_path,
+        limit=visible_session_limit if visible_session_limit is not None else (
+            CRON_PROJECT_CHIP_LIMIT if source_filter == 'cron'
+            else WEBHOOK_PROJECT_CHIP_LIMIT if source_filter == 'webhook'
+            else KANBAN_PROJECT_CHIP_LIMIT if source_filter == 'kanban'
+            else CLI_VISIBLE_SESSION_LIMIT
+        ),
+        log=logger,
+        # Background sources have independent bounded passes below. Keeping them
+        # out of this 20-row interactive window prevents a busy worker source
+        # (especially kanban) from evicting every CLI/TUI/ACP conversation.
+        # Spelled as a literal on purpose: tests/test_issue2841_show_cron_sessions_toggle.py
+        # reads this line as source text. Must stay equal to
+        # INTERACTIVE_WINDOW_EXCLUDED_CLI_SOURCES (pinned by
+        # test_background_source_exclusion_literal_matches_the_constant).
+        exclude_sources=("cron", "webhook", "kanban", "oneshot") if source_filter is None else None,
+        include_sources=None if source_filter is None else (source_filter,),
+        **({'session_ids': session_ids} if session_ids is not None else {}),
+    )
+    if source_filter is None:
+        # The interactive window above is a MIXED budget of assigned and
+        # unassigned conversations, and it truncates by recency. Two bounded
+        # recovery passes repair the two ways that loses a conversation:
+        #   1. an assigned conversation older than the window is unreachable even
+        #      though its project chip still claims it;
+        #   2. every assigned row inside the window spends a slot the sidebar
+        #      owes to an unassigned conversation (#6659 review findings 1-2).
+        # Both passes are keyed on the LOGICAL conversation (lineage), never the
+        # raw row, so compression segments cannot consume either budget.
+        # The assigned recovery pass skips only the true background sources, so
+        # a one-shot run filed under a project stays reachable from its chip.
+        # The unassigned refill skips one-shot runs too: refilling the window
+        # with them would undo #8265.
+        interactive_excluded = BACKGROUND_CLI_SOURCES
+        unassigned_refill_excluded = INTERACTIVE_WINDOW_EXCLUDED_CLI_SOURCES
+        first_pass_count = len(state_rows)
+        represented_rows: dict[str, dict] = {}
+
+        def _lineage_ids(row: dict) -> list[str]:
+            return [
+                str(value)
+                for key in ("id", "_lineage_root_id", "_lineage_tip_id")
+                if (value := row.get(key))
+            ]
+
+        def _merge_state_row(row: dict) -> bool:
+            """Add ``row`` unless its lineage is already represented.
+
+            Returns True only when a NEW logical conversation was added, which is
+            what lets recovery pass 1 spend its per-project budget on
+            conversations rather than rows. An already represented lineage is
+            upgraded in place: the recovery pass sees the same conversation
+            carrying its resolved project assignment, and the projection loop
+            must read that richer row. Pass 2 needs no budget of its own (its
+            query limit is the bound) and ignores the result.
+
+            "Upgrade" is one-way. Overwriting a row that already carries a
+            RESOLVED project_id with a projection that has none would delete the
+            chip this whole function exists to restore — and swap the row's
+            identity from the lineage tip back to its root. Pass 2 projects the
+            same conversations as pass 1 without the assignment context, so it
+            must never be able to win that race.
+            """
+            lineage_ids = _lineage_ids(row)
+            existing = next(
+                (represented_rows[value] for value in lineage_ids if value in represented_rows),
+                None,
+            )
+            if existing is not None:
+                if (
+                    _resolved_project_id(row.get('project_id')) is not None
+                    or _resolved_project_id(existing.get('project_id')) is None
+                ):
+                    # Either the incoming row adds an assignment, or the row on
+                    # file has none to lose: overwriting cannot drop a chip.
+                    existing.clear()
+                    existing.update(row)
+                for value in lineage_ids:
+                    represented_rows[value] = existing
+                return False
+            state_rows.append(row)
+            for value in lineage_ids:
+                represented_rows[value] = row
+            return True
+
+        for row in state_rows:
+            for value in _lineage_ids(row):
+                represented_rows.setdefault(value, row)
+
+        # --- Recovery pass 1: project-assigned conversations the recent window
+        # truncated. Bounded PER PROJECT (see PROJECT_ASSIGNED_CLI_LIMIT) so a
+        # chip can reveal its project's history without any one project growing
+        # the payload without limit. Skipped entirely when the profile has no
+        # projects at all — nothing could resolve, so the query would be waste.
+        #
+        # Two tiers, because a per-project BUDGET on top of one global recency
+        # window is not a per-project bound: a project that owns the whole window
+        # leaves every other project unrepresented. So the global query runs
+        # first (the only cost most profiles pay), and only if it came back
+        # saturated does a project-scoped follow-up top up the projects it
+        # starved. Worst case per build: 1 global query + 1 GROUP BY probe +
+        # one project-scoped query per starved project, each bounded to that
+        # project's remaining budget (whose sum the scan ceiling bounds).
+        known_project_ids = _known_project_ids() if project_assigned_limit is not False else frozenset()
+        if (
+            project_assigned_limit is not False
+            and known_project_ids
+            and _state_db_supports_project_ids(db_path)
+        ):
+            project_count = max(len(known_project_ids), 1)
+            per_project_limit = (
+                None if project_assigned_limit is None
+                else max(0, int(project_assigned_limit))
+            )
+            # Every project gets an EQUAL share of the global scan ceiling. The
+            # share only bites past PROJECT_ASSIGNED_CLI_SCAN_CEILING /
+            # PROJECT_ASSIGNED_CLI_LIMIT projects, and it is what keeps the
+            # recovered payload bounded (<= the ceiling) while making a project's
+            # allowance independent of how loud its neighbours are.
+            effective_limit = (
+                None if per_project_limit is None
+                else min(
+                    per_project_limit,
+                    max(1, PROJECT_ASSIGNED_CLI_SCAN_CEILING // project_count),
+                )
+            )
+            query_limit = (
+                None if effective_limit is None
+                else min(
+                    effective_limit * project_count,
+                    PROJECT_ASSIGNED_CLI_SCAN_CEILING,
+                )
+            )
+            try:
+                # An assigned conversation ALREADY inside the recent window
+                # occupies one of its project's slots, so this pass tops each
+                # project UP TO the bound instead of stacking a second bound on
+                # top of the window.
+                kept_per_project: dict[str, int] = {}
+                for row in state_rows:
+                    seeded_project_id = _interactive_row_project_id(row)
+                    if seeded_project_id is not None:
+                        kept_per_project[seeded_project_id] = (
+                            kept_per_project.get(seeded_project_id, 0) + 1
+                        )
+
+                def _spend_assigned_rows(rows: list[dict]) -> None:
+                    """Merge ``rows`` into the window under the per-project budget."""
+                    for row in rows:
+                        project_id = _resolved_project_id(row.get('project_id'))
+                        if project_id is None:
+                            # A deleted/cross-profile id is not an assignment.
+                            # Leave the row to the normal window so it stays
+                            # reachable under "Unassigned" (#6659 finding 3).
+                            continue
+                        if (
+                            effective_limit is not None
+                            and kept_per_project.get(project_id, 0) >= effective_limit
+                        ):
+                            continue
+                        if _merge_state_row(row):
+                            # Spend the budget on LOGICAL conversations only: a
+                            # row that merely upgrades an already-represented
+                            # lineage (a compression segment, or a window row
+                            # learning its assignment) costs its project nothing.
+                            kept_per_project[project_id] = (
+                                kept_per_project.get(project_id, 0) + 1
+                            )
+
+                # One global newest-first query covers every profile whose whole
+                # assigned history fits in the window — the overwhelmingly common
+                # case, and the only query most builds pay.
+                global_rows, global_window_exhausted = cast(
+                    tuple[list[dict], bool],
+                    read_importable_agent_session_rows(
+                        db_path,
+                        limit=query_limit,
+                        log=logger,
+                        exclude_sources=interactive_excluded,
+                        project_assignment='assigned',
+                        return_window_exhaustion=True,
+                    ),
+                )
+                _spend_assigned_rows(global_rows)
+
+                # A full logical result truncates by recency, as does a result
+                # that stays short only because the final raw candidate window
+                # was consumed by compression/visibility projection.  In either
+                # case older rows can still exist, so only then pay the GROUP BY
+                # probe that identifies projects needing a scoped top-up. A short
+                # result from an unfilled raw window has seen every candidate and
+                # keeps the one-global-query fast path.
+                if (
+                    effective_limit
+                    and query_limit
+                    and (
+                        len(global_rows) >= query_limit
+                        or global_window_exhausted
+                    )
+                ):
+                    # One GROUP BY over sessions.project_id (no join, no lineage
+                    # recursion) says which projects still own rows this pass has
+                    # not delivered, so the follow-up queries below are paid only
+                    # for projects that can actually be starved — not one per
+                    # registered project.
+                    owed_rows = read_assigned_project_row_counts(
+                        db_path,
+                        log=logger,
+                        exclude_sources=interactive_excluded,
+                    )
+                    starved = sorted(
+                        (kept_per_project.get(project_id, 0), project_id)
+                        for project_id, row_count in owed_rows.items()
+                        if project_id in known_project_ids
+                        and kept_per_project.get(project_id, 0) < effective_limit
+                        and row_count > kept_per_project.get(project_id, 0)
+                    )
+                    # Neediest first (fewest conversations delivered, then id for
+                    # a deterministic order). EVERY starved project is served: a
+                    # fixed per-build project cap would leave every project past
+                    # it unreachable on each rebuild — the very starvation this
+                    # pass exists to repair (greptile P1 on #6659). The per-build
+                    # cost stays bounded because each query is limited to one
+                    # project's remaining budget (sum <= the scan ceiling) and
+                    # only fires when the global window was saturated.
+                    #
+                    # The WIDENING below is rationed per PASS instead (greptile
+                    # P1 on #6659): `remaining` bounds each project's FIRST
+                    # query, but a retry that jumps to `query_limit` is not
+                    # bounded by the project's own share at all, so granting it
+                    # to every starved project made a build scan
+                    # len(starved) * query_limit — an order of magnitude past
+                    # the ceiling on a profile with ten compression-heavy
+                    # projects. One aggregate pool caps the scoped reading of
+                    # a pass at a constant multiple of `query_limit` however
+                    # many projects are starved.
+                    # Only the widening is rationed; the first query of every
+                    # starved project is never skipped, which is what keeps the
+                    # completeness guarantee above intact.
+                    #
+                    # (greptile P1, 2026-09-22 re-review) The pool is debited
+                    # only for what a retry reads BEYOND the project's own
+                    # first-query width — `widened - scoped_limit`, not the
+                    # whole `widened` grant. Debiting the whole grant spent the
+                    # entire pool on the first starved project whose window
+                    # merely touched its own 8x oversample: it read
+                    # `grant - share` extra rows but was billed the full grant,
+                    # so every later starved project lost its retry and its
+                    # older conversations stayed absent from its sidebar on
+                    # every rebuild. With incremental debits a later project
+                    # retries whenever real reads have left it pool; if an
+                    # earlier project genuinely read the pool down to zero,
+                    # that was real scan work — the aggregate bound, not a
+                    # reservation, is what caps the pass. The bound is
+                    # `3 * query_limit`: every starved project's first query
+                    # sums to at most `query_limit`, a retrying project re-reads
+                    # at most its own first width again, and the funded
+                    # increments sum to at most the pool — still constant in
+                    # the number of starved projects, which is what retires the
+                    # original `len(starved) * query_limit` blow-up.
+                    widening_budget = query_limit
+                    for starved_index, (_kept, project_id) in enumerate(starved):
+                        remaining = effective_limit - kept_per_project.get(project_id, 0)
+                        if remaining <= 0:
+                            continue
+                        # A scoped query carries a raw candidate window of its
+                        # own, and compression segments plus the post-projection
+                        # visibility filters are spent from that window BEFORE
+                        # the logical slice. A lineage-heavy project can
+                        # therefore come back short with its window fully
+                        # consumed and older assigned conversations of its own
+                        # still waiting behind it. Without the exhaustion signal
+                        # the loop would advance to the next project and leave
+                        # this one under-delivered on every rebuild — the same
+                        # failure the global query already guards against
+                        # (greptile P1 on #6659). Re-query once, widened to the
+                        # project's own width plus whatever the pass's widening
+                        # pool still has, which is what bounds the retry at the
+                        # PASS level instead of per project (greptile P1 on
+                        # #6659).
+                        scoped_limit = remaining
+                        while True:
+                            scoped_rows, scoped_window_exhausted = cast(
+                                tuple[list[dict], bool],
+                                read_importable_agent_session_rows(
+                                    db_path,
+                                    limit=scoped_limit,
+                                    log=logger,
+                                    exclude_sources=interactive_excluded,
+                                    project_assignment='assigned',
+                                    project_ids=(project_id,),
+                                    return_window_exhaustion=True,
+                                ),
+                            )
+                            _spend_assigned_rows(scoped_rows)
+                            if (
+                                not scoped_window_exhausted
+                                # A binding window on a project that is now
+                                # full needs no second query, and neither does
+                                # one that cannot be widened any further.
+                                or kept_per_project.get(project_id, 0)
+                                >= effective_limit
+                                or scoped_limit >= query_limit
+                            ):
+                                break
+                            # (greptile P1, 2026-09-22 re-review) Each
+                            # retry is funded by a FAIR SHARE of what the
+                            # pool still holds — one slice per starved
+                            # project not yet tried, so later projects
+                            # always keep pool for their own first retry.
+                            # The retry goes to `scoped_limit + share`:
+                            # debiting the whole grant spent the entire
+                            # pool on the first starved project whose
+                            # window merely touched its own 8x oversample
+                            # and left every later one unfunded, but
+                            # granting `min(query_limit, pool)` whole also
+                            # let the first project READ the pool down to
+                            # zero — every project whose raw window is
+                            # consumed re-reads its own width once before
+                            # delivering, so an honest retry must buy
+                            # roughly one more width. The share converges
+                            # there in a few bounded steps; anything still
+                            # short after the pool is spent stays for the
+                            # next build — the alternative is the
+                            # per-project grant that made the pass scan
+                            # `len(starved) * query_limit` (the original
+                            # greptile P1 on #6659).
+                            pool_share = (
+                                widening_budget
+                                // max(len(starved) - starved_index, 1)
+                            )
+                            if pool_share <= 0:
+                                # The pool is spent: no further starved
+                                # project's retry can be funded. Whatever a
+                                # project could not reach this pass stays
+                                # for the next build — the alternative is
+                                # buying reads nobody budgeted for.
+                                break
+                            widened = min(
+                                query_limit, scoped_limit + pool_share
+                            )
+                            widening_budget -= widened - scoped_limit
+                            scoped_limit = widened
+            except (OSError, sqlite3.Error) as exc:
+                projection_complete = False
+                logger.warning(
+                    "Optional project-assigned recovery pass unavailable at %s: %s",
+                    db_path,
+                    exc,
+                )
+            except Exception:
+                logger.debug("Project-assigned CLI recovery pass failed", exc_info=True)
+
+        # --- Recovery pass 2: top the interactive window back up to
+        # CLI_VISIBLE_SESSION_LIMIT *unassigned* conversations. Only runs when
+        # the window came up short AND something other than an empty database
+        # can explain it: either it was saturated, or assigned conversations
+        # inside it displaced unassigned candidates. A profile with no
+        # assignments and a small state.db still pays nothing.
+        unassigned_target = (
+            visible_session_limit if visible_session_limit is not None
+            else CLI_VISIBLE_SESSION_LIMIT
+        )
+
+        def _count_unassigned() -> int:
+            """Conversations in the window this projection calls unassigned.
+
+            Recomputed after every refill query instead of trusted from before
+            it: the classification depends on the sidecar, so only the rows in
+            hand can answer it. Cheap to repeat — both inputs
+            (``_sidecar_row_project_id``, ``_known_project_ids``) are memoized
+            for the scan, so no pass re-reads a file (#4842).
+            """
+            return sum(
+                1 for row in state_rows if _interactive_row_project_id(row) is None
+            )
+
+        unassigned_seen = _count_unassigned()
+        # A sidecar-carried assignment is invisible to the SQL 'unassigned'
+        # filter (state.db still says NULL), so the refill query would spend
+        # that many of its own slots re-fetching conversations this pass already
+        # classified as assigned and already represents. Widen the FIRST query by
+        # that count so it can actually reach the older unassigned conversations
+        # the moved rows displaced (#6659 review finding 2). It is only the first
+        # estimate — the moved conversations this window cannot see yet are what
+        # the re-examination loop below is for.
+        sidecar_only_assigned = sum(
+            1 for row in state_rows
+            if _interactive_row_project_id(row) is not None
+            and _resolved_project_id(row.get('project_id')) is None
+        )
+        if (
+            unassigned_target
+            and unassigned_seen < unassigned_target
+            and (
+                first_pass_count >= unassigned_target
+                # A short MIXED first pass can still be under-delivering: the
+                # narrower unassigned-only query reaches conversations the mixed
+                # candidate window spent on assigned rows and segments.
+                or unassigned_seen < first_pass_count
+            )
+        ):
+            try:
+                # ONE pre-computed allowance is the wrong shape. It is derived
+                # from the rows fetched BEFORE the refill, but the refill reaches
+                # OLDER conversations, and those can carry sidecar-only
+                # assignments of their own — each of which spends an unassigned
+                # slot again, the exact failure the widening exists to remove.
+                # (Three moves at the bottom edge of a 30-conversation database
+                # delivered 19 rows and never fetched the 20th conversation;
+                # eleven straddling the boundary delivered 15.)
+                #
+                # So the refill re-classifies ITS OWN result and widens again
+                # while the window is short. Bounds, per PROFILE CONTEXT (not per
+                # sidebar build: all_profiles=1 runs this loader once per context,
+                # so an N-profile view pays N times everything below):
+                #   * at most UNASSIGNED_CLI_REFILL_MAX_QUERIES queries;
+                #   * none of them reading deeper than the scan ceiling;
+                #   * and it stops early the moment the window is full or the
+                #     filter has demonstrably nothing deeper to give.
+                # Guarantee: the window is filled whenever at least
+                # ``unassigned_target`` of the newest ceiling
+                # state.db-unassigned conversations are still unassigned once
+                # their sidecars are read — the last query reads exactly that
+                # band. Past that the sidebar is honestly short (a shortfall the
+                # database itself imposes) instead of unbounded work.
+                #
+                # What that costs, stated at its WORST rather than its best. The
+                # window this loop must deliver is 20 rows; the best case is a
+                # single query carrying 24 of them, and quoting that as the
+                # trade-off understates it by an order of magnitude:
+                #   * PAYLOAD. Every refill row is merged into the projection and
+                #     travels on, so the surplus is trimmed by the sidebar cap
+                #     only AFTER it has been read, sidecar-stat()ed and (on
+                #     /api/sessions/gateway/stream, which snapshots the uncapped
+                #     list) serialised. A shape that keeps the window short
+                #     through all three estimates reaches the forced ceiling
+                #     query, and the model then carries the whole band — up to
+                #     scan_ceiling (200) conversations, nearly all of them
+                #     unassigned, to hand the sidebar 20. The widening below is
+                #     what keeps ordinary shapes off that path; it does not, and
+                #     cannot, remove it, because the ceiling read is exactly what
+                #     the guarantee above is made of.
+                #   * I/O. "No query deeper than 200 conversations" is a LOGICAL
+                #     depth. read_importable_agent_session_rows oversamples raw
+                #     rows by CANDIDATE_WINDOW_MULTIPLIERS = (8, 32) to survive
+                #     compression segments, so a ceiling-width query touches
+                #     200 * 8 = 1600 raw rows, and 200 * 32 = 6400 when the first
+                #     window is consumed and re-widened. Per profile context.
+                # Cheaper than any of it: project-filtered server pagination, or
+                # recording WebUI-side moves in state.db so the SQL filter stops
+                # lying to this pass.
+                query_limit = unassigned_target + sidecar_only_assigned
+                # A caller-supplied window wider than the ceiling still gets its
+                # first query at full width — the ceiling bounds the WIDENING,
+                # it does not shrink the requested window.
+                scan_ceiling = max(UNASSIGNED_CLI_REFILL_SCAN_CEILING, query_limit)
+                queries_left = UNASSIGNED_CLI_REFILL_MAX_QUERIES
+                while queries_left > 0:
+                    queries_left -= 1
+                    if queries_left == 0:
+                        # Out of estimates: pay one query at the ceiling rather
+                        # than hand back a short window after guessing three
+                        # times. This is the only query allowed to over-read, and
+                        # the ceiling is what bounds it.
+                        query_limit = scan_ceiling
+                    refill_rows, refill_window_exhausted = cast(
+                        tuple[list[dict], bool],
+                        read_importable_agent_session_rows(
+                            db_path,
+                            limit=query_limit,
+                            log=logger,
+                            exclude_sources=unassigned_refill_excluded,
+                            project_assignment='unassigned',
+                            return_window_exhaustion=True,
+                        ),
+                    )
+                    for row in refill_rows:
+                        _merge_state_row(row)
+                    unassigned_seen = _count_unassigned()
+                    shortfall = unassigned_target - unassigned_seen
+                    if (
+                        shortfall <= 0
+                        or query_limit >= scan_ceiling
+                        # A short result from an UNFILLED raw candidate window has
+                        # already seen every conversation this filter can reach,
+                        # so a wider query would re-read the same rows for
+                        # nothing. A short result whose raw window WAS consumed
+                        # (by compression segments) is the opposite: widening the
+                        # limit re-widens that window, so it is worth another go.
+                        or (
+                            len(refill_rows) < query_limit
+                            and not refill_window_exhausted
+                        )
+                    ):
+                        break
+                    # Widen GEOMETRICALLY, not by one row at a time. Up to three
+                    # candidate widths; the widest of the ones that apply wins:
+                    #   * query_limit + shortfall — the exact width needed if
+                    #     every conversation deeper than the current one is
+                    #     unassigned. It is the FLOOR: always strictly wider, so
+                    #     the loop cannot stall, and it is exact (no over-read)
+                    #     when the moved conversations are clustered.
+                    #   * query_limit + query_limit // queries_left — GEOMETRIC
+                    #     growth, paced by the budget that is left. The floor alone
+                    #     advances by only the shortfall, so a handful of moves
+                    #     clustered just below the window edge crawls (21, 23, 25)
+                    #     until every estimate is spent and the forced ceiling read
+                    #     does the job anyway: 200 rows fetched to deliver 20. The
+                    #     step grows as the budget shrinks (width/3, then width/2)
+                    #     because a too-narrow LAST estimate costs the whole ceiling
+                    #     read, while a too-wide one costs only its own surplus.
+                    #     Those eight clustered moves now finish at (21, 28).
+                    #   * ceil(target * query_limit / unassigned_seen) — the width
+                    #     implied by the moved SHARE observed so far, for moves
+                    #     spread through the history. Without it, a database where
+                    #     every other conversation was moved would close the gap
+                    #     by halves and need ~log2(target) queries.
+                    # That last term applies ONLY when this window found at least
+                    # one still-unassigned conversation. With zero, the share is
+                    # undefined, and guarding the divisor with max(seen, 1)
+                    # evaluated it as target * query_limit (20 * 40 = 800, clamped
+                    # to the ceiling): every profile that had moved >= 21 of its
+                    # newest conversations jumped straight to a full 200-row read
+                    # where the 60-row floor would have filled the window. Zero
+                    # unassigned rows is not evidence about density, so the
+                    # geometric step — not a degenerate ratio — is what carries it.
+                    # The price of escalating smoothly is that a profile whose
+                    # newest ceiling band is ENTIRELY moved now spends its whole
+                    # budget (40, 60, 90, 200) climbing to the ceiling it was
+                    # always going to need, instead of two queries. That is the
+                    # deliberate side of the trade: an extra narrow query costs SQL
+                    # only, while an early-and-wrong wide query costs payload — and
+                    # payload is read, sidecar-stat()ed and serialised. And a
+                    # cluster deeper than the last estimate can reach — measured at
+                    # 23+ moves sitting just under the window edge, where the three
+                    # estimates are 21, 28, 42 — still ends on the ceiling read, as
+                    # it did before: that is the guarantee doing its job, not the
+                    # estimate failing.
+                    next_query_limit = max(
+                        query_limit + shortfall,
+                        query_limit + query_limit // max(queries_left, 1),
+                    )
+                    if unassigned_seen > 0:
+                        next_query_limit = max(
+                            next_query_limit,
+                            -(  # ceil(target * width / unassigned)
+                                -unassigned_target * query_limit // unassigned_seen
+                            ),
+                        )
+                    query_limit = min(scan_ceiling, next_query_limit)
+            except (OSError, sqlite3.Error) as exc:
+                projection_complete = False
+                logger.warning(
+                    "Optional unassigned refill pass unavailable at %s: %s",
+                    db_path,
+                    exc,
+                )
+            except Exception:
+                logger.debug("Unassigned CLI refill pass failed", exc_info=True)
+
+    for row in state_rows:
+        sid = row['id']
+        raw_ts = row['last_activity'] or row['started_at']
+        # Prefer the CLI session's own profile from the DB; fall back to
+        # the active CLI profile so sidebar filtering works either way.
+        profile = profile_value  # CLI DB has no profile column; use active profile
+
+        _source = row['source'] or 'cli'
+        # Honor the deleted-WebUI tombstone: a WebUI row the user deleted must
+        # not resurface in this projection (the #5498 ghost). Live sidecar wins.
+        if (
+            _source == 'webui'
+            and sid in _deleted_webui_tombstone
+            and not (SESSION_DIR / f"{sid}.json").exists()
+        ):
+            continue
+        _source_meta = normalize_agent_session_source(_source)
+        _title = row['title']
+        if not _title and _source == 'cron':
+            # Look up the human-friendly cron job name (cron_{job_id}_{ts}) from
+            # the once-parsed jobs.json map instead of re-reading the file here.
+            _title = _cron_title_from_jobs(sid) or _title
+        # If a WebUI JSON file exists for this session (e.g. previously
+        # imported or renamed in the sidebar), prefer its UI-owned metadata over
+        # the state.db projection. This keeps archived cron/tool/API runs hidden
+        # even when all_sessions() omits the hidden sidecar and the state row is
+        # re-injected from Hermes state.db (#4397).
+        _sidecar_meta = _state_projection_sidecar_metadata(sid)
+        if _sidecar_meta.get('title'):
+            _title = _sidecar_meta['title']
+        if _sidecar_meta.get('archived') is not None:
+            _archived = bool(_sidecar_meta['archived'])
+        else:
+            _archived = bool(row.get('archived'))
+        _display_title = _title or f'{_source.title()} Session'
+        cli_sessions.append({
+            'session_id': sid,
+            'title': _display_title,
+            'workspace': _cli_workspace(),
+            'model': row['model'] or None,
+            'message_count': row['message_count'] or row['actual_message_count'] or 0,
+            'created_at': row['started_at'],
+            'updated_at': raw_ts,
+            'pinned': False,
+            'archived': _archived,
+            'project_id': _interactive_row_project_id(row),
+            'profile': profile,
+            'source_tag': _source,
+            'raw_source': row.get('raw_source') or _source_meta.get('raw_source'),
+            'user_id': row.get('user_id'),
+            'chat_id': row.get('chat_id') or row.get('origin_chat_id'),
+            'chat_type': row.get('chat_type'),
+            'thread_id': row.get('thread_id'),
+            'session_key': row.get('session_key'),
+            'platform': row.get('platform'),
+            'session_source': row.get('session_source') or _source_meta.get('session_source'),
+            'source_label': row.get('source_label') or _source_meta.get('source_label'),
+            'parent_session_id': row.get('parent_session_id'),
+            'parent_title': row.get('parent_title'),
+            'parent_source': row.get('parent_source'),
+            'relationship_type': row.get('relationship_type'),
+            '_parent_lineage_root_id': row.get('_parent_lineage_root_id'),
+            'end_reason': row.get('end_reason'),
+            'actual_message_count': row.get('actual_message_count'),
+            'user_message_count': row.get('actual_user_message_count'),
+            '_lineage_root_id': row.get('_lineage_root_id'),
+            '_lineage_tip_id': row.get('_lineage_tip_id'),
+            '_compression_segment_count': row.get('_compression_segment_count'),
+            'is_cli_session': is_cli_session_row({**row, **_source_meta}),
+        })
+
+    if source_filter is not None:
+        return _result()
+
+    def _optional_source_rows(label: str, **kwargs):
+        """Read one additive source pass without discarding primary rows."""
+        nonlocal projection_complete
+        try:
+            return read_importable_agent_session_rows(db_path, **kwargs)
+        except (OSError, sqlite3.Error) as exc:
+            projection_complete = False
+            logger.warning(
+                "Optional %s state.db projection unavailable at %s: %s",
+                label,
+                db_path,
+                exc,
+            )
+            return ()
+
+    # --- Second pass: fetch cron sessions that may have been squeezed out
+    # of the default window by more-recent non-cron sessions.
+    # The normal sidebar query caps at CLI_VISIBLE_SESSION_LIMIT (20) rows;
+    # once 20 newer sessions exist, older cron runs vanish from the payload
+    # before _include_project_hidden_background_sidebar_sessions can rescue
+    # them (#3172).  A separate, higher-capped cron-only pass ensures they
+    # stay addressable under their project chip.
+    if cron_project_limit is not False:
+        existing_sids = {s['session_id'] for s in cli_sessions}
+        try:
+            for row in _optional_source_rows(
+                "cron",
+                limit=cron_project_limit,
+                log=logger,
+                exclude_sources=None,
+                include_sources=("cron",),
+            ):
+                sid = row['id']
+                if sid in existing_sids:
+                    continue
+                _source = row['source'] or 'cli'
+                if _source != 'cron':
+                    continue
+                raw_ts = row['last_activity'] or row['started_at']
+                _title = row['title']
+                if not _title:
+                    # Friendly cron job name from the once-parsed jobs.json map.
+                    _title = _cron_title_from_jobs(sid) or _title
+                _sidecar_meta = _state_projection_sidecar_metadata(sid)
+                if _sidecar_meta.get('title'):
+                    _title = _sidecar_meta['title']
+                if _sidecar_meta.get('archived') is not None:
+                    _archived = bool(_sidecar_meta['archived'])
+                else:
+                    _archived = bool(row.get('archived'))
+                _display_title = _title or 'Cron Session'
+                cli_sessions.append({
+                    'session_id': sid,
+                    'title': _display_title,
+                    'workspace': _cli_workspace(),
+                    'model': row['model'] or None,
+                    'message_count': row['message_count'] or row['actual_message_count'] or 0,
+                    'created_at': row['started_at'],
+                    'updated_at': raw_ts,
+                    'pinned': False,
+                    'archived': _archived,
+                    'project_id': _cron_pid(),
+                    'profile': profile_value,
+                    'source_tag': 'cron',
+                    'raw_source': row.get('raw_source'),
+                    'user_id': row.get('user_id'),
+                    'chat_id': row.get('chat_id') or row.get('origin_chat_id'),
+                    'chat_type': row.get('chat_type'),
+                    'thread_id': row.get('thread_id'),
+                    'session_key': row.get('session_key'),
+                    'platform': row.get('platform'),
+                    'session_source': row.get('session_source'),
+                    'source_label': row.get('source_label'),
+                    'parent_session_id': row.get('parent_session_id'),
+                    'parent_title': row.get('parent_title'),
+                    'parent_source': row.get('parent_source'),
+                    'relationship_type': row.get('relationship_type'),
+                    '_parent_lineage_root_id': row.get('_parent_lineage_root_id'),
+                    'end_reason': row.get('end_reason'),
+                    'actual_message_count': row.get('actual_message_count'),
+                    'user_message_count': row.get('actual_user_message_count'),
+                    '_lineage_root_id': row.get('_lineage_root_id'),
+                    '_lineage_tip_id': row.get('_lineage_tip_id'),
+                    '_compression_segment_count': row.get('_compression_segment_count'),
+                    'is_cli_session': is_cli_session_row(row),
+                })
+                existing_sids.add(sid)
+        except Exception:
+            logger.debug("Cron project-chip second pass failed", exc_info=True)
+
+    # --- Second pass: fetch webhook sessions that may have been squeezed out
+    # of the default window. They stay hidden from the default sidebar but must
+    # remain addressable under the Webhooks project chip.
+    if webhook_project_limit is not False:
+        existing_sids = {s['session_id'] for s in cli_sessions}
+        try:
+            for row in _optional_source_rows(
+                "webhook",
+                limit=webhook_project_limit,
+                log=logger,
+                exclude_sources=None,
+                include_sources=("webhook",),
+            ):
+                sid = row['id']
+                if sid in existing_sids:
+                    continue
+                _source = row['source'] or 'webhook'
+                if _source != 'webhook':
+                    continue
+                _source_meta = normalize_agent_session_source(_source)
+                raw_ts = row['last_activity'] or row['started_at']
+                _title = row['title']
+                _sidecar_meta = _state_projection_sidecar_metadata(sid)
+                if _sidecar_meta.get('title'):
+                    _title = _sidecar_meta['title']
+                if _sidecar_meta.get('archived') is not None:
+                    _archived = bool(_sidecar_meta['archived'])
+                else:
+                    _archived = bool(row.get('archived'))
+                _display_title = _title or 'Webhook Session'
+                cli_sessions.append({
+                    'session_id': sid,
+                    'title': _display_title,
+                    'workspace': _cli_workspace(),
+                    'model': row['model'] or None,
+                    'message_count': row['message_count'] or row['actual_message_count'] or 0,
+                    'created_at': row['started_at'],
+                    'updated_at': raw_ts,
+                    'pinned': False,
+                    'archived': _archived,
+                    'project_id': _webhook_pid(),
+                    'profile': profile_value,
+                    'source_tag': 'webhook',
+                    'raw_source': row.get('raw_source') or _source_meta.get('raw_source'),
+                    'user_id': row.get('user_id'),
+                    'chat_id': row.get('chat_id') or row.get('origin_chat_id'),
+                    'chat_type': row.get('chat_type'),
+                    'thread_id': row.get('thread_id'),
+                    'session_key': row.get('session_key'),
+                    'platform': row.get('platform'),
+                    'session_source': row.get('session_source') or _source_meta.get('session_source'),
+                    'source_label': row.get('source_label') or _source_meta.get('source_label'),
+                    'parent_session_id': row.get('parent_session_id'),
+                    'parent_title': row.get('parent_title'),
+                    'parent_source': row.get('parent_source'),
+                    'relationship_type': row.get('relationship_type'),
+                    '_parent_lineage_root_id': row.get('_parent_lineage_root_id'),
+                    'end_reason': row.get('end_reason'),
+                    'actual_message_count': row.get('actual_message_count'),
+                    'user_message_count': row.get('actual_user_message_count'),
+                    '_lineage_root_id': row.get('_lineage_root_id'),
+                    '_lineage_tip_id': row.get('_lineage_tip_id'),
+                    '_compression_segment_count': row.get('_compression_segment_count'),
+                    'is_cli_session': is_cli_session_row({**row, **_source_meta}),
+                })
+                existing_sids.add(sid)
+        except Exception:
+            logger.debug("Webhook project-chip second pass failed", exc_info=True)
+
+    # --- Second pass: fetch kanban sessions without letting a kanban-heavy
+    # state.db consume the interactive CLI_VISIBLE_SESSION_LIMIT window.
+    if kanban_project_limit is not False:
+        existing_sids = {s['session_id'] for s in cli_sessions}
+        try:
+            for row in _optional_source_rows(
+                "kanban",
+                limit=kanban_project_limit,
+                log=logger,
+                exclude_sources=None,
+                include_sources=("kanban",),
+            ):
+                sid = row['id']
+                if sid in existing_sids:
+                    continue
+                _source = row['source'] or 'kanban'
+                if _source != 'kanban':
+                    continue
+                _source_meta = normalize_agent_session_source(_source)
+                raw_ts = row['last_activity'] or row['started_at']
+                _title = row['title']
+                _sidecar_meta = _state_projection_sidecar_metadata(sid)
+                if _sidecar_meta.get('title'):
+                    _title = _sidecar_meta['title']
+                if _sidecar_meta.get('archived') is not None:
+                    _archived = bool(_sidecar_meta['archived'])
+                else:
+                    _archived = bool(row.get('archived'))
+                cli_sessions.append({
+                    'session_id': sid,
+                    'title': _title or 'Kanban Session',
+                    'workspace': _cli_workspace(),
+                    'model': row['model'] or None,
+                    'message_count': row['message_count'] or row['actual_message_count'] or 0,
+                    'created_at': row['started_at'],
+                    'updated_at': raw_ts,
+                    'pinned': False,
+                    'archived': _archived,
+                    'project_id': _state_row_project_id(sid, _source),
+                    'profile': profile_value,
+                    'source_tag': 'kanban',
+                    'raw_source': row.get('raw_source') or _source_meta.get('raw_source'),
+                    'user_id': row.get('user_id'),
+                    'chat_id': row.get('chat_id') or row.get('origin_chat_id'),
+                    'chat_type': row.get('chat_type'),
+                    'thread_id': row.get('thread_id'),
+                    'session_key': row.get('session_key'),
+                    'platform': row.get('platform'),
+                    'session_source': row.get('session_source') or _source_meta.get('session_source'),
+                    'source_label': row.get('source_label') or _source_meta.get('source_label'),
+                    'parent_session_id': row.get('parent_session_id'),
+                    'parent_title': row.get('parent_title'),
+                    'parent_source': row.get('parent_source'),
+                    'relationship_type': row.get('relationship_type'),
+                    '_parent_lineage_root_id': row.get('_parent_lineage_root_id'),
+                    'end_reason': row.get('end_reason'),
+                    'actual_message_count': row.get('actual_message_count'),
+                    'user_message_count': row.get('actual_user_message_count'),
+                    '_lineage_root_id': row.get('_lineage_root_id'),
+                    '_lineage_tip_id': row.get('_lineage_tip_id'),
+                    '_compression_segment_count': row.get('_compression_segment_count'),
+                    'is_cli_session': is_cli_session_row({**row, **_source_meta}),
+                })
+                existing_sids.add(sid)
+        except Exception:
+            logger.debug("Kanban sidebar second pass failed", exc_info=True)
+
+    return _result()
+
+
+def get_cli_session_by_id(
+    session_id: str,
+    source_filter: str,
+    *,
+    all_profiles: bool = False,
+) -> dict:
+    """Resolve one ``source_filter`` session by id, outside any recency window.
+
+    The sidebar views are bounded by recency, so a session the user explicitly
+    opens can sit outside every one of them (an older one-shot run, #8265). This
+    reads exactly that row from the active profile's state.db, or from every
+    profile's when ``all_profiles`` is set, through the same projection the
+    sidebar uses, so the row carries the same profile, workspace and project
+    fields. Returns {} when no profile owns it.
+    """
+    sid = str(session_id or '').strip()
+    source = _normalize_cli_session_source_filter(source_filter)
+    if not sid or not source:
+        return {}
+    if all_profiles:
+        contexts, _cache_key = _all_profiles_cli_contexts()
+    else:
+        hermes_home, db_path, cli_profile, _cache_key = _resolve_cli_sessions_context(source)
+        contexts = [(hermes_home, db_path, cli_profile)]
+    for ctx_home, ctx_db_path, ctx_profile in contexts:
+        try:
+            rows = _load_cli_sessions_uncached(
+                ctx_home,
+                ctx_db_path,
+                ctx_profile,
+                source_filter=source,
+                include_claude_code=False,
+                session_ids=(sid,),
+            )
+        except (OSError, sqlite3.Error):
+            logger.debug("Explicit CLI session lookup skipped profile %s", ctx_profile, exc_info=True)
+            continue
+        for row in rows:
+            if row.get('session_id') == sid:
+                return row
+    return {}
+
+
+def get_cli_sessions(
+    source_filter=None,
+    *,
+    all_profiles: bool = False,
+    include_claude_code: bool = True,
+) -> list:
+    """Read CLI sessions from the agent's SQLite store and return them as
+    dicts in a format the WebUI sidebar can render alongside local sessions.
+
+    Returns empty list if the SQLite DB is missing or any error occurs -- the
+    bridge is purely additive and never crashes the WebUI.
+    """
+    source_filter = _normalize_cli_session_source_filter(source_filter)
+    contexts = []
+    if all_profiles:
+        contexts, context_cache_key = _all_profiles_cli_contexts()
+        stable_context_cache_key = tuple(
+            (_path_cache_key(ctx_home), str(ctx_profile or 'default'))
+            for ctx_home, _ctx_db_path, ctx_profile in contexts
+        )
+        db_path = "all profiles"
+        # #4842: freeze the volatile per-profile state.db component while
+        # streaming so a streamed message row in one profile doesn't bust the
+        # all-profiles CLI cache and re-run every profile's heavy projection.
+        _streaming_marker = _cli_sessions_streaming_freeze_marker()
+        if _streaming_marker is not None:
+            context_cache_key = ('streaming-frozen', _streaming_marker)
+        cache_key = (
+            'all_profiles',
+            source_filter or '',
+            bool(include_claude_code),
+            context_cache_key,
+            stable_context_cache_key,
+            _path_cache_key(_default_claude_code_projects_dir()),
+            _path_stat_cache_key(_default_claude_code_projects_dir()),
+            _path_stat_cache_key(SESSION_INDEX_FILE),
+        )
+    else:
+        resolve_kwargs = {}
+        resolve_supports_include_claude_code = _callable_accepts_include_claude_code(
+            _resolve_cli_sessions_context
+        )
+        if resolve_supports_include_claude_code:
+            resolve_kwargs['include_claude_code'] = include_claude_code
+        hermes_home, db_path, cli_profile, cache_key = _resolve_cli_sessions_context(
+            source_filter,
+            **resolve_kwargs,
+        )
+        if not resolve_supports_include_claude_code:
+            cache_key = cache_key + (bool(include_claude_code),)
+    ttl = _cli_sessions_cache_ttl_seconds()
+    now = time.monotonic()
+
+    def _load_sessions() -> list | _CliSessionsLoadResult:
+        loader_supports_include_claude_code = _callable_accepts_include_claude_code(
+            _load_cli_sessions_uncached
+        )
+        loader_supports_completeness = _callable_accepts_keyword(
+            _load_cli_sessions_uncached, '_with_completeness'
+        )
+        if all_profiles:
+            merged: list[dict] = []
+            unavailable_error = None
+            successful_profiles = 0
+            optional_incomplete = False
+            for ctx_home, ctx_db_path, ctx_profile in contexts:
+                load_kwargs = {
+                    # NOTE: visible_session_limit=None is NOT "unbounded" for the
+                    # interactive pass — it resolves to CLI_VISIBLE_SESSION_LIMIT
+                    # above, so this view truncates assigned conversations by
+                    # recency exactly like the single-profile one and needs the
+                    # same recovery passes. project_assigned_limit therefore keeps
+                    # its default per-project bound here. Only the three limits
+                    # below are handed straight to the reader as ``limit=``, where
+                    # None really does mean unbounded.
+                    'source_filter': source_filter,
+                    'visible_session_limit': None,
+                    'project_assigned_limit': PROJECT_ASSIGNED_CLI_LIMIT,
+                    'cron_project_limit': None,
+                    'webhook_project_limit': None,
+                    'kanban_project_limit': None,
+                }
+                if loader_supports_include_claude_code:
+                    # Claude Code is global rather than profile-owned. Scan it
+                    # once below so profile 0 availability cannot suppress it.
+                    load_kwargs['include_claude_code'] = False
+                if loader_supports_completeness:
+                    load_kwargs['_with_completeness'] = True
+                try:
+                    profile_loaded = _load_cli_sessions_uncached(
+                        ctx_home,
+                        ctx_db_path,
+                        ctx_profile,
+                        **load_kwargs,
+                    )
+                    if isinstance(profile_loaded, _CliSessionsLoadResult):
+                        profile_rows = profile_loaded.sessions
+                        optional_incomplete = optional_incomplete or (
+                            not profile_loaded.complete
+                            and profile_loaded.fresh_when_incomplete
+                        )
+                    else:
+                        profile_rows = profile_loaded
+                    merged.extend(profile_rows)
+                    successful_profiles += 1
+                except (OSError, sqlite3.Error) as _profile_err:
+                    unavailable_error = _profile_err
+                    logger.warning(
+                        "get_cli_sessions() skipped unavailable profile %s at %s: %s",
+                        ctx_profile or 'default',
+                        ctx_db_path,
+                        _profile_err,
+                    )
+            external_complete = True
+            if include_claude_code and source_filter in (None, CLAUDE_CODE_SOURCE):
+                try:
+                    merged.extend(get_claude_code_sessions())
+                except Exception as _claude_err:
+                    external_complete = False
+                    logger.warning(
+                        "get_cli_sessions() Claude Code scan failed: %s",
+                        _claude_err,
+                    )
+            return _CliSessionsLoadResult(
+                merged,
+                complete=(
+                    unavailable_error is None
+                    and successful_profiles == len(contexts)
+                    and external_complete
+                    and not optional_incomplete
+                ),
+                fresh_when_incomplete=(
+                    optional_incomplete
+                    and unavailable_error is None
+                    and successful_profiles == len(contexts)
+                    and external_complete
+                ),
+            )
+        load_kwargs: dict = {'source_filter': source_filter}
+        if loader_supports_include_claude_code:
+            load_kwargs['include_claude_code'] = include_claude_code
+        if loader_supports_completeness:
+            load_kwargs['_with_completeness'] = True
+        return _load_cli_sessions_uncached(
+            hermes_home,
+            db_path,
+            cli_profile,
+            **load_kwargs,
+        )
+
+    if ttl > 0:
+        stale_sessions = None
+        stale_stamp = None
+        with _CLI_SESSIONS_CACHE_LOCK:
+            cached_entry = _CLI_SESSIONS_CACHE.get(cache_key)
+            if cached_entry is not None:
+                if len(cached_entry) == 3:
+                    cached_expires_at, cached_stamp, cached_sessions = cached_entry
+                else:
+                    cached_expires_at, cached_sessions = cached_entry
+                    cached_stamp = _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
+                if cached_stamp != _CLI_SESSIONS_CACHE_INVALIDATION_VERSION:
+                    _CLI_SESSIONS_CACHE.pop(cache_key, None)
+                elif cached_expires_at > now:
+                    # LRU: a fresh hit is the most-recently-used entry.
+                    _CLI_SESSIONS_CACHE.move_to_end(cache_key)
+                    return _copy_cli_sessions(cached_sessions)
+                else:
+                    stale_sessions = _copy_cli_sessions(cached_sessions)
+                    stale_stamp = cached_stamp
+        event, is_owner = _cli_sessions_cache_claim_rebuild(cache_key)
+        if is_owner:
+            try:
+                invalidation_stamp = _cli_sessions_cache_invalidation_stamp()
+                return _load_and_cache_cli_sessions(
+                    cache_key=cache_key,
+                    ttl=ttl,
+                    invalidation_stamp=invalidation_stamp,
+                    load_sessions=_load_sessions,
+                    stale_sessions=stale_sessions,
+                    stale_stamp=stale_stamp,
+                    all_profiles=all_profiles,
+                    db_path=db_path,
+                )
+            finally:
+                _cli_sessions_cache_done(cache_key, event)
+        return _reload_cli_sessions_after_inflight(
+            cache_key=cache_key,
+            ttl=ttl,
+            stale_sessions=stale_sessions,
+            stale_stamp=stale_stamp,
+            load_sessions=_load_sessions,
+            all_profiles=all_profiles,
+            db_path=db_path,
+        )
+
+    try:
+        loaded = _load_sessions()
+        return loaded.sessions if isinstance(loaded, _CliSessionsLoadResult) else loaded
+    except Exception as _cli_err:
+        logger.warning(
+            "get_cli_sessions() failed — check state.db schema or path (%s): %s",
+            "all profiles" if all_profiles else db_path, _cli_err,
+        )
+        return []
+
+def _json_loads_if_string(value):
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return value
+
+
+@dataclass(frozen=True)
+class StateDBSessionMessagesSnapshot:
+    """Internal message projection paired with its durable SQLite revision."""
+
+    messages: list
+    revision: dict | None
+
+
+def _state_db_session_messages_result(messages, revision, *, with_revision):
+    if with_revision:
+        return StateDBSessionMessagesSnapshot(messages=list(messages or []), revision=revision)
+    return list(messages or [])
+
+
+def _state_db_active_rows_digest(rows) -> str:
+    """Match the Agent fence for model-facing fields mutable in place."""
+    digest = hashlib.sha256()
+    stamped = False
+    for row in rows:
+        keys = row.keys()
+        api_content = row['api_content'] if 'api_content' in keys else None
+        if api_content is None:
+            continue
+        stamped = True
+        digest.update(
+            json.dumps(
+                [row['id'], api_content],
+                ensure_ascii=False,
+                separators=(',', ':'),
+                default=str,
+            ).encode('utf-8', errors='surrogatepass')
+        )
+        digest.update(b'\n')
+    return digest.hexdigest() if stamped else ''
+
+
+# hermes_state stores list/dict message content (multimodal parts) as a
+# sentinel-prefixed JSON string because sqlite3 binds only scalars; see
+# hermes_state._CONTENT_JSON_PREFIX and _decode_content(). This module reads
+# that table with its own SQL, so it must apply the same decode. Without it an
+# image part's base64 data URI reaches the transcript as literal text -- a
+# single unbreakable ~65k-character run -- and WebKit computes min-content
+# width by scanning every line-break position, pinning a core for minutes.
+#
+# The decode deliberately does NOT widen `content` beyond the one shape the
+# rest of the WebUI already accepts:
+#   * list roots only. A dict root would reach _getCachedRender() unchanged and
+#     _renderCacheKey() would call text.slice() on an object, blanking the turn.
+#   * no non-finite numbers. Python emits NaN/Infinity, which the browser's
+#     JSON.parse() rejects, breaking the whole /api/session response.
+# Anything else is returned as the original string, exactly as before.
+_STATE_DB_CONTENT_JSON_PREFIX = "\x00json:"
+
+
+def _is_valid_image_part_payload(part) -> bool:
+    """Explicit per-type payload validation for an image content part."""
+    part_type = part.get("type")
+    if part_type in ("image_url", "input_image"):
+        ref = part.get("image_url")
+        if isinstance(ref, dict):
+            ref = ref.get("url")
+        if isinstance(ref, str) and ref.strip():
+            return True
+        file_id = part.get("file_id")
+        return part_type == "input_image" and isinstance(file_id, str) and bool(file_id.strip())
+    if part_type == "image":
+        source = part.get("source")
+        if not isinstance(source, dict):
+            return False
+        if source.get("type") == "base64":
+            data = source.get("data")
+            return (
+                isinstance(data, str)
+                and bool(data)
+                and isinstance(source.get("media_type"), str)
+            )
+        if source.get("type") == "url":
+            url = source.get("url")
+            return isinstance(url, str) and bool(url.strip())
+        return False
+    return False
+
+
+def _is_supported_content_part_list(parts) -> bool:
+    """True only for lists the current WebUI will actually render.
+
+    The shared JS readers keep text parts and discard every image part:
+    ``msgContent()`` joins the text parts and trims, and ``_messageIsRenderable()``
+    hides the row when that is empty. This projection supplies no attachments,
+    so image parts do not render from it either. A list is therefore decoded only
+    when it carries non-whitespace text to show. Image-only lists, and lists with
+    a malformed image part, stay undecoded so the row cannot silently vanish.
+    """
+    if not parts:
+        return False
+    has_text = False
+    for part in parts:
+        if not isinstance(part, dict):
+            return False
+        part_type = part.get("type")
+        if not isinstance(part_type, str):
+            return False
+        if part_type == "text":
+            text = part.get("text")
+            if not isinstance(text, str):
+                return False
+            if text.strip():
+                has_text = True
+        elif part_type in _SESSION_MESSAGE_IMAGE_PART_TYPES:
+            if not _is_valid_image_part_payload(part):
+                return False
+        else:
+            return False
+    return has_text
+
+
+def _reject_non_finite_state_db_json_constant(value):
+    raise ValueError(f"unsupported JSON constant: {value}")
+
+
+def _parse_finite_state_db_json_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"unsupported JSON float: {value}")
+    return parsed
+
+
+def _decode_state_db_content(value):
+    """Decode the Agent's structured-content storage form without widening it.
+
+    Returns the original value unchanged for anything that is not a
+    sentinel-prefixed, finite, list-rooted payload.
+    """
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if not isinstance(value, str) or not value.startswith(_STATE_DB_CONTENT_JSON_PREFIX):
+        return value
+    try:
+        decoded = json.loads(
+            value[len(_STATE_DB_CONTENT_JSON_PREFIX):],
+            parse_constant=_reject_non_finite_state_db_json_constant,
+            parse_float=_parse_finite_state_db_json_float,
+        )
+    except Exception:
+        return value
+    if not isinstance(decoded, list) or not _is_supported_content_part_list(decoded):
+        return value
+    try:
+        # Prove the decoded value survives the trip to the browser before
+        # handing it on: re-serialisable, finite, UTF-8 encodable.
+        json.dumps(decoded, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except Exception:
+        return value
+    return decoded
+
+
+def _project_state_db_message(row, available, id_col, optional, *, include_row_identity=False):
+    """Authoritative state.db row → WebUI message projection (#6826 r4).
+
+    Shared by ``get_state_db_session_messages`` and the regeneration
+    single-snapshot helper so the bounded tail can never drift from the
+    canonical reader: JSON-decode content/tool_calls/reasoning payloads, omit
+    empty fields, keep durable row id private for provider replays and native
+    image projections, and apply ``tool_name → name``.
+    """
+    msg = {
+        'role': row['role'],
+        'content': _decode_state_db_content(row['content']),
+        'timestamp': row['timestamp'],
+    }
+    for col in optional:
+        if col not in row.keys():
+            continue
+        value = row[col]
+        if value in (None, ''):
+            continue
+        if col in {'tool_calls', 'reasoning_details', 'codex_reasoning_items', 'codex_message_items'}:
+            value = _json_loads_if_string(value)
+        msg[col] = value
+    native_image_projection = (
+        msg.get('role') == 'user'
+        and isinstance(msg.get('content'), str)
+        and '[screenshot]' in msg['content']
+    )
+    if (
+        id_col
+        and row['id'] is not None
+        and (
+            include_row_identity
+            or native_image_projection
+            or (
+                isinstance(msg.get('api_content'), str)
+                and msg['api_content']
+            )
+        )
+    ):
+        msg['_state_db_row_id'] = row['id']
+    if msg.get('role') == 'tool' and msg.get('tool_name') and not msg.get('name'):
+        msg['name'] = msg['tool_name']
+    return msg
+
+
+@overload
+def get_state_db_session_messages(
+    sid,
+    *,
+    stitch_continuations: bool = False,
+    profile=None,
+    since_timestamp=None,
+    include_inactive: bool = False,
+    limit=None,
+    include_row_identity: bool = False,
+    with_revision: Literal[False] = False,
+) -> list: ...
+
+
+@overload
+def get_state_db_session_messages(
+    sid,
+    *,
+    stitch_continuations: bool = False,
+    profile=None,
+    since_timestamp=None,
+    include_inactive: bool = False,
+    limit=None,
+    include_row_identity: bool = False,
+    with_revision: Literal[True],
+) -> StateDBSessionMessagesSnapshot: ...
+
+
+def get_state_db_session_messages(
+    sid,
+    *,
+    stitch_continuations: bool = False,
+    profile=None,
+    since_timestamp=None,
+    include_inactive: bool = False,
+    limit=None,
+    include_row_identity: bool = False,
+    with_revision: bool = False,
+):
+    """Read messages for a Hermes session from state.db.
+
+    When *profile* is supplied, reads from that profile's state.db; otherwise
+    falls back to the active profile's state.db.  This generic reader works for
+    any session source, including WebUI-origin sessions that were later updated
+    through another Hermes surface such as the Gateway API Server.  When
+    ``stitch_continuations`` is true it preserves the historical CLI/external-agent
+    behavior of walking compatible compression/close parent segments before reading
+    messages.
+
+    ``since_timestamp`` is an optional display-path optimization.  It limits the
+    raw state.db scan to rows at or after a sidecar-derived timestamp floor while
+    preserving the caller's normal merge/window logic.  Full-history callers must
+    leave it unset.
+
+    ``limit`` is an optional defensive row cap (applied after ORDER BY as a SQL
+    LIMIT). It is a BACKSTOP against a pathological/huge state.db materializing
+    unbounded rows into a Python list, NOT a semantic window: the display path
+    counts visible rows post-reconciliation, so a true window LIMIT here would
+    corrupt the sidecar/state.db merge (see _state_db_since_timestamp_for_limited_display,
+    which deliberately does NOT SQL-LIMIT raw rows for that reason). Callers that
+    need the full history for model-context reconstruction leave this unset.
+
+    When the messages table exposes an ``active`` column, inactive rows are
+    compacted/archived history and are intentionally excluded by default. WebUI
+    reconciliation feeds this reader straight into the next model context; pulling
+    ``active=0`` archive rows back in resurrects pre-compaction history and can
+    make every later turn re-trigger compression. Pass ``include_inactive=True``
+    only for explicit recovery/audit views.
+
+    ``with_revision=True`` returns a :class:`StateDBSessionMessagesSnapshot`.
+    Its revision is derived from the exact rows fetched by the same SQLite
+    query and is available only for an unbounded, active, current-segment read.
+    Existing callers keep the historical list return by default.
+
+    ``include_row_identity=True`` retains private durable row IDs for every
+    projected row. Cancelled-journal consumers use this to carry proven SQLite
+    successor identity through sidecar persistence; ordinary projections retain
+    their historical shape. Public/provider projections strip the private IDs.
+    """
+    try:
+        import sqlite3
+    except ImportError:
+        return _state_db_session_messages_result([], None, with_revision=with_revision)
+
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / 'state.db'
+    else:
+        db_path = _active_state_db_path()
+    if not db_path.exists():
+        return _state_db_session_messages_result([], None, with_revision=with_revision)
+
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(messages)")
+            available = {str(row['name']) for row in cur.fetchall()}
+            required = {'role', 'content', 'timestamp'}
+            if not required.issubset(available):
+                return _state_db_session_messages_result([], None, with_revision=with_revision)
+            optional = [
+                'tool_call_id',
+                'tool_calls',
+                'tool_name',
+                'reasoning',
+                'reasoning_details',
+                'codex_reasoning_items',
+                'reasoning_content',
+                'codex_message_items',
+                # Hermes Agent stores the exact provider-facing text here when
+                # it differs from the clean transcript content.  Keep this
+                # sidecar in the WebUI's internal history; the provider-safe
+                # projection strips it before any direct API request.
+                'api_content',
+            ]
+            id_col = ['id'] if 'id' in available else []
+            revision_cols = []
+            if with_revision:
+                if 'active' in available:
+                    revision_cols.append('active')
+                if 'api_content' in available:
+                    revision_cols.append('api_content')
+            selected = (
+                id_col
+                + ['role', 'content', 'timestamp']
+                + revision_cols
+                + [c for c in optional if c in available]
+            )
+
+            session_chain = [str(sid)]
+            if stitch_continuations:
+                cur.execute("PRAGMA table_info(sessions)")
+                session_cols = {str(row['name']) for row in cur.fetchall()}
+                if {'parent_session_id', 'end_reason', 'started_at', 'source'}.issubset(session_cols):
+                    # session_source/model_config carry the fork/delegate boundary
+                    # identity consumed by _is_continuation_session (#6931/#7021).
+                    # Select them when present so the branch-marker guard applies
+                    # to the stitch path too; older schemas degrade to NULL.
+                    identity_cols = []
+                    if 'session_source' in session_cols:
+                        identity_cols.append('session_source')
+                    else:
+                        identity_cols.append('NULL AS session_source')
+                    if 'model_config' in session_cols:
+                        identity_cols.append('model_config')
+                    else:
+                        identity_cols.append('NULL AS model_config')
+                    lineage_select = (
+                        "id, source, started_at, parent_session_id, ended_at, end_reason"
+                        + ", " + ", ".join(identity_cols)
+                    )
+                    cur.execute(
+                        f"""
+                        SELECT {lineage_select}
+                        FROM sessions
+                        WHERE id = ?
+                        """,
+                        (sid,),
+                    )
+                    rows_by_id = {}
+                    row = cur.fetchone()
+                    if row:
+                        rows_by_id[str(row['id'])] = dict(row)
+                        current_id = str(row['id'])
+                        seen = {current_id}
+                        for _ in range(20):
+                            current = rows_by_id.get(current_id)
+                            parent_id = current.get('parent_session_id') if current else None
+                            if not parent_id or parent_id in seen:
+                                break
+                            cur.execute(
+                                f"""
+                                SELECT {lineage_select}
+                                FROM sessions
+                                WHERE id = ?
+                                """,
+                                (parent_id,),
+                            )
+                            parent_row = cur.fetchone()
+                            if not parent_row:
+                                break
+                            parent_dict = dict(parent_row)
+                            rows_by_id[str(parent_row['id'])] = parent_dict
+                            if not _is_continuation_session(parent_dict, current):
+                                break
+                            session_chain.insert(0, str(parent_row['id']))
+                            current_id = str(parent_row['id'])
+                            seen.add(current_id)
+
+            placeholders = ', '.join('?' for _ in session_chain)
+            params = list(session_chain)
+            since_clause = ""
+            if since_timestamp is not None:
+                try:
+                    since_ts = float(since_timestamp)
+                except (TypeError, ValueError):
+                    since_ts = None
+                if since_ts is not None:
+                    since_clause = " AND (timestamp IS NULL OR timestamp >= ?)"
+                    params.append(since_ts)
+            active_clause = ""
+            if 'active' in available and not include_inactive:
+                active_clause = " AND (active IS NULL OR active != 0)"
+            durable_order_column = 'id' if 'id' in available else 'timestamp'
+            # Defensive row cap (backstop only — see docstring). Applied as a
+            # SQL LIMIT bound parameter (?) so the tail (newest) rows are
+            # retained and a pathological state.db can't materialize unbounded
+            # rows. None = unchanged full-history read for model-context callers.
+            limit_clause = ""
+            if limit is not None:
+                try:
+                    limit_int = max(1, int(limit))
+                except (TypeError, ValueError):
+                    limit_int = None
+                if limit_int is not None:
+                    # Keep the newest durable rows under the cap, then restore
+                    # canonical append order for the caller.
+                    limit_clause = f" ORDER BY {durable_order_column} DESC LIMIT ?"
+                    params.append(limit_int)
+            if limit_clause:
+                cur.execute(f"""
+                    SELECT * FROM (
+                        SELECT {', '.join(selected)}, session_id
+                        FROM messages
+                        WHERE session_id IN ({placeholders})
+                        {since_clause}
+                        {active_clause}
+                        {limit_clause}
+                    ) ORDER BY {durable_order_column} ASC
+                """, params)
+            else:
+                cur.execute(f"""
+                    SELECT {', '.join(selected)}, session_id
+                    FROM messages
+                    WHERE session_id IN ({placeholders})
+                    {since_clause}
+                    {active_clause}
+                    ORDER BY {durable_order_column} ASC
+                """, params)
+            rows = cur.fetchall()
+            revision = None
+            if (
+                with_revision
+                and 'id' in available
+                and 'active' in available
+                and len(session_chain) == 1
+                and str(session_chain[0]) == str(sid)
+                and since_timestamp is None
+                and not include_inactive
+                and limit is None
+                and all(row['active'] == 1 for row in rows)
+            ):
+                revision = {
+                    'session_id': str(sid),
+                    'active_message_count': len(rows),
+                    'max_active_message_id': max(
+                        (int(row['id']) for row in rows),
+                        default=0,
+                    ),
+                }
+                if 'api_content' in available:
+                    revision['active_rows_digest'] = _state_db_active_rows_digest(rows)
+
+            msgs = []
+            for row in rows:
+                msgs.append(
+                    _project_state_db_message(
+                        row, available, bool(id_col), optional,
+                        include_row_identity=include_row_identity,
+                    )
+                )
+    except Exception:
+        return _state_db_session_messages_result([], None, with_revision=with_revision)
+    return _state_db_session_messages_result(msgs, revision, with_revision=with_revision)
+
+
+def get_state_db_session_message_prefix_summary(
+    sid,
+    before_timestamp,
+    *,
+    profile=None,
+) -> dict | None:
+    """Return prefix timestamp counts, or ``None`` when they cannot be proven.
+
+    The projection intentionally avoids message content and tool-call columns so
+    callers can reject impossible prefix matches before materializing visible
+    identities. Missing databases are an authoritative empty prefix and are not
+    created by this read path.
+    """
+    try:
+        import sqlite3
+    except ImportError:
+        return None
+
+    if not sid:
+        return None
+    try:
+        before_ts = float(before_timestamp)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(before_ts):
+        return None
+
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / 'state.db'
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not db_path.exists():
+        return {"count": 0, "null_timestamp_count": 0}
+
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(messages)")
+            available = {str(row['name']) for row in cur.fetchall()}
+            if not {'session_id', 'timestamp'}.issubset(available):
+                return None
+            active_clause = ""
+            if 'active' in available:
+                active_clause = " AND (active IS NULL OR active != 0)"
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(CASE
+                        WHEN timestamp IS NOT NULL AND timestamp < ? THEN 1
+                    END) AS count,
+                    COUNT(CASE WHEN timestamp IS NULL THEN 1 END) AS null_timestamp_count
+                FROM messages
+                WHERE session_id = ?
+                {active_clause}
+                """,
+                (before_ts, str(sid)),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "count": int(row["count"]),
+                "null_timestamp_count": int(row["null_timestamp_count"]),
+            }
+    except Exception:
+        return None
+
+
+def get_state_db_session_message_keys_before_timestamp(
+    sid,
+    before_timestamp,
+    *,
+    profile=None,
+) -> list[tuple] | None:
+    """Return visible-identity keys before ``before_timestamp`` in DB order.
+
+    Missing timestamps are intentionally excluded because the bounded reader
+    keeps them with ``timestamp IS NULL OR timestamp >= ?``.  The caller uses
+    this as a conservative prefix-identity guard before taking the optimized
+    tail-read path, so schemas that cannot prove the merge-visible identity
+    force a full read.
+    """
+    try:
+        import sqlite3
+    except ImportError:
+        return None
+
+    if not sid:
+        return None
+    try:
+        before_ts = float(before_timestamp)
+    except (TypeError, ValueError):
+        return None
+
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / 'state.db'
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not db_path.exists():
+        return []
+
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(messages)")
+            available = {str(row['name']) for row in cur.fetchall()}
+            if not {'id', 'session_id', 'role', 'content', 'timestamp', 'tool_calls'}.issubset(available):
+                return None
+            api_content_select = ", api_content" if "api_content" in available else ""
+            cur.execute(
+                f"""
+                SELECT
+                    COALESCE(role, '') AS role,
+                    COALESCE(content, '') AS content,
+                    tool_calls{api_content_select}
+                FROM messages
+                WHERE session_id = ? AND timestamp IS NOT NULL AND timestamp < ?
+                ORDER BY timestamp ASC, id ASC
+                """,
+                (str(sid), before_ts),
+            )
+            return [
+                _session_message_visible_key(
+                    {
+                        "role": row["role"],
+                        # Same guarded decode as the projected tail: prefix and
+                        # tail keys must share one representation or the
+                        # prefix/tail collision proof can miss a genuine
+                        # repeated recovered turn.
+                        "content": _decode_state_db_content(row["content"]),
+                        "tool_calls": _json_loads_if_string(row["tool_calls"]),
+                        "api_content": row["api_content"] if "api_content" in available else None,
+                    },
+                    normalize_workspace_prefix=True,
+                )
+                for row in cur.fetchall()
+            ]
+    except Exception:
+        return None
+
+
+def get_state_db_regeneration_tail_snapshot(
+    sid,
+    floor,
+    *,
+    profile=None,
+):
+    """Return prefix proof + bounded tail from ONE read transaction (#6826 r3).
+
+    The regeneration guard must not suffer TOCTOU: the prefix summary, the
+    ordered prefix keys, and the bounded tail must come from the same SQLite
+    snapshot, otherwise a row inserted between the proof and the data read
+    can be silently omitted while the proof still authorizes the bounded path.
+
+    Returns ``None`` when a stable single-connection snapshot cannot be
+    obtained (callers must fall back to the full read). Otherwise returns::
+
+        {
+          "prefix": {"count": N, "null_timestamp_count": M},
+          "prefix_keys": [visible-key, ...],       # rows < floor, db order
+          "tail": [message-dict, ...],             # rows >= floor (bounded)
+          "tail_keys": [visible-key, ...],         # rows >= floor, db order
+        }
+    """
+    try:
+        import sqlite3
+    except ImportError:
+        return None
+
+    if not sid:
+        return None
+    try:
+        floor_ts = float(floor)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / 'state.db'
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not db_path.exists():
+        return {"prefix": {"count": 0, "null_timestamp_count": 0}, "prefix_keys": [], "tail": [], "tail_keys": []}
+
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA data_version")
+            dv_before = cur.fetchone()[0]
+            cur.execute("BEGIN")
+            cur.execute("PRAGMA table_info(messages)")
+            available = {str(row['name']) for row in cur.fetchall()}
+            if not {'session_id', 'role', 'content', 'timestamp'}.issubset(available):
+                cur.execute("ROLLBACK")
+                return None
+            active_clause = ""
+            if 'active' in available:
+                active_clause = " AND (active IS NULL OR active != 0)"
+            # durable order: id ASC when present (matches the canonical reader),
+            # else timestamp ASC
+            durable_order = 'id' if 'id' in available else 'timestamp'
+            # 1) prefix summary (rows with timestamp < floor)
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(CASE WHEN timestamp IS NOT NULL AND timestamp < ? THEN 1 END) AS count,
+                    COUNT(CASE WHEN timestamp IS NULL THEN 1 END) AS null_timestamp_count
+                FROM messages
+                WHERE session_id = ? {active_clause}
+                """,
+                (floor_ts, str(sid)),
+            )
+            row = cur.fetchone()
+            prefix = {
+                "count": int(row["count"]) if row else 0,
+                "null_timestamp_count": int(row["null_timestamp_count"]) if row else 0,
+            }
+            # 2) ordered prefix keys (rows < floor) in durable order
+            prefix_key_cols = "COALESCE(role,'') AS role, COALESCE(content,'') AS content"
+            if 'tool_calls' in available:
+                prefix_key_cols += ", tool_calls"
+            if 'api_content' in available:
+                prefix_key_cols += ", api_content"
+            prefix_key_sql = (
+                f"SELECT {prefix_key_cols} FROM messages "
+                "WHERE session_id = ? AND timestamp IS NOT NULL AND timestamp < ? "
+                f"{active_clause} ORDER BY {durable_order} ASC"
+            )
+            try:
+                cur.execute(prefix_key_sql, (str(sid), floor_ts))
+            except Exception:
+                cur.execute("ROLLBACK")
+                return None
+            prefix_keys = [
+                _session_message_visible_key({
+                    "role": r["role"],
+                    "content": _decode_state_db_content(r["content"]),
+                    "tool_calls": _json_loads_if_string(r["tool_calls"]) if "tool_calls" in r.keys() and r["tool_calls"] is not None else None,
+                    "api_content": r["api_content"] if "api_content" in r.keys() else None,
+                }, normalize_workspace_prefix=True)
+                for r in cur.fetchall()
+            ]
+            # 3) bounded tail (rows >= floor) with the canonical projection
+            optional = [
+                'tool_call_id', 'tool_calls', 'tool_name', 'reasoning',
+                'reasoning_details', 'codex_reasoning_items', 'reasoning_content',
+                'codex_message_items', 'api_content',
+            ]
+            tail_select = ['id', 'role', 'content', 'timestamp'] if 'id' in available else ['role', 'content', 'timestamp']
+            for col in optional + (['active'] if 'active' in available else []):
+                if col in available and col not in tail_select:
+                    tail_select.append(col)
+            tail_sql = (
+                f"SELECT {', '.join(tail_select)} FROM messages "
+                f"WHERE session_id = ? AND (timestamp IS NULL OR timestamp >= ?) {active_clause} "
+                f"ORDER BY {durable_order} ASC"
+            )
+            cur.execute(tail_sql, (str(sid), floor_ts))
+            tail_rows = [
+                _project_state_db_message(r, available, 'id' in available, optional)
+                for r in cur.fetchall()
+            ]
+            tail_keys = [
+                _session_message_visible_key(
+                    {
+                        "role": r.get("role"),
+                        "content": r.get("content"),
+                        "tool_calls": r.get("tool_calls"),
+                        "api_content": r.get("api_content"),
+                    },
+                    normalize_workspace_prefix=True,
+                )
+                for r in tail_rows
+            ]
+            cur.execute("COMMIT")
+            cur.execute("PRAGMA data_version")
+            dv_after = cur.fetchone()[0]
+            if dv_before != dv_after:
+                # a concurrent WAL commit landed during the proof → stale
+                # snapshot; refuse the bounded path (TOCTOU).
+                return None
+            return {
+                "prefix": prefix,
+                "prefix_keys": prefix_keys,
+                "tail": tail_rows,
+                "tail_keys": tail_keys,
+            }
+    except Exception:
+        return None
+
+
+def _reconciled_visible_count_for_sidebar(sid) -> int | None:
+    """Count visible rows in the reconciled sidecar+state.db transcript.
+
+    The sidebar growth overlay's authority for ``visible_message_count``
+    (#7882 re-gate round-3 must-fix 2): provenance-stamped reconciliation is
+    what the full save re-walks, so it is what the overlay must report. The
+    sidecar's own transcript already carries the hidden-row ``_source``
+    stamps (eager checkpoint) and its metadata prefix excludes hidden rows;
+    state.db rows appended past the sidecar arrive as plain user rows whose
+    provenance rides the session's pending fields.
+
+    Merges the sidecar's stamped transcript with freshly-read state.db rows
+    (pending provenance stamped exactly like the display path), then counts
+    non-hidden rows. Returns None when either source can't be read so the
+    caller falls back to the raw-delta arithmetic.
+
+    Bounded work: one metadata-only sidecar load + one state.db read for the
+    single session being overlaid (the growth guard already limits this to
+    rows whose count actually advanced), not a full transcript walk per
+    sidebar poll.
+    """
+    if not sid:
+        return None
+    try:
+        session = Session.load_metadata_only(str(sid))
+    except Exception:
+        session = None
+    if session is None or getattr(session, '_loaded_metadata_only', False):
+        # Metadata-only stubs carry messages=[] by contract; the sidecar
+        # transcript needs a full load (bounded to this one session).
+        try:
+            session = Session.load(str(sid))
+        except Exception:
+            return None
+    if session is None:
+        return None
+    try:
+        sidecar_messages = list(getattr(session, 'messages', None) or [])
+    except Exception:
+        return None
+    try:
+        state_messages = get_state_db_session_messages(
+            str(sid),
+            profile=getattr(session, 'profile', None),
+        )
+    except Exception:
+        # #7882 (greptile P2): a failed detailed read is NOT "no state rows".
+        # Converting it to [] makes the merge count the sidecar tail alone and
+        # the caller treats that as a successful recount — freezing the stale
+        # sidecar total even though the growth guard already saw newer state.db
+        # rows. Return None so the caller's raw-delta fallback runs instead.
+        return None
+    if not isinstance(state_messages, list):
+        return None
+    if not state_messages:
+        # #7882 (gate round-7 SILENT): the detailed reader itself swallows DB
+        # errors and returns [] (its internal try/except projects failures as
+        # an empty list), so the except above only catches caller-level
+        # failures. An empty read here is "unavailable", not a proved zero —
+        # falling through would merge the sidecar tail alone and return the
+        # stale sidecar count as a successful recount. None keeps the
+        # caller's growth fallback authoritative.
+        return None
+    if not sidecar_messages and not state_messages:
+        return None
+    try:
+        stamped = _stamp_pending_source_for_display(session, state_messages)
+    except Exception:
+        stamped = state_messages
+    try:
+        merged = merge_session_messages_append_only(
+            sidecar_messages,
+            stamped,
+            truncation_watermark=getattr(session, 'truncation_watermark', None),
+            truncation_boundary=getattr(session, 'truncation_boundary', None),
+        )
+    except Exception:
+        # Merge failure is the same contract as a failed read: no proved
+        # reconciled total exists, so None (fallback) — never the sidecar's
+        # own count, which can be older than the state.db rows the growth
+        # guard just observed (#7882 greptile P2).
+        return None
+    if not merged:
+        return None
+    return sum(
+        1 for m in merged
+        if isinstance(m, dict) and not is_hidden_transcript_row(m)
+    )
+
+
+def get_state_db_session_summary(sid, *, profile=None) -> dict:
+    """Return a cheap message count/timestamp summary for one state.db session."""
+    try:
+        import sqlite3
+    except ImportError:
+        return {"message_count": 0, "last_message_at": 0.0}
+
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / 'state.db'
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not sid or not db_path.exists():
+        return {"message_count": 0, "last_message_at": 0.0}
+
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(messages)")
+            available = {str(row['name']) for row in cur.fetchall()}
+            if 'session_id' not in available:
+                return {"message_count": 0, "last_message_at": 0.0}
+            if 'timestamp' in available:
+                cur.execute(
+                    "SELECT COUNT(*) AS message_count, MAX(timestamp) AS last_message_at "
+                    "FROM messages WHERE session_id = ?",
+                    (str(sid),),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"message_count": 0, "last_message_at": 0.0}
+                return {
+                    "message_count": max(0, int(row["message_count"] or 0)),
+                    "last_message_at": float(row["last_message_at"] or 0) if row["last_message_at"] is not None else 0.0,
+                }
+            cur.execute("SELECT COUNT(*) AS message_count FROM messages WHERE session_id = ?", (str(sid),))
+            row = cur.fetchone()
+            return {
+                "message_count": max(0, int(row["message_count"] or 0)) if row else 0,
+                "last_message_at": 0.0,
+            }
+    except Exception:
+        return {"message_count": 0, "last_message_at": 0.0}
+
+
+def _normalized_message_timestamp_for_key(value):
+    if value is None or value == "":
+        return ""
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not math.isfinite(timestamp):
+        # Keep malformed metadata from crashing key construction.  The
+        # reconciliation layer separately marks this row invalid so it cannot
+        # fall through to a weaker metadata-free match.
+        return f"<invalid:{value!r}>"
+    # Truncate to second-level granularity so that sub-second drift between
+    # the sidecar JSON write and the state.db created_at write does not cause
+    # the legacy dedup key to differ for the same logical message.
+    return str(int(timestamp))
+
+
+def _message_timestamp_as_float(msg):
+    if not isinstance(msg, dict):
+        return None
+    value = msg.get("timestamp")
+    if value is None or value == "":
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    return timestamp if math.isfinite(timestamp) else None
+
+
+def _session_message_api_content_key(msg: dict | None):
+    """Return the exact trusted provider sidecar used in duplicate identity."""
+    if not isinstance(msg, dict):
+        return None
+    value = msg.get("api_content")
+    return value if isinstance(value, str) and value else None
+
+
+def _session_message_key_with_sidecar(base_key: tuple, msg: dict) -> tuple:
+    """Append provider sidecar identity only when one is actually present.
+
+    The no-sidecar key shape is an internal compatibility surface used by
+    reconciliation tests and callers.  A present sidecar must extend that
+    identity so different provider bytes cannot collapse into one duplicate.
+    """
+    sidecar = _session_message_api_content_key(msg)
+    return base_key if sidecar is None else (*base_key, sidecar)
+
+
+_SESSION_MESSAGE_IMAGE_PART_TYPES = {"image", "image_url", "input_image"}
+_WEBUI_TRUSTED_AGENT_INPUT_FIELD = "_webui_trusted_agent_input_text"
+_WEBUI_UNMATCHED_NATIVE_IMAGE_MIRROR_FIELD = "_webui_unmatched_native_image_mirror"
+
+
+def _agent_durable_multimodal_content(msg: dict) -> str | None:
+    """Project one native image-bearing turn to Hermes Agent's stored text."""
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return None
+    normalized_parts = []
+    image_parts = 0
+    for part in content:
+        if not isinstance(part, dict):
+            return None
+        part_type = part.get("type")
+        if isinstance(part_type, str) and part_type in _SESSION_MESSAGE_IMAGE_PART_TYPES:
+            normalized_parts.append("[screenshot]")
+            image_parts += 1
+        elif part_type == "text":
+            text = part.get("text")
+            if not isinstance(text, str):
+                return None
+            normalized_parts.append(text)
+        else:
+            return None
+    if not image_parts:
+        return None
+    return " ".join("\n".join(normalized_parts).split())
+
+
+def _session_message_multimodal_mirror_key(
+    msg: dict,
+    *,
+    require_image_parts: bool = False,
+    require_scalar_mirror: bool = False,
+):
+    """Return exact cross-store identity for a native multimodal mirror.
+
+    The bridge exists to pair ONE rich image-bearing row with ONE scalar row
+    holding the Agent's stored projection of it. It must never pair two rich
+    rows: distinct image turns can project to the same "[screenshot] <text>"
+    string, so rich-to-rich matching collapses different images into one turn.
+    Callers pass ``require_image_parts`` on the rich side and
+    ``require_scalar_mirror`` on the scalar side to keep the pairing asymmetric.
+    """
+    if not isinstance(msg, dict):
+        return None
+    if require_image_parts and require_scalar_mirror:
+        return None
+    role = str(msg.get("role") or "").strip().lower()
+    if role != "user":
+        return None
+    raw_content = msg.get("content")
+    if require_scalar_mirror and not isinstance(raw_content, str):
+        return None
+    content = _agent_durable_multimodal_content(msg)
+    if require_image_parts and content is None:
+        return None
+    if content is None:
+        if not isinstance(raw_content, str):
+            return None
+        content = _normalized_session_message_content(msg)
+    timestamp, timestamp_valid = _message_exact_timestamp_details(msg)
+    if not timestamp_valid or timestamp is None:
+        return None
+    tool_calls = msg.get("tool_calls")
+    tool_calls_key = json.dumps(tool_calls, sort_keys=True, default=str) if tool_calls else ""
+    # api_content is checked as private identity below, not projected content:
+    # one store may carry the trusted provider sidecar while the other does not.
+    return (
+        "multimodal_mirror",
+        role,
+        content,
+        timestamp,
+        str(msg.get("tool_call_id") or ""),
+        str(msg.get("tool_name") or msg.get("name") or ""),
+        tool_calls_key,
+    )
+
+
+def _native_image_leading_text(message):
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return None
+    parts = []
+    for part in content:
+        if not isinstance(part, dict):
+            return None
+        part_type = str(part.get("type") or "").lower()
+        if part_type in _SESSION_MESSAGE_IMAGE_PART_TYPES:
+            return "\n".join(parts)
+        if part_type not in {"", "text", "input_text", "output_text"}:
+            return None
+        text = part.get("text", part.get("input_text", part.get("output_text", "")))
+        if not isinstance(text, str):
+            return None
+        parts.append(text)
+    return None
+
+
+def _stamp_pending_source_for_display(session, state_messages):
+    """Stamp the pending turn's ``_source`` onto unprovenanced state.db rows.
+
+    The Agent core appends the pending user row to state.db WITHOUT the
+    ``_source`` stamp — provenance lives only in the session's
+    ``pending_user_message``/``pending_user_source`` fields until the turn
+    settles. A reload that reads state.db during the deferred-save window
+    would otherwise adopt the row unstamped and render a hidden
+    ``delegation_wakeup`` handoff as a visible user bubble (#quiet-delegation
+    gate review; #7828 fixes the settle-side stamp, this fixes the projection
+    side). Rows are freshly read per request, so mutating them here is safe.
+    Timestamp identity mirrors ``_suppress_native_image_display_mirrors``:
+    the live worker recorded the exact ``persist_user_timestamp`` value, so an
+    exact match is authoritative.
+    """
+    if not state_messages:
+        return state_messages
+    source = str(getattr(session, "pending_user_source", None) or "")
+    if not source or source == "webui":
+        return state_messages
+    pending_started = getattr(session, "pending_started_at", None)
+    if not isinstance(pending_started, (int, float)) or pending_started <= 0:
+        return state_messages
+    if not str(getattr(session, "pending_user_message", None) or ""):
+        return state_messages
+    target_ts = float(pending_started)
+    for message in state_messages:
+        if not isinstance(message, dict) or message.get("_source"):
+            continue
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        ts, ts_valid = _message_exact_timestamp_details(message)
+        if ts_valid and ts == target_ts:
+            message["_source"] = source
+            attach_wakeup_display_meta(message, source)
+    return state_messages
+
+
+def _suppress_native_image_display_mirrors(
+    session,
+    state_messages,
+    *,
+    suppress_api_content=True,
+    suppress_pending_turn=True,
+):
+    """Drop proven pending Agent rows and native-image mirrors from display."""
+    if not state_messages:
+        return state_messages
+
+    if suppress_pending_turn:
+        identity = _validated_webui_pending_user_timestamp_identity(
+            session,
+            getattr(session, "_webui_pending_user_timestamp_identity", None),
+        )
+        if identity is not None:
+            # A matching timestamp is an Agent handoff identity only because
+            # the live worker recorded that this exact value was passed via
+            # persist_user_timestamp. If rows collide on it, hide the whole
+            # ambiguous bucket from display; model context retains every row.
+            pending_timestamp = identity[1]
+            state_messages = [
+                message for message in state_messages
+                if not (
+                    isinstance(message, dict)
+                    and str(message.get("role") or "").lower() == "user"
+                    and _message_exact_timestamp(message) == pending_timestamp
+                )
+            ]
+
+    display_messages = getattr(session, "messages", None) or []
+    context_messages = getattr(session, "context_messages", None) or []
+    if not display_messages or not context_messages or not state_messages:
+        return state_messages
+
+    display_by_token = collections.defaultdict(list)
+    context_by_token = collections.defaultdict(list)
+    for message in display_messages:
+        if isinstance(message, dict) and message.get("_active_turn_token"):
+            display_by_token[message["_active_turn_token"]].append(message)
+    for message in context_messages:
+        if isinstance(message, dict) and message.get("_active_turn_token"):
+            context_by_token[message["_active_turn_token"]].append(message)
+
+    display_row_id_counts = collections.Counter()
+    context_row_id_counts = collections.Counter()
+    for messages, counts in (
+        (display_messages, display_row_id_counts),
+        (context_messages, context_row_id_counts),
+    ):
+        for message in messages:
+            row_id, valid = _state_db_row_identity_details(message)
+            if valid and row_id is not None:
+                counts[row_id] += 1
+
+    from api.streaming import _submitted_user_text_matches
+
+    mirrors = collections.defaultdict(list)
+    for token, contexts in context_by_token.items():
+        displays = display_by_token.get(token, [])
+        for context in contexts:
+            trusted_input = context.get(_WEBUI_TRUSTED_AGENT_INPUT_FIELD)
+            leading_text = _native_image_leading_text(context)
+            if (
+                not isinstance(trusted_input, str)
+                or leading_text is None
+                or not _submitted_user_text_matches(leading_text, trusted_input)
+            ):
+                continue
+            key = _session_message_multimodal_mirror_key(
+                context,
+                require_image_parts=True,
+            )
+            if key is None:
+                continue
+            display = displays[0] if len(contexts) == len(displays) == 1 else None
+            display_link_valid = False
+            if display is not None and display.get("role") == "user":
+                context_ts, context_ts_valid = _message_exact_timestamp_details(context)
+                display_ts, display_ts_valid = _message_exact_timestamp_details(display)
+                display_link_valid = (
+                    context_ts_valid
+                    and display_ts_valid
+                    and context_ts is not None
+                    and display_ts == context_ts
+                    and _message_private_identity_compatible(display, context)
+                )
+            # Keep trusted rich candidates even when display linkage is
+            # ambiguous, so a matching scalar row is preserved unless its
+            # durable row id proves it is the exact Agent projection.
+            mirrors[key].append((context, display, display_link_valid))
+    if not mirrors:
+        return state_messages
+
+    row_id_counts = collections.Counter()
+    stable_id_counts = collections.Counter()
+    state_mirror_keys = []
+    for message in state_messages:
+        if not isinstance(message, dict):
+            state_mirror_keys.append(None)
+            continue
+        row_id, row_id_valid = _state_db_row_identity_details(message)
+        stable_id, stable_id_valid = _stable_message_identity_details(message)
+        if row_id_valid and row_id is not None:
+            row_id_counts[row_id] += 1
+        if stable_id_valid and stable_id is not None:
+            stable_id_counts[stable_id] += 1
+        state_mirror_keys.append(
+            _session_message_multimodal_mirror_key(
+                message,
+                require_scalar_mirror=True,
+            )
+        )
+
+    suppress = set()
+    marked = {}
+    for index, key in enumerate(state_mirror_keys):
+        if key is None or key not in mirrors:
+            continue
+        message = state_messages[index]
+        row_id, row_id_valid = _state_db_row_identity_details(message)
+        stable_id, stable_id_valid = _stable_message_identity_details(message)
+        contexts = mirrors[key]
+        matched = None
+        preserve_distinct_row = False
+        if len(contexts) == 1:
+            context, display, display_link_valid = contexts[0]
+            context_row_id, context_row_id_valid = _state_db_row_identity_details(context)
+            display_row_id, display_row_id_valid = _state_db_row_identity_details(display)
+            linked_context_row = (
+                display is not None
+                and display_link_valid
+                and context_row_id_valid
+                and display_row_id_valid
+                and context_row_id is not None
+                and context_row_id == display_row_id
+                and context_row_id_counts[context_row_id] == 1
+                and display_row_id_counts[display_row_id] == 1
+            )
+            if (
+                linked_context_row
+                and (not row_id_valid or row_id is None or row_id != context_row_id)
+                and (row_id is None or row_id_counts[row_id] == 1)
+                and stable_id_valid
+                and (stable_id is None or stable_id_counts[stable_id] == 1)
+            ):
+                preserve_distinct_row = True
+            if (
+                linked_context_row
+                and row_id_valid
+                and row_id is not None
+                and context_row_id == row_id
+                and row_id_counts[row_id] == 1
+                and stable_id_valid
+                and (stable_id is None or stable_id_counts[stable_id] == 1)
+                and _message_private_identity_compatible(context, message)
+            ):
+                matched = context
+        if (
+            matched is not None
+            and (suppress_api_content or not _session_message_api_content_key(message))
+        ):
+            suppress.add(index)
+        elif preserve_distinct_row:
+            marked[index] = {
+                **message,
+                _WEBUI_UNMATCHED_NATIVE_IMAGE_MIRROR_FIELD: True,
+            }
+    return [
+        marked.get(index, message)
+        for index, message in enumerate(state_messages)
+        if index not in suppress
+    ]
+
+
+# Per-call memo of structured-content identities. Reconciliation derives merge,
+# dedup, content and visible keys for every message, several per source, so a
+# large multimodal payload would otherwise be serialised once per key. The memo
+# is scoped to a single merge call (set/reset in
+# merge_session_messages_append_only) and keyed by object identity with the
+# object held alive, so a later call always recomputes after mutation and an id
+# can never be reused for a different list within one call.
+_STRUCTURED_IDENTITY_MEMO = contextvars.ContextVar(
+    "_STRUCTURED_IDENTITY_MEMO", default=None
+)
+
+
+def _canonical_structured_content(content) -> str:
+    """Canonical serialisation of structured content -- the expensive step."""
+    try:
+        return json.dumps(content, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        return repr(content)
+
+
+def _content_identity_for_key(content):
+    """Identity component for message content in every reconciliation key.
+
+    Non-list values key exactly as they always have: ``str(content or "")``.
+
+    Non-empty list content -- which reaches these paths once the state.db
+    sentinel is decoded -- gets an OUT-OF-BAND identity: a tuple, not a string.
+    No scalar can ever compare equal to it, so there is no in-band marker for a
+    message body to imitate. (An earlier revision tagged lists with a string
+    prefix; a scalar containing that prefix collided with the rich row.)
+
+    Merge, dedup, content and visible keys all derive structured content
+    through this one function so the discriminator cannot drift between them.
+    """
+    if not (isinstance(content, list) and content):
+        return str(content or "")
+    memo = _STRUCTURED_IDENTITY_MEMO.get()
+    if memo is not None:
+        hit = memo.get(id(content))
+        if hit is not None and hit[0] is content:
+            return hit[1]
+    identity = ("structured_content", _canonical_structured_content(content))
+    if memo is not None:
+        memo[id(content)] = (content, identity)
+    return identity
+
+
+def _session_message_merge_key(msg: dict):
+    if not isinstance(msg, dict):
+        return ("non_dict", repr(msg))
+    message_identity = msg.get("id") or msg.get("message_id")
+    if message_identity:
+        return _session_message_key_with_sidecar(
+            ("message_id", str(message_identity)), msg
+        )
+    # Include tool_calls so assistant messages that invoke different tools
+    # (but share identical empty content and same-second timestamp) are not
+    # collapsed by the merge-key guard at line ~4216.  Without this,
+    # all tool-calling messages map to the same legacy key and the
+    # timestamp<=max_sidecar_timestamp blanket-skip at line ~4218 drops
+    # every state.db tool-call after the first one registered by the sidecar.
+    _tc = msg.get("tool_calls")
+    _tc_key = json.dumps(_tc, sort_keys=True, default=str) if _tc else ""
+    return _session_message_key_with_sidecar((
+        "legacy",
+        str(msg.get("role") or ""),
+        _content_identity_for_key(msg.get("content")),
+        _normalized_message_timestamp_for_key(msg.get("timestamp")),
+        str(msg.get("tool_call_id") or ""),
+        str(msg.get("tool_name") or msg.get("name") or ""),
+        _tc_key,
+    ), msg)
+
+
+def _session_messages_have_prefix(messages, prefix) -> bool:
+    messages = list(messages or [])
+    prefix = list(prefix or [])
+    if len(prefix) > len(messages):
+        return False
+    for idx, expected in enumerate(prefix):
+        if _session_message_merge_key(messages[idx]) != _session_message_merge_key(expected):
+            return False
+    return True
+
+
+_SESSION_MESSAGE_DISPLAY_METADATA_KEYS = (
+    "_turnDuration",
+    "_turnTps",
+    "_turnUsage",
+    "_firstTokenMs",
+    "_usedModel",
+    "_gatewayRouting",
+    "_statusCard",
+    "_anchor_stream_id",
+    "_anchor_activity_scene",
+    # Map of absolute media path -> content-addressed snapshot digest, stamped
+    # at turn-settle time (api/media_snapshots.py) so historical previews keep
+    # showing the file bytes the turn emitted even after the file is
+    # overwritten in place. Display-only metadata: must survive the
+    # sidecar/state.db merge exactly like the other keys above.
+    "_media_snapshots",
+)
+
+
+def _message_display_metadata_value_present(value) -> bool:
+    if value is None or value == "":
+        return False
+    if isinstance(value, (dict, list, tuple, set)) and not value:
+        return False
+    return True
+
+
+def _merge_session_display_metadata(target: dict | None, source: dict | None) -> None:
+    """Preserve display-only turn metadata when duplicate transcript rows merge."""
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return
+    for key in _SESSION_MESSAGE_DISPLAY_METADATA_KEYS:
+        if _message_display_metadata_value_present(target.get(key)):
+            continue
+        value = source.get(key)
+        if _message_display_metadata_value_present(value):
+            target[key] = copy.deepcopy(value)
+
+
+def _state_db_row_identity_details(message: dict | None) -> tuple[str | None, bool]:
+    """Return ``(row_id, valid)`` for private state.db provenance aliases.
+
+    A message carrying two different aliases is contradictory provenance.  It
+    must not silently fall through to timestamp/sequence matching, because that
+    would turn an identity conflict into a guessed provider-side payload.
+    """
+    if not isinstance(message, dict):
+        return None, True
+    values = set()
+    for key in ("_row_id", "_state_db_row_id", "_db_row_id", "state_db_row_id"):
+        if key not in message or message.get(key) in (None, ""):
+            continue
+        value = message.get(key)
+        if isinstance(value, bool):
+            return None, False
+        if isinstance(value, int):
+            normalized = str(value) if value >= 0 else None
+        elif isinstance(value, float):
+            normalized = str(int(value)) if math.isfinite(value) and value >= 0 and value.is_integer() else None
+        elif isinstance(value, str):
+            text = value.strip()
+            normalized = text if text.isdigit() else None
+            if normalized is not None:
+                normalized = str(int(normalized))
+        else:
+            normalized = None
+        if normalized is None:
+            return None, False
+        values.add(normalized)
+    if len(values) > 1:
+        return None, False
+    return (next(iter(values)) if values else None), True
+
+
+def _state_db_row_identity(message: dict | None):
+    """Return durable state.db provenance without treating WebUI ``id`` as it."""
+    identity, valid = _state_db_row_identity_details(message)
+    return identity if valid else None
+
+
+def _stable_message_identity_details(message: dict | None) -> tuple[str | None, bool]:
+    """Return a canonical stable message id and whether its aliases are valid."""
+    if not isinstance(message, dict):
+        return None, True
+    values = set()
+    for key in ("id", "message_id"):
+        if key not in message or message.get(key) in (None, ""):
+            continue
+        value = message.get(key)
+        if isinstance(value, bool):
+            return None, False
+        if isinstance(value, (int, str)):
+            normalized = str(value).strip()
+        elif isinstance(value, float):
+            normalized = str(value) if math.isfinite(value) else ""
+        else:
+            normalized = ""
+        if not normalized:
+            return None, False
+        values.add(normalized)
+    if len(values) > 1:
+        return None, False
+    return (next(iter(values)) if values else None), True
+
+
+def _message_private_identity_compatible(target: dict | None, source: dict | None) -> bool:
+    """Return whether private identities do not contradict one another."""
+    target_stable, target_stable_valid = _stable_message_identity_details(target)
+    source_stable, source_stable_valid = _stable_message_identity_details(source)
+    if not target_stable_valid or not source_stable_valid:
+        return False
+    if target_stable is not None and source_stable is not None and target_stable != source_stable:
+        return False
+    target_row_id, target_row_id_valid = _state_db_row_identity_details(target)
+    source_row_id, source_row_id_valid = _state_db_row_identity_details(source)
+    if not target_row_id_valid or not source_row_id_valid:
+        return False
+    if target_row_id is not None and source_row_id is not None and target_row_id != source_row_id:
+        return False
+    target_api_content = _session_message_api_content_key(target)
+    source_api_content = _session_message_api_content_key(source)
+    return not (
+        target_api_content is not None
+        and source_api_content is not None
+        and target_api_content != source_api_content
+    )
+
+
+def _message_identity_compatible(target: dict | None, source: dict | None) -> bool:
+    """Check legacy ordinary visible-content identity; intentionally excludes api_content."""
+    target_stable, target_stable_valid = _stable_message_identity_details(target)
+    source_stable, source_stable_valid = _stable_message_identity_details(source)
+    if not target_stable_valid or not source_stable_valid:
+        return False
+    if target_stable is not None and source_stable is not None and target_stable != source_stable:
+        return False
+    target_row_id, target_row_id_valid = _state_db_row_identity_details(target)
+    source_row_id, source_row_id_valid = _state_db_row_identity_details(source)
+    if not target_row_id_valid or not source_row_id_valid:
+        return False
+    if target_row_id is not None and source_row_id is not None and target_row_id != source_row_id:
+        return False
+    return _visible_content_compatible(target, source)
+
+
+def _message_exact_timestamp(message: dict | None):
+    """Return a numeric transcript timestamp, preserving ``0`` as valid."""
+    if not isinstance(message, dict):
+        return None
+    parsed, valid = _message_exact_timestamp_details(message)
+    return parsed if valid else None
+
+
+def _message_exact_timestamp_details(message: dict | None) -> tuple[float | None, bool]:
+    """Return ``(timestamp, valid)`` while distinguishing absent metadata."""
+    if not isinstance(message, dict):
+        return None, True
+    if any(isinstance(message.get(key), bool) for key in ("timestamp", "_ts")):
+        return None, False
+    for key in ("timestamp", "_ts"):
+        if key not in message or message.get(key) in (None, ""):
+            continue
+        try:
+            parsed = float(message.get(key))
+        except (TypeError, ValueError):
+            return None, False
+        if not math.isfinite(parsed):
+            return None, False
+        return parsed, True
+    return None, True
+
+
+def _message_sidecar_role(message: dict | None):
+    if not isinstance(message, dict):
+        return None
+    role = str(message.get("role") or "").strip().lower()
+    return role if role in {"user", "assistant"} else None
+
+
+_WORKSPACE_PREFIX_RE = re.compile(r"^\s*\[Workspace(?:::v1)?:[^\]]+\]\s*")
+
+
+def _message_visible_content_key(message: dict | None):
+    """Return a canonical visible-content key for sidecar reconciliation."""
+    if not isinstance(message, dict):
+        return None
+    role = _message_sidecar_role(message)
+    if role is None:
+        return None
+
+    def _normalize(value, *, strip_prefix=False):
+        if isinstance(value, str):
+            text = value
+            if strip_prefix:
+                text = _WORKSPACE_PREFIX_RE.sub("", text, count=1)
+            return " ".join(text.split())
+        if isinstance(value, list):
+            return [_normalize(item, strip_prefix=strip_prefix) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: _normalize(child, strip_prefix=False)
+                for key, child in value.items()
+                if key not in {"api_content", "_state_db_row_id", "_db_row_id", "state_db_row_id"}
+            }
+        return value
+
+    normalized = _normalize(message.get("content"), strip_prefix=(role == "user"))
+    try:
+        content = json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        content = repr(normalized)
+    return role, content
+
+
+def _visible_content_compatible(target: dict | None, source: dict | None) -> bool:
+    """Return True only when role and visible content agree exactly."""
+    return _message_visible_content_key(target) == _message_visible_content_key(source)
+
+
+def _copy_api_content_sidecar(target: dict | None, source: dict | None) -> bool:
+    """Copy a valid sidecar unless the target already has a valid one."""
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return False
+    target_role = _message_sidecar_role(target)
+    source_role = _message_sidecar_role(source)
+    if target_role is None or target_role != source_role:
+        return False
+    if not _visible_content_compatible(target, source):
+        target_mirror_key = _session_message_multimodal_mirror_key(
+            target,
+            require_image_parts=True,
+        )
+        if (
+            target_mirror_key is None
+            or target_mirror_key != _session_message_multimodal_mirror_key(
+                source, require_scalar_mirror=True
+            )
+        ):
+            return False
+    target_api_content = target.get("api_content")
+    if isinstance(target_api_content, str) and target_api_content:
+        return True
+    api_content = source.get("api_content")
+    if isinstance(api_content, str) and api_content:
+        target["api_content"] = api_content
+        return True
+    return False
+
+
+def _reconcile_api_content_sidecars(sidecar_messages: list, state_messages: list) -> None:
+    """Attach state.db ``api_content`` to the matching sidecar transcript rows.
+
+    Matching is intentionally stricter than visible transcript dedupe. A
+    unique stable message id is preferred, followed by a unique durable
+    state.db row id, exact timestamps, same-second timestamp drift, and finally
+    a mutually-unique role/content pair that may have mixed timestamp metadata.
+    Duplicate, malformed, or contradictory provenance is consumed without a
+    fallback guess. Repeated visible rows without unique provenance remain
+    unattached. If both sides already carry different non-empty provider
+    sidecars, neither is attached; the append-only merge preserves those rows
+    as distinct.
+    """
+    sidecar = [message for message in sidecar_messages or () if isinstance(message, dict)]
+    state = [
+        message
+        for message in state_messages or ()
+        if isinstance(message, dict)
+        and _message_sidecar_role(message) is not None
+        and isinstance(message.get("api_content"), str)
+        and message.get("api_content")
+    ]
+    if not sidecar or not state:
+        return
+
+    used_targets: set[int] = set()
+    used_sources: set[int] = set()
+
+    # Invalid provenance is never treated as absent metadata. Consume those
+    # rows up front so no weaker tier can attach an arbitrary provider sidecar.
+    for index, message in enumerate(sidecar):
+        _, row_id_valid = _state_db_row_identity_details(message)
+        _, timestamp_valid = _message_exact_timestamp_details(message)
+        _, stable_id_valid = _stable_message_identity_details(message)
+        if not row_id_valid or not timestamp_valid or not stable_id_valid:
+            used_targets.add(index)
+    for source_index, message in enumerate(state):
+        _, row_id_valid = _state_db_row_identity_details(message)
+        _, timestamp_valid = _message_exact_timestamp_details(message)
+        _, stable_id_valid = _stable_message_identity_details(message)
+        if not row_id_valid or not timestamp_valid or not stable_id_valid:
+            used_sources.add(source_index)
+
+    # 1. Stable message identity. This is the strongest WebUI-side identity
+    # and must run before timestamp/content fallbacks. Duplicate or conflicting
+    # aliases are consumed above and cannot fall through to a guess.
+    targets_by_stable_id = {}
+    state_by_stable_id = {}
+    for index, message in enumerate(sidecar):
+        if index in used_targets:
+            continue
+        stable_id, valid = _stable_message_identity_details(message)
+        if valid and stable_id is not None:
+            targets_by_stable_id.setdefault(stable_id, []).append(index)
+    for source_index, message in enumerate(state):
+        if source_index in used_sources:
+            continue
+        stable_id, valid = _stable_message_identity_details(message)
+        if valid and stable_id is not None:
+            state_by_stable_id.setdefault(stable_id, []).append(source_index)
+    stable_ids = list(targets_by_stable_id)
+    stable_ids.extend(
+        stable_id
+        for stable_id in state_by_stable_id
+        if stable_id not in targets_by_stable_id
+    )
+    duplicate_stable_target_indexes = set()
+    duplicate_stable_source_indexes = set()
+    for stable_id in stable_ids:
+        target_indexes = targets_by_stable_id.get(stable_id, [])
+        source_indexes = state_by_stable_id.get(stable_id, [])
+        if len(target_indexes) > 1 or len(source_indexes) > 1:
+            # Durable row ids are stronger provenance than a repeated stable
+            # message id. Defer this bucket's quarantine until after the row-id
+            # tier so unique row-id pairs can still resolve it one-to-one.
+            duplicate_stable_target_indexes.update(target_indexes)
+            duplicate_stable_source_indexes.update(source_indexes)
+
+    for stable_id in stable_ids:
+        target_indexes = [
+            index
+            for index in targets_by_stable_id.get(stable_id, ())
+            if index not in used_targets
+        ]
+        source_indexes = [
+            index
+            for index in state_by_stable_id.get(stable_id, ())
+            if index not in used_sources
+        ]
+        # A singleton stable id present on only one side remains eligible for
+        # stronger durable-row, timestamp, or content matching below.
+        if len(target_indexes) != 1 or len(source_indexes) != 1:
+            continue
+        target_index = target_indexes[0]
+        source_index = source_indexes[0]
+        if not _message_identity_compatible(sidecar[target_index], state[source_index]):
+            used_targets.add(target_index)
+            used_sources.add(source_index)
+            continue
+        target_api_content = _session_message_api_content_key(sidecar[target_index])
+        source_api_content = _session_message_api_content_key(state[source_index])
+        used_targets.add(target_index)
+        used_sources.add(source_index)
+        if (
+            target_api_content is not None
+            and source_api_content is not None
+            and target_api_content != source_api_content
+        ):
+            continue
+        _copy_api_content_sidecar(sidecar[target_index], state[source_index])
+
+    # 2. Durable row identity. This path is unambiguous only when every
+    # alias agrees, each row id occurs once on each side, and visible content
+    # is compatible.  Any duplicate/conflicting id is consumed and rejected;
+    # it must not fall through to a weaker tier.  A unique row id with
+    # conflicting non-empty sidecars is left for the append-only merge, which
+    # can preserve both authoritative payloads without guessing.
+    targets_by_row_id = {}
+    for index, message in enumerate(sidecar):
+        if index in used_targets:
+            continue
+        row_id, valid = _state_db_row_identity_details(message)
+        if not valid:
+            used_targets.add(index)
+        elif row_id is not None:
+            targets_by_row_id.setdefault(row_id, []).append(index)
+    state_by_row_id = {}
+    for source_index, message in enumerate(state):
+        if source_index in used_sources:
+            continue
+        row_id, valid = _state_db_row_identity_details(message)
+        if not valid:
+            used_sources.add(source_index)
+        elif row_id is not None:
+            state_by_row_id.setdefault(row_id, []).append(source_index)
+
+    # Reject duplicate source buckets independently of the target map.  A
+    # source-only duplicate id has no target loop iteration to consume it, so
+    # without this pre-pass it would descend into timestamp/metadata-free
+    # matching and attach one arbitrary provider sidecar.
+    for source_indexes in state_by_row_id.values():
+        if len(source_indexes) > 1:
+            used_sources.update(source_indexes)
+
+    for row_id, original_target_indexes in targets_by_row_id.items():
+        original_source_indexes = state_by_row_id.get(row_id, [])
+        target_indexes = [
+            index for index in original_target_indexes if index not in used_targets
+        ]
+        source_indexes = [
+            index for index in original_source_indexes if index not in used_sources
+        ]
+        if len(original_target_indexes) != 1 or len(original_source_indexes) != 1:
+            used_targets.update(target_indexes)
+            used_sources.update(source_indexes)
+            continue
+        if len(target_indexes) != 1 or len(source_indexes) != 1:
+            continue
+        target_index = target_indexes[0]
+        source_index = source_indexes[0]
+        if not _message_identity_compatible(sidecar[target_index], state[source_index]):
+            # Row ids never override contradictory stable ids, aliases, roles,
+            # or visible content. Quarantine both sides before fallback.
+            used_targets.add(target_index)
+            used_sources.add(source_index)
+            continue
+        target_api_content = _session_message_api_content_key(sidecar[target_index])
+        source_api_content = _session_message_api_content_key(state[source_index])
+        if (
+            target_api_content is not None
+            and source_api_content is not None
+            and target_api_content != source_api_content
+        ):
+            # A durable row id is not sufficient to reconcile two already
+            # authoritative provider payloads. Quarantine both rows so a
+            # weaker timestamp/content tier cannot attach one payload to the
+            # other row.
+            used_targets.add(target_index)
+            used_sources.add(source_index)
+            continue
+        used_targets.add(target_index)
+        used_sources.add(source_index)
+        _copy_api_content_sidecar(sidecar[target_index], state[source_index])
+
+    # Any duplicate stable-id rows left unresolved by the authoritative row-id
+    # tier are ambiguous and must not fall through to timestamps/content.
+    used_targets.update(
+        index for index in duplicate_stable_target_indexes if index not in used_targets
+    )
+    used_sources.update(
+        index for index in duplicate_stable_source_indexes if index not in used_sources
+    )
+
+    # 3. Exact role + timestamp. Equal timestamps are not provenance; resolve
+    # only mutually-unique compatible pairs inside a bucket and never guess by
+    # list order when a relationship is ambiguous.
+    sidecar_by_exact_timestamp = {}
+    state_by_exact_timestamp = {}
+    for index, message in enumerate(sidecar):
+        if index in used_targets:
+            continue
+        role = _message_sidecar_role(message)
+        timestamp = _message_exact_timestamp(message)
+        _, valid = _state_db_row_identity_details(message)
+        if valid and role is not None and timestamp is not None:
+            sidecar_by_exact_timestamp.setdefault((role, timestamp), []).append(index)
+    for source_index, message in enumerate(state):
+        if source_index in used_sources:
+            continue
+        role = _message_sidecar_role(message)
+        timestamp = _message_exact_timestamp(message)
+        _, valid = _state_db_row_identity_details(message)
+        if valid and role is not None and timestamp is not None:
+            state_by_exact_timestamp.setdefault((role, timestamp), []).append((source_index, message))
+    for key, state_rows in state_by_exact_timestamp.items():
+        target_indexes = [
+            index
+            for index in sidecar_by_exact_timestamp.get(key, ())
+            if index not in used_targets
+        ]
+        if not target_indexes:
+            # No exact-timestamp target is not an ambiguity: leave the source
+            # row available for the documented same-second/content tiers.
+            continue
+
+        # Use the same mutually-unique compatibility graph as the same-second
+        # tier. This resolves distinct content pairs inside a repeated exact
+        # timestamp bucket without guessing by list order.
+        compatible_targets_by_source = {}
+        for source_index, source_message in state_rows:
+            if source_index in used_sources:
+                continue
+            compatible_targets_by_source[source_index] = [
+                target_index
+                for target_index in target_indexes
+                if target_index not in used_targets
+                and _message_identity_compatible(sidecar[target_index], source_message)
+                and (
+                    _session_message_api_content_key(sidecar[target_index]) is None
+                    or _session_message_api_content_key(sidecar[target_index])
+                    == _session_message_api_content_key(source_message)
+                )
+            ]
+
+        compatible_sources_by_target = {}
+        for source_index, candidates in compatible_targets_by_source.items():
+            for target_index in candidates:
+                compatible_sources_by_target.setdefault(target_index, []).append(source_index)
+
+        for source_index, candidates in compatible_targets_by_source.items():
+            if len(candidates) != 1:
+                continue
+            target_index = candidates[0]
+            if len(compatible_sources_by_target.get(target_index, ())) != 1:
+                continue
+            if source_index in used_sources or target_index in used_targets:
+                continue
+            used_sources.add(source_index)
+            used_targets.add(target_index)
+            _copy_api_content_sidecar(sidecar[target_index], state[source_index])
+
+    # 4. Same-second sub-second drift. The sidecar JSON and state.db can
+    # record one logical turn with different fractional timestamps while still
+    # landing in the same wall-clock second. Do not use the truncated second
+    # as identity by itself: require a unique *compatible* visible row on each
+    # side. A candidate is compatible only when role + normalized visible
+    # content and all available provenance agree, and neither side carries a
+    # conflicting provider sidecar.
+    # This keeps repeated text, contradictory provenance, and conflicting wire
+    # payloads fail-closed instead of guessing by list order.
+    sidecar_by_same_second = {}
+    state_by_same_second = {}
+    for index, message in enumerate(sidecar):
+        if index in used_targets:
+            continue
+        role = _message_sidecar_role(message)
+        timestamp = _message_exact_timestamp(message)
+        row_id, valid = _state_db_row_identity_details(message)
+        if valid and role is not None and timestamp is not None:
+            second = _normalized_message_timestamp_for_key(timestamp)
+            sidecar_by_same_second.setdefault((role, second), []).append(index)
+    for source_index, message in enumerate(state):
+        if source_index in used_sources:
+            continue
+        role = _message_sidecar_role(message)
+        timestamp = _message_exact_timestamp(message)
+        row_id, valid = _state_db_row_identity_details(message)
+        if valid and role is not None and timestamp is not None:
+            second = _normalized_message_timestamp_for_key(timestamp)
+            state_by_same_second.setdefault((role, second), []).append(source_index)
+
+    for key, state_indexes in state_by_same_second.items():
+        target_indexes = [
+            index
+            for index in sidecar_by_same_second.get(key, ())
+            if index not in used_targets
+        ]
+        if not target_indexes:
+            continue
+
+        compatible_targets_by_source = {}
+        for source_index in state_indexes:
+            if source_index in used_sources:
+                continue
+            source_message = state[source_index]
+            compatible_targets_by_source[source_index] = [
+                target_index
+                for target_index in target_indexes
+                if target_index not in used_targets
+                and _message_identity_compatible(sidecar[target_index], source_message)
+                and (
+                    _session_message_api_content_key(sidecar[target_index]) is None
+                    or _session_message_api_content_key(sidecar[target_index])
+                    == _session_message_api_content_key(source_message)
+                )
+            ]
+
+        compatible_sources_by_target = {}
+        for source_index, candidates in compatible_targets_by_source.items():
+            for target_index in candidates:
+                compatible_sources_by_target.setdefault(target_index, []).append(source_index)
+
+        # Accept only one-to-one compatible pairs.  This deliberately does not
+        # zip a bucket: repeated same-text rows or equal timestamps remain
+        # distinct until durable provenance resolves them.
+        for source_index, candidates in compatible_targets_by_source.items():
+            if len(candidates) != 1:
+                continue
+            target_index = candidates[0]
+            if len(compatible_sources_by_target.get(target_index, ())) != 1:
+                continue
+            if source_index in used_sources or target_index in used_targets:
+                continue
+            used_sources.add(source_index)
+            used_targets.add(target_index)
+            _copy_api_content_sidecar(sidecar[target_index], state[source_index])
+
+    # 5. Role + visible-content fallback tolerates mixed timestamp metadata,
+    # but only when the candidate relationship is mutually unique. Repeated
+    # identical rows have no principled ordering and remain unattached.
+    sidecar_by_visible_content = {}
+    state_by_visible_content = {}
+    for index, message in enumerate(sidecar):
+        if index in used_targets:
+            continue
+        role = _message_sidecar_role(message)
+        _, row_id_valid = _state_db_row_identity_details(message)
+        _, stable_id_valid = _stable_message_identity_details(message)
+        _, timestamp_valid = _message_exact_timestamp_details(message)
+        if (
+            row_id_valid
+            and stable_id_valid
+            and timestamp_valid
+            and role is not None
+            and _message_visible_content_key(message) is not None
+        ):
+            sidecar_by_visible_content.setdefault(_message_visible_content_key(message), []).append(index)
+    for source_index, message in enumerate(state):
+        if source_index in used_sources:
+            continue
+        role = _message_sidecar_role(message)
+        _, row_id_valid = _state_db_row_identity_details(message)
+        _, stable_id_valid = _stable_message_identity_details(message)
+        _, timestamp_valid = _message_exact_timestamp_details(message)
+        if (
+            row_id_valid
+            and stable_id_valid
+            and timestamp_valid
+            and role is not None
+            and _message_visible_content_key(message) is not None
+        ):
+            state_by_visible_content.setdefault(_message_visible_content_key(message), []).append(source_index)
+    for visible_key, target_indexes in sidecar_by_visible_content.items():
+        source_indexes = state_by_visible_content.get(visible_key, [])
+        if len(target_indexes) != 1 or len(source_indexes) != 1:
+            continue
+        target_index = target_indexes[0]
+        source_index = source_indexes[0]
+        target_timestamp, target_timestamp_valid = _message_exact_timestamp_details(
+            sidecar[target_index]
+        )
+        source_timestamp, source_timestamp_valid = _message_exact_timestamp_details(
+            state[source_index]
+        )
+        if (
+            not target_timestamp_valid
+            or not source_timestamp_valid
+            or (target_timestamp is not None and source_timestamp is not None)
+        ):
+            continue
+        if not _message_identity_compatible(sidecar[target_index], state[source_index]):
+            continue
+        target_api_content = _session_message_api_content_key(sidecar[target_index])
+        source_api_content = _session_message_api_content_key(state[source_index])
+        if (
+            target_api_content is not None
+            and source_api_content is not None
+            and target_api_content != source_api_content
+        ):
+            continue
+        used_targets.add(target_index)
+        used_sources.add(source_index)
+        _copy_api_content_sidecar(sidecar[target_index], state[source_index])
+
+
+def _session_message_dedup_key(msg: dict):
+    """Like _session_message_merge_key but preserves full-precision timestamp.
+
+    Two messages are true duplicates only if role, content, AND exact
+    timestamp all match.  Sub-second timestamp differences indicate
+    legitimately distinct messages (e.g. two assistant turns within the
+    same wall-clock second).
+    """
+    if not isinstance(msg, dict):
+        return ("non_dict", repr(msg))
+    message_identity = msg.get("id") or msg.get("message_id")
+    if message_identity:
+        return _session_message_key_with_sidecar(
+            ("message_id", str(message_identity)), msg
+        )
+    # Include tool_calls in the key so assistant messages that carry
+    # different tool invocations (but identical empty content/timestamp)
+    # are never collapsed into one.  (#3346 regression)
+    _tc = msg.get("tool_calls")
+    _tc_key = json.dumps(_tc, sort_keys=True, default=str) if _tc else ""
+    return _session_message_key_with_sidecar((
+        "legacy",
+        str(msg.get("role") or ""),
+        _content_identity_for_key(msg.get("content")),
+        str(msg.get("timestamp") or ""),
+        str(msg.get("tool_call_id") or ""),
+        str(msg.get("tool_name") or msg.get("name") or ""),
+        _tc_key,
+    ), msg)
+
+
+def _normalized_session_message_content(msg: dict):
+    """Visible identity for a message's content.
+
+    Scalars normalise whitespace as before. Structured content returns the same
+    out-of-band tuple as the merge/dedup keys, so content and visible keys can
+    never place a list and a string in the same identity space.
+    """
+    if not isinstance(msg, dict):
+        return repr(msg)
+    content = msg.get("content")
+    if isinstance(content, list) and content:
+        return _content_identity_for_key(content)
+    return " ".join(str(content or "").split())
+
+
+def _loose_session_message_content(value: str) -> str:
+    return " ".join(re.findall(r"\w+", str(value or "").casefold()))
+
+
+def _session_message_content_key(
+    msg: dict,
+    *,
+    normalize_workspace_prefix: bool = True,
+):
+    if not isinstance(msg, dict):
+        return ("non_dict", repr(msg))
+    role = str(msg.get("role") or "")
+    content = _normalized_session_message_content(msg)
+    if role == "user" and normalize_workspace_prefix and isinstance(content, str):
+        # WebUI sends the model a workspace-prefixed user_message
+        # ("[Workspace::v1: /path]\n<text>") while the visible/optimistic
+        # bubble and the WebUI sidecar row carry only the bare "<text>". The
+        # streaming dedup identity (_message_identity in api/streaming.py)
+        # strips this prefix for user turns, so this reconciliation key must
+        # do the same. Otherwise a state.db row (prefixed) and a sidecar row
+        # (bare) key DIFFERENTLY, the alignment loop in
+        # state_db_delta_after_context fails to match them, treats the
+        # state.db copy as a NEW row, and appends a duplicate user turn. The
+        # agent then merges the two adjacent user rows into a permanent
+        # composite -- the post-restart stale-user-prepend bug (#5339). Reuse
+        # the SAME helper as the streaming side (imported lazily to avoid a
+        # circular import; api.streaming imports api.models at module load) so
+        # the two dedup layers can't drift apart again.
+        from api.streaming import _strip_workspace_prefix
+
+        content = " ".join(
+            _strip_workspace_prefix(content, include_legacy=True).split()
+        )
+    return _session_message_key_with_sidecar((
+        role,
+        content,
+        str(msg.get("tool_call_id") or ""),
+        str(msg.get("tool_name") or msg.get("name") or ""),
+    ), msg)
+
+
+def _session_message_visible_key(
+    msg: dict,
+    *,
+    normalize_workspace_prefix: bool = False,
+):
+    if not isinstance(msg, dict):
+        return ("non_dict", repr(msg))
+    # Include tool_calls so assistant messages that invoke different tools
+    # (but share identical empty content) are not collapsed by sidecar
+    # prefix matching.  Without this, all tool-calling messages map to
+    # ("assistant", "") and the merge treats state.db rows as replays.
+    _tc = msg.get("tool_calls")
+    _tc_key = json.dumps(_tc, sort_keys=True, default=str) if _tc else ""
+    role = str(msg.get("role") or "")
+    content = _normalized_session_message_content(msg)
+    if role == "user" and normalize_workspace_prefix and isinstance(content, str):
+        # state.db stores the model-facing workspace-prefixed prompt while the
+        # WebUI sidecar owns the bare visible text. Fold that protocol wrapper
+        # into the exact key so large-session reconciliation does not depend on
+        # the bounded fuzzy fallback to recognize one logical turn.
+        from api.streaming import _strip_workspace_prefix
+
+        content = " ".join(
+            _strip_workspace_prefix(content, include_legacy=True).split()
+        )
+    return _session_message_key_with_sidecar((
+        role,
+        content,
+        _tc_key,
+    ), msg)
+
+
+def _build_visible_duplicate_lookup(visible_keys: set[tuple]) -> dict:
+    by_role = {}
+    for key in visible_keys:
+        try:
+            role = key[0]
+            content = key[1]
+        except (TypeError, IndexError):
+            continue
+        # Only text identities take part in fuzzy matching; structured content
+        # is exact-identity only and must never fuzzy-match a scalar.
+        if not content or not isinstance(content, str):
+            continue
+        by_role.setdefault(role, []).append(key)
+    # Keep loose_by_key lazy.  Some transcripts contain multi-megabyte tool
+    # outputs; eagerly casefolding + regex-tokenizing every visible key on every
+    # duplicate probe made /api/session take 10s+ and blocked /api/sessions.
+    return {"keys": visible_keys, "by_role": by_role, "loose_by_key": {}}
+
+
+_VISIBLE_DUPLICATE_FUZZY_MAX_KEYS = 1000
+
+
+def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], lookup: dict | None = None):
+    if visible_key in visible_keys:
+        return visible_key
+    role = visible_key[0]
+    content = visible_key[1] if len(visible_key) > 1 else ""
+    sidecar = visible_key[3] if len(visible_key) > 3 else None
+    if not content:
+        return None
+    # Structured content is matched by exact identity only (checked above).
+    # Substring/token matching would otherwise compare a canonical list
+    # serialisation against arbitrary text and pair a rich row with a scalar.
+    if not isinstance(content, str):
+        return None
+    # Exact identity above remains authoritative at every size. The fallback
+    # below scans the existing keys for every candidate, so it becomes
+    # quadratic on long transcripts even when each individual message is small.
+    # Prefer an occasional near-duplicate over blocking every WebUI endpoint.
+    if len(visible_keys) > _VISIBLE_DUPLICATE_FUZZY_MAX_KEYS:
+        return None
+    if lookup is None:
+        lookup = _build_visible_duplicate_lookup(visible_keys)
+    loose_content = None
+    loose_by_key = lookup.setdefault("loose_by_key", {})
+    for existing_key in lookup.get("by_role", {}).get(role, []):
+        existing_role = existing_key[0]
+        existing_content = existing_key[1] if len(existing_key) > 1 else ""
+        existing_sidecar = existing_key[3] if len(existing_key) > 3 else None
+        if (
+            role != existing_role
+            or sidecar != existing_sidecar
+            or not existing_content
+            or not isinstance(existing_content, str)
+        ):
+            continue
+        # Exact visible-key equality was checked above. For very large payloads
+        # (tool logs / request dumps), Python-in substring and fuzzy-token
+        # comparisons are both expensive and low-value; doing them repeatedly
+        # made session loading block the whole WebUI for many seconds. Keep
+        # fuzzy matching for normal chat-sized text, but do exact-only matching
+        # for giant payloads.
+        if max(len(content), len(existing_content)) > 200_000:
+            continue
+        if content in existing_content or existing_content in content:
+            return existing_key
+        if loose_content is None:
+            loose_content = _loose_session_message_content(content)
+        loose_existing = loose_by_key.get(existing_key)
+        if loose_existing is None:
+            loose_existing = _loose_session_message_content(existing_content)
+            loose_by_key[existing_key] = loose_existing
+        if loose_content and loose_existing and (
+            loose_content in loose_existing or loose_existing in loose_content
+        ):
+            return existing_key
+    return None
+
+
+def _has_visible_duplicate(visible_key: tuple, visible_keys: set[tuple]) -> bool:
+    return _matching_visible_duplicate(visible_key, visible_keys) is not None
+
+
+def _sidecar_has_terminal_partial_error(sidecar_messages: list, *, live_only: bool = False) -> bool:
+    """Return True when WebUI already owns an interrupted live partial turn.
+
+    After a cancelled/error terminal event, the WebUI sidecar contains the
+    user prompt, the streamed partial assistant prose/tool snapshot, and the
+    explicit terminal carrier. state.db may still contain the same run's raw
+    assistant/tool replay rows; appending those rows makes Compact Worklog show
+    duplicated process prose after cancel. In that shape, the sidecar is the
+    display owner.
+    """
+    messages = [msg for msg in (sidecar_messages or []) if isinstance(msg, dict)]
+    latest_error_idx = None
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role") or "").lower() != "assistant":
+            continue
+        if msg.get("_error"):
+            latest_error_idx = idx
+    if latest_error_idx is None:
+        return False
+    for msg in messages[latest_error_idx + 1 :]:
+        if str(msg.get("role") or "").lower() in ("user", "assistant"):
+            return False
+    segment_start = 0
+    for idx in range(latest_error_idx - 1, -1, -1):
+        if str(messages[idx].get("role") or "").lower() == "user":
+            segment_start = idx + 1
+            break
+    if live_only and segment_start == 0:
+        return False  # A partial/error-only context does not own the user turn.
+    for msg in messages[segment_start:latest_error_idx]:
+        if str(msg.get("role") or "").lower() == "assistant" and (
+            msg.get("_partial") or (not live_only and msg.get("_recovered_from_cancel_journal") is True)
+        ):
+            return True
+    return False
+
+
+def _selected_history_owns_live_partial(selected: list, owner_messages: list) -> bool:
+    """Require the selected user and saved partial, not its optional carrier."""
+    if not _sidecar_has_terminal_partial_error(owner_messages, live_only=True):
+        return False
+    owner_rows = [row for row in owner_messages if isinstance(row, dict)]
+    error_index = max(i for i, row in enumerate(owner_rows)
+                      if str(row.get('role') or '').lower() == 'assistant' and row.get('_error'))
+    user_index = max(i for i, row in enumerate(owner_rows[:error_index])
+                     if str(row.get('role') or '').lower() == 'user')
+    user = owner_rows[user_index]
+    partials = [row for row in owner_rows[user_index+1:error_index]
+                if str(row.get('role') or '').lower() == 'assistant' and row.get('_partial')]
+    selected = [row for row in selected if isinstance(row, dict)]
+
+    def same_saved_row(local, saved, *, ordered_copy=False):
+        if (not _message_private_identity_compatible(local, saved)
+                or _session_message_visible_key(local) != _session_message_visible_key(saved)):
+            return False
+        token, saved_token = local.get('_active_turn_token'), saved.get('_active_turn_token')
+        if token and saved_token and token != saved_token:
+            return False
+        if saved.get('_partial') and not local.get('_partial'):
+            return False  # An ordinary settled answer is not a live partial.
+        if local is saved:
+            return True
+        clock, valid = _message_exact_timestamp_details(local)
+        saved_clock, saved_valid = _message_exact_timestamp_details(saved)
+        row_id, _ = _state_db_row_identity_details(local)
+        saved_id, _ = _state_db_row_identity_details(saved)
+        stable, _ = _stable_message_identity_details(local)
+        saved_stable, _ = _stable_message_identity_details(saved)
+        if ((row_id is not None and int(row_id) > 0 and row_id == saved_id)
+                or (stable is not None and stable == saved_stable)
+                or (token and token == saved_token)):
+            return True
+        if not (valid and saved_valid and clock is not None and clock == saved_clock):
+            return False
+        if _message_sidecar_role(saved) == 'user' and not ordered_copy:
+            # Clock-only authority cannot choose between an earlier identical
+            # user and the current Stop owner. A trusted ID/token above can.
+            candidates = [row for row in owner_rows
+                          if _session_message_visible_key(row) == _session_message_visible_key(saved)
+                          and _message_exact_timestamp_details(row) == (saved_clock, True)
+                          and _message_private_identity_compatible(local, row)]
+            if len(candidates) != 1:
+                return False
+        return True
+
+    # Ordinal correspondence in the complete saved history proves which of
+    # several legacy equal-clock users owns this partial. A shorter, older view
+    # still requires the existing unique clock or explicit identity below.
+    selected_history = [row for row in selected if not row.get('_error')]
+    saved_history = [row for row in owner_rows if not row.get('_error')]
+    if len(selected_history) == len(saved_history) and all(
+        same_saved_row(local, saved, ordered_copy=True)
+        for local, saved in zip(selected_history, saved_history, strict=True)
+    ):
+        return True
+
+    for index, row in enumerate(selected):
+        if str(row.get('role') or '').lower() != 'user' or not same_saved_row(row, user):
+            continue
+        end = next((i for i in range(index+1, len(selected))
+                    if str(selected[i].get('role') or '').lower() == 'user'), len(selected))
+        cursor = index+1
+        for partial in partials:
+            matched = next((i for i in range(cursor, end) if same_saved_row(selected[i], partial)), None)
+            if matched is None:
+                break
+            cursor = matched+1
+        else:
+            return True
+    return False
+
+
+def _cancelled_journal_turn_owner(
+    sidecar_messages: list, *, include_live_partial: bool = False,
+) -> tuple[dict, dict] | None:
+    """Find the latest cancelled journal segment, including historical ones."""
+    messages = [row for row in sidecar_messages if isinstance(row, dict)]
+    for error_idx in range(len(messages) - 1, -1, -1):
+        carrier = messages[error_idx]
+        if carrier.get('role') != 'assistant' or not carrier.get('_error'):
+            continue
+        owner_idx = next((i for i in range(error_idx - 1, -1, -1)
+                          if messages[i].get('role') == 'user'), None)
+        if owner_idx is None:
+            continue
+        segment = messages[owner_idx + 1:error_idx]
+        has_partial = any(row.get('_partial') for row in segment)
+        if has_partial and (not include_live_partial
+                            or carrier.get('type') not in (None, '', 'cancelled')):
+            continue  # A typed crash/provider interruption is not a user Stop.
+        if (has_partial or any(row.get('_recovered_from_cancel_journal') is True for row in segment)):
+            return messages[owner_idx], carrier
+    return None
+
+
+def _state_db_cancelled_journal_turn_bounds(
+    sidecar_messages: list, state_messages: list, *, turn_owner=None,
+    allow_legacy_integer_clock=False,
+) -> tuple[int | None, int | None]:
+    """Prove the cancelled owner and its next user in SQLite's row order.
+
+    Recovery timestamps are not execution timestamps. An exact, unique owner
+    in SQLite's ordered transcript proves its next user is a successor even
+    when that successor predates the recovered sidecar's terminal carrier.
+    """
+    if turn_owner is None:
+        turn_owner = _cancelled_journal_turn_owner(sidecar_messages)
+    if turn_owner is None:
+        return None, None
+    owner, carrier = turn_owner
+
+    def timestamp(row):
+        if any(isinstance(row.get(key), bool) for key in ('timestamp', '_ts')):
+            return None
+        return _message_exact_timestamp(row)
+
+    owner_time = timestamp(owner)
+
+    def owner_clock_matches(row):
+        if timestamp(row) == owner_time:
+            return owner_time is not None
+        return (allow_legacy_integer_clock and type(owner.get('timestamp')) is int
+                and _journal_user_timestamps_match(owner['timestamp'], row.get('timestamp')))
+
+    owner_stable, stable_valid = _stable_message_identity_details(owner)
+    owner_row, row_valid = _state_db_row_identity_details(owner)
+    if not stable_valid or not row_valid:
+        return None, None
+    known_claims = []
+    for i, row in enumerate(state_messages):
+        if not isinstance(row, dict) or row.get('role') != 'user':
+            continue
+        stable, stable_valid = _stable_message_identity_details(row)
+        row_id, row_valid = _state_db_row_identity_details(row)
+        if not stable_valid or not row_valid:
+            return None, None
+        if ((owner_stable is not None and stable == owner_stable)
+                or (owner_row is not None and row_id == owner_row)):
+            known_claims.append(i)
+    matches = [i for i, row in enumerate(state_messages)
+               if isinstance(row, dict) and row.get('role') == 'user'
+               and owner_clock_matches(row)
+               and _session_message_content_key(row, normalize_workspace_prefix=True)
+               == _session_message_content_key(owner, normalize_workspace_prefix=False)
+               and _message_private_identity_compatible(owner, row)]
+    # A row claiming the cancelled owner's known ID is never a later-only
+    # successor merely because its content or timestamp changed.
+    if known_claims and (len(known_claims) != 1 or known_claims[0] not in matches):
+        return None, None
+    if matches:
+        if len(matches) != 1:
+            return None, None
+        matched = state_messages[matches[0]]
+        if not _message_private_identity_compatible(owner, matched):
+            return None, None
+        owner_token, matched_token = owner.get('_active_turn_token'), matched.get('_active_turn_token')
+        if owner_token and matched_token and owner_token != matched_token:
+            return None, None
+        # A unique SQLite tuple can still be an earlier visible occurrence.
+        # Plaintext SQLite rows have no durable row identity in this projection;
+        # do not mistake an old repeated prompt for the absent/restamped owner.
+        bound_identity = bool(known_claims or (owner_token and owner_token == matched_token))
+        if not bound_identity:
+            owner_index = next(i for i, row in enumerate(sidecar_messages) if row is owner)
+            if any(isinstance(row, dict) and row.get('role') == 'user'
+                   and owner_clock_matches(row)
+                   and _session_message_content_key(row, normalize_workspace_prefix=False)
+                   == _session_message_content_key(owner, normalize_workspace_prefix=False)
+                   and _message_private_identity_compatible(row, matched)
+                   for row in sidecar_messages[:owner_index]):
+                return None, None
+        start = next((i for i in range(matches[0] + 1, len(state_messages))
+                      if isinstance(state_messages[i], dict) and state_messages[i].get('role') == 'user'), None)
+    else:
+        # A later-only store can still prove a successor with a timestamp newer
+        # than the terminal carrier. Unknown/older timestamps grant no authority.
+        terminal_time = timestamp(carrier)
+        start = next((i for i, row in enumerate(state_messages)
+                      if isinstance(row, dict) and row.get('role') == 'user'
+                      and terminal_time is not None and timestamp(row) is not None
+                      and timestamp(row) > terminal_time), None)
+    return (matches[0] if matches else None), start
+
+
+def _state_db_after_cancelled_journal_turn(sidecar_messages: list, state_messages: list) -> list:
+    """Return only the proved successor, excluding the cancelled execution."""
+    _, start = _state_db_cancelled_journal_turn_bounds(sidecar_messages, state_messages)
+    return list(state_messages[start:]) if start is not None else []
+
+
+def _restore_cancelled_journal_prefix(selected, prefix, owner_messages, *, verified_start=False):
+    """Fill ordered gaps after a unique retained anchor, before the Stop owner.
+
+    Matched row order bounds gaps; user clocks order whole unmatched turns.
+    Assistant/tool rows stay with their owner regardless of recovery clocks.
+    Never infer permission to restore a discarded leading prefix from text alone.
+    A verified compression anchor separately authorizes its already sliced tail.
+    """
+    owner, _ = _cancelled_journal_turn_owner(owner_messages)
+
+    def row_owners(rows):
+        owners = []
+        current = None
+        for row in rows:
+            if row.get('role') == 'user':
+                current = row
+            owners.append(current)
+        return owners
+
+    local_owners_all, source_owners = row_owners(selected), row_owners(prefix)
+    local_owner_by_row = {id(row): turn for row, turn in zip(selected, local_owners_all, strict=True)}
+    source_owner_by_row = {id(row): turn for row, turn in zip(prefix, source_owners, strict=True)}
+    local_occurrences = collections.Counter(
+        (id(turn), _session_message_visible_key(row))
+        for row, turn in zip(selected, local_owners_all, strict=True)
+    )
+    source_occurrences = collections.Counter(
+        (id(turn), _session_message_visible_key(row, normalize_workspace_prefix=True))
+        for row, turn in zip(prefix, source_owners, strict=True)
+    )
+
+    def matches(local, saved):
+        if not _message_private_identity_compatible(local, saved):
+            return False
+        left_token, right_token = local.get('_active_turn_token'), saved.get('_active_turn_token')
+        if left_token and right_token and left_token != right_token:
+            return False
+        left_time, left_valid = _message_exact_timestamp_details(local)
+        right_time, right_valid = _message_exact_timestamp_details(saved)
+        key = _session_message_visible_key(local, normalize_workspace_prefix=False)
+        if (not left_valid or not right_valid or right_time is None
+                or key != _session_message_visible_key(saved, normalize_workspace_prefix=True)):
+            return False
+        for identity in (_state_db_row_identity_details, _stable_message_identity_details):
+            local_id, local_valid = identity(local)
+            saved_id, saved_valid = identity(saved)
+            if (local_valid and saved_valid and local_id is not None and local_id == saved_id
+                    and (identity is not _state_db_row_identity_details or int(local_id) > 0)):
+                return True
+        if left_time is not None and left_time == right_time:
+            return True
+        if local.get('role') == 'user':
+            return False
+        local_owner, saved_owner = local_owner_by_row.get(id(local)), source_owner_by_row.get(id(saved))
+        # Native Agent flush and WebUI settlement stamp replies independently.
+        # A mutually unique visible row inside the same proved user execution
+        # is a mirror, not a second completed turn or an unanchored gap.
+        return (local_owner is not None and saved_owner is not None
+                and matches(local_owner, saved_owner)
+                and local_occurrences[(id(local_owner), key)] == 1
+                and source_occurrences[(id(saved_owner), key)] == 1)
+
+    owner_indices = [i for i, row in enumerate(selected) if row is owner or matches(owner, row)]
+    if len(owner_indices) > 1:
+        return selected
+    stop_index = owner_indices[0] if owner_indices else len(selected)
+    local_prefix = selected[:stop_index]
+    # Duplicate private IDs cannot establish ownership or order of a gap.
+    for rows in (prefix, local_prefix):
+        for identity in (_state_db_row_identity_details, _stable_message_identity_details):
+            ids = [identity(row) for row in rows]
+            if any(not valid for _, valid in ids):
+                return selected
+            known = [value for value, _ in ids if value is not None]
+            if len(set(known)) != len(known):
+                return selected
+    for identity in (_state_db_row_identity_details, _stable_message_identity_details):
+        local_by_id = {identity(row)[0]: row for row in local_prefix if identity(row)[0] is not None}
+        for row in prefix:
+            row_id = identity(row)[0]
+            if row_id in local_by_id and not matches(local_by_id[row_id], row):
+                return selected
+    # Equal-clock native calls with differing tool payloads cannot be an
+    # anchor, or a new gap beside the saved call's authoritative result block.
+    local_call_clocks = collections.defaultdict(set)
+    for row in local_prefix:
+        if row.get('tool_calls'):
+            local_call_clocks[_message_exact_timestamp_details(row)].add(_session_message_visible_key(row))
+    for row in prefix:
+        key = _message_exact_timestamp_details(row)
+        if row.get('tool_calls') and key in local_call_clocks:
+            if _session_message_visible_key(row, normalize_workspace_prefix=True) not in local_call_clocks[key]:
+                return selected
+    def anchor_key(row, *, source=False):
+        clock, valid = _message_exact_timestamp_details(row)
+        if not valid or clock is None:
+            return None
+        return clock, _session_message_visible_key(row, normalize_workspace_prefix=source)
+
+    source_keys = collections.defaultdict(list)
+    for index, row in enumerate(prefix):
+        source_keys[_session_message_visible_key(row, normalize_workspace_prefix=True)].append(index)
+    anchors = []
+    for local_idx, row in enumerate(local_prefix):
+        candidates = source_keys.get(_session_message_visible_key(row), [])
+        compatible = [index for index in candidates if matches(row, prefix[index])]
+        # A clock/content mirror with contradictory private/provider identity
+        # is quarantined, never inserted as a second authoritative occurrence.
+        if (anchor_key(row) is not None
+                and any(anchor_key(row) == anchor_key(prefix[index], source=True)
+                        and not matches(row, prefix[index]) for index in candidates)):
+            return selected
+        if len(compatible) > 1:
+            return selected
+        if compatible:
+            anchors.append((local_idx, compatible[0]))
+    anchors.sort()
+    if any(right[1] <= left[1] for left, right in zip(anchors, anchors[1:], strict=False)):
+        return selected
+    local_owners = local_owners_all[:stop_index]
+    for local_idx, saved_idx in anchors:
+        local_owner, saved_owner = local_owners[local_idx], source_owners[saved_idx]
+        # Matching assistant/tool bytes can occur in different executions.
+        # Such a row cannot align gaps belonging to contradictory user owners.
+        if (local_owner is not None and saved_owner is not None
+                and not matches(local_owner, saved_owner)):
+            return selected
+    if not anchors and not verified_start:
+        return selected
+
+    def merge_gap(local, saved):
+        if not local or not saved:
+            return list(local or saved)
+
+        def turn_blocks(rows):
+            leading, turns = [], []
+            previous_clock = None
+            for row in rows:
+                if row.get('role') == 'user':
+                    clock, valid = _message_exact_timestamp_details(row)
+                    if (not valid or clock is None
+                            or (previous_clock is not None and clock <= previous_clock)):
+                        return None
+                    turns.append((clock, [row]))
+                    previous_clock = clock
+                elif turns:
+                    turns[-1][1].append(row)
+                else:
+                    leading.append(row)
+            return leading, turns
+
+        local_blocks, saved_blocks = turn_blocks(local), turn_blocks(saved)
+        if local_blocks is None or saved_blocks is None:
+            return None
+        local_leading, local_turns = local_blocks
+        saved_leading, saved_turns = saved_blocks
+        # Both leading fragments belong to the preceding anchor's execution.
+        # Without another shared row their relative order cannot be proved.
+        if local_leading and saved_leading:
+            return None
+        merged = local_leading + saved_leading
+        local_index = saved_index = 0
+        while local_index < len(local_turns) and saved_index < len(saved_turns):
+            local_clock, local_rows = local_turns[local_index]
+            saved_clock, saved_rows = saved_turns[saved_index]
+            if local_clock == saved_clock:
+                return None
+            if local_clock < saved_clock:
+                merged.extend(local_rows)
+                local_index += 1
+            else:
+                merged.extend(saved_rows)
+                saved_index += 1
+        for _, rows in local_turns[local_index:] + saved_turns[saved_index:]:
+            merged.extend(rows)
+        return merged
+
+    result = []
+    local_cursor = 0
+    source_cursor = 0 if verified_start else anchors[0][1]
+    for local_idx, saved_idx in anchors:
+        gap = []
+        if saved_idx >= source_cursor:
+            gap = prefix[source_cursor:saved_idx]
+            if gap and local_idx and local_prefix[local_idx].get('role') == 'tool':
+                # A saved tool result cannot be separated from its assistant's
+                # native tool-call block by a newly recovered user/answer.
+                block_start = local_idx - 1
+                while block_start >= 0 and local_prefix[block_start].get('role') == 'tool':
+                    block_start -= 1
+                if block_start >= 0 and local_prefix[block_start].get('tool_calls'):
+                    return selected
+        merged_gap = merge_gap(local_prefix[local_cursor:local_idx], gap)
+        if merged_gap is None:
+            return selected
+        result.extend(merged_gap)
+        result.append(local_prefix[local_idx])
+        local_cursor, source_cursor = local_idx + 1, saved_idx + 1
+    merged_gap = merge_gap(local_prefix[local_cursor:], prefix[source_cursor:])
+    if merged_gap is None:
+        return selected
+    result.extend(merged_gap)
+    result.extend(selected[stop_index:])
+    return result
+
+
+def _state_db_after_saved_cancel_successors(
+    owner_messages: list, state_messages: list, local_messages: list, *, turn_owner=None,
+) -> list:
+    """Remove only an ordered mirror of successors already saved after Stop.
+
+    The cancelled owner/carrier are excluded from this alignment. Require a
+    two-row prefix for legacy content-only evidence; retain occurrence counts
+    and reject conflicting private identities so a genuinely new identical
+    turn is not collapsed. Timestamps may change when SQLite restamps mirrors.
+    """
+    if turn_owner is None:
+        turn_owner = _cancelled_journal_turn_owner(owner_messages)
+    if turn_owner is None:
+        return state_messages
+    carrier = turn_owner[1]
+    carrier_index = next(i for i, row in enumerate(owner_messages) if row is carrier)
+    saved = [row for row in owner_messages[carrier_index + 1:] if isinstance(row, dict)]
+    if not saved or saved[0].get('role') != 'user':
+        return state_messages
+    # The display can be newer than authoritative model context. Remove only
+    # the saved prefix also represented in this call's selected local view;
+    # visible ownership alone does not prove context has consumed those rows.
+    represented = 0
+    for offset in range(len(local_messages)):
+        length = 0
+        while length < len(saved) and offset + length < len(local_messages):
+            local, visible = local_messages[offset + length], saved[length]
+            if (not isinstance(local, dict)
+                    or not _message_private_identity_compatible(local, visible)
+                    or _message_exact_timestamp_details(local)
+                    != _message_exact_timestamp_details(visible)
+                    or _session_message_content_key(local, normalize_workspace_prefix=False)
+                    != _session_message_content_key(visible, normalize_workspace_prefix=False)):
+                break
+            length += 1
+        represented = max(represented, length)
+    if represented < 2:
+        return state_messages
+    saved = saved[:represented]
+    _reconcile_api_content_sidecars(saved, state_messages)
+    matched = 0
+    for local, incoming in zip(saved, state_messages, strict=False):
+        # Content alone cannot distinguish a restamped legacy mirror from a
+        # genuinely new identical turn. Only a shared valid identity or exact
+        # non-null clock grants authority to consume this occurrence.
+        local_stable, local_stable_valid = _stable_message_identity_details(local)
+        incoming_stable, incoming_stable_valid = _stable_message_identity_details(incoming)
+        local_row, local_row_valid = _state_db_row_identity_details(local)
+        incoming_row, incoming_row_valid = _state_db_row_identity_details(incoming)
+        shared_identity = (
+            (local_stable_valid and incoming_stable_valid and local_stable is not None
+             and local_stable == incoming_stable)
+            or (local_row_valid and incoming_row_valid and local_row is not None
+                and int(local_row) > 0 and local_row == incoming_row)
+        )
+        local_time, local_time_valid = _message_exact_timestamp_details(local)
+        incoming_time, incoming_time_valid = _message_exact_timestamp_details(incoming)
+        exact_clock = (local_time_valid and incoming_time_valid and local_time is not None
+                       and local_time == incoming_time)
+        if (not isinstance(incoming, dict)
+                or not (shared_identity or exact_clock)
+                or not _message_private_identity_compatible(local, incoming)
+                or _session_message_content_key(local, normalize_workspace_prefix=False)
+                != _session_message_content_key(incoming, normalize_workspace_prefix=True)):
+            break
+        matched += 1
+    if matched < 2:
+        return state_messages
+    return state_messages[matched:]
+
+
+def state_db_delta_after_context(sidecar_context: list, state_messages: list) -> list:
+    """Return only state.db rows that are newer than model-facing context.
+
+    `context_messages` is the authoritative model-facing prefix. state.db may
+    contain a mirrored copy of that prefix with fresh timestamps, especially for
+    LCM/continuation sessions. Appending the whole state transcript to a clean
+    sidecar context replays old context into the next runtime prompt.
+    """
+    sidecar_context = list(sidecar_context or [])
+    state_messages = list(state_messages or [])
+    if not sidecar_context or not state_messages:
+        return state_messages
+
+    # Attach trusted state.db sidecars before computing context keys.  A missing
+    # sidecar is not a wildcard: once attached, it participates in every
+    # duplicate/prefix decision below and distinct provider bytes remain
+    # distinct rows.
+    _reconcile_api_content_sidecars(sidecar_context, state_messages)
+
+    # Recovered interrupted turns are special: the visible interruption marker
+    # is synthetic, so the recovered user turn should still count as a mirrored
+    # prefix when it is the actual aligned prefix row.
+    allow_single_row_prefix = bool(
+        isinstance(sidecar_context[0], dict)
+        and sidecar_context[0].get('_recovered')
+        and str(sidecar_context[0].get('role') or '') == 'user'
+    )
+
+    sidecar_keys = [
+        _session_message_content_key(m, normalize_workspace_prefix=False)
+        for m in sidecar_context
+    ]
+    state_keys = [
+        _session_message_content_key(m, normalize_workspace_prefix=True)
+        for m in state_messages
+    ]
+    max_offset = min(len(sidecar_keys), len(state_keys))
+    best_len = 0
+    best_offset = 0
+    for offset in range(max_offset):
+        length = 0
+        while (
+            offset + length < len(sidecar_keys)
+            and length < len(state_keys)
+            and sidecar_keys[offset + length] == state_keys[length]
+        ):
+            length += 1
+        if length > best_len:
+            best_len = length
+            best_offset = offset
+
+    # Require at least two mirrored rows. A single repeated short user message
+    # is not enough evidence that state.db starts with a mirrored context
+    # segment, but small recovered contexts often contain only a compact summary
+    # and one follow-up row; those should still use the delta path.
+    if best_len < (1 if allow_single_row_prefix and best_offset == 0 else 2):
+        return state_messages
+
+    # Drop only rows that can be aligned with the remaining sidecar context in
+    # order. This still tolerates stale state-only rows between mirrored context
+    # rows, but once the sidecar context is exhausted every later state row is a
+    # real delta, even if it repeats a short earlier message.
+    sidecar_index = best_len
+    state_index = best_len
+    while sidecar_index < len(sidecar_keys) and state_index < len(state_keys):
+        if state_keys[state_index] == sidecar_keys[sidecar_index]:
+            sidecar_index += 1
+        state_index += 1
+    if sidecar_index == len(sidecar_keys):
+        return state_messages[state_index:]
+    return state_messages[best_len:]
+
+
+def _normalized_compression_anchor_text(value) -> str:
+    return " ".join(str(value or "").split()).strip()[:160]
+
+
+def _compression_anchor_timestamp_as_float(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _context_messages_include_compression_marker(messages: list) -> bool:
+    for message in messages or []:
+        if not is_context_compression_marker(message):
+            continue
+        text = _message_content_text(message).lower().lstrip()
+        # Only prompt compaction summaries require fail-closed state.db replay.
+        # Other compression-adjacent summaries, such as Session Arc Summary,
+        # keep the existing prefix-delta behavior so fresh follow-ups survive.
+        if text.startswith("[context compaction") or text.startswith("context compaction"):
+            return True
+    return False
+
+
+def _state_db_anchor_index(state_messages: list, anchor_key) -> int | None:
+    if not isinstance(anchor_key, dict):
+        return None
+
+    anchor_role = str(anchor_key.get("role") or "").strip().lower()
+    anchor_text = _normalized_compression_anchor_text(anchor_key.get("text"))
+    anchor_attachments = anchor_key.get("attachments")
+    anchor_ts = _compression_anchor_timestamp_as_float(anchor_key.get("ts"))
+
+    if not anchor_role:
+        return None
+
+    # Do not attempt text-only fallback when timestamp is unavailable. Text-based
+    # fallback can match stale legacy rows if the anchor timestamp was lost,
+    # which can re-introduce old state.db rows after compaction.
+    if anchor_ts is None:
+        return None
+
+    if anchor_attachments in (None, ""):
+        expected_attachments = 0
+    else:
+        try:
+            expected_attachments = int(anchor_attachments)
+        except (TypeError, ValueError):
+            expected_attachments = 0
+
+    exact_timestamp_matches = []
+    for idx, message in enumerate(state_messages or []):
+        if _message_role(message) != anchor_role:
+            continue
+
+        attachments = message.get("attachments") if isinstance(message, dict) else None
+        attach_count = len(attachments) if isinstance(attachments, list) else 0
+        if attach_count != expected_attachments:
+            continue
+
+        # Attachment-only or timestamp-only anchors have no stable text payload.
+        # In that shape the timestamp + role + attachment count is the boundary;
+        # apply text comparison only when the anchor actually captured text.
+        message_text = _normalized_compression_anchor_text(_message_content_text(message))
+        if anchor_text and message_text != anchor_text:
+            continue
+
+        message_ts = _compression_anchor_timestamp_as_float(
+            message.get("timestamp") if isinstance(message, dict) else None
+        )
+        if message_ts is None:
+            continue
+        if abs(message_ts - anchor_ts) <= 1e-6:
+            exact_timestamp_matches.append(idx)
+            continue
+
+    if exact_timestamp_matches:
+        return exact_timestamp_matches[-1]
+    return None
+
+
+def _tool_call_assistant_should_precede_content_assistant(existing: dict, msg: dict) -> bool:
+    return (
+        isinstance(existing, dict)
+        and isinstance(msg, dict)
+        and str(msg.get("role") or "").lower() == "assistant"
+        and bool(msg.get("tool_calls"))
+        and not _message_content_text(msg).strip()
+        and str(existing.get("role") or "").lower() == "assistant"
+        and not existing.get("tool_calls")
+        and bool(_message_content_text(existing).strip())
+    )
+
+
+def _insert_state_message_chronologically(messages: list, msg: dict) -> bool:
+    """Insert a state.db-only row before newer sidecar rows when safe.
+
+    Returns False when the only chronological slot would resurrect an old state
+    row before the sidecar/context begins. This keeps no-watermark compression
+    display paths from reintroducing rows that were already compacted out.
+    """
+    timestamp = _message_timestamp_as_float(msg)
+    if timestamp is None:
+        messages.append(msg)
+        return True
+    idx = 0
+    while idx < len(messages):
+        existing = messages[idx]
+        existing_timestamp = _message_timestamp_as_float(existing)
+        should_insert = existing_timestamp is not None and (
+            existing_timestamp > timestamp
+            or (
+                existing_timestamp == timestamp
+                and (
+                    (
+                        msg.get("role") == "user"
+                        and existing.get("role") == "assistant"
+                    )
+                    or _tool_call_assistant_should_precede_content_assistant(existing, msg)
+                )
+            )
+        )
+        if not should_insert:
+            idx += 1
+            continue
+        if idx == 0 and existing_timestamp is not None and existing_timestamp > timestamp:
+            # With no surviving sidecar/context row before this slot, a real
+            # interruption rescue is indistinguishable from a compacted-out old
+            # prompt; prefer avoiding no-watermark resurrection in that shape.
+            return False
+        # Advance the insertion point past two kinds of slots that must not be
+        # split, applied to a fixpoint so they compose in any order at an
+        # equal-timestamp collision:
+        #   (a) an assistant(tool_calls) -> tool result block — inserting inside
+        #       it would split the tool call from its result (provider 400 /
+        #       corrupt tool context);
+        #   (b) a slot whose left neighbour shares this message's role at the
+        #       same timestamp — inserting there would re-order an already-matched
+        #       same-role turn (e.g. user, <inserted user>, assistant). The agent
+        #       core merges adjacent users before send, so (b) is benign in
+        #       practice, but advancing keeps the merged transcript correctly
+        #       ordered and alternation-clean regardless.
+        # Looping to a fixpoint guarantees the same-role guard can't strand the
+        # insert back inside a tool-pair (and vice versa).
+        while True:
+            advanced = False
+            # (a) Skip past a complete assistant(tool_calls) -> tool result
+            # block. Advance over ALL contiguous tool rows that belong to the
+            # preceding assistant's tool_calls, not just the first — a multi-tool
+            # turn has several adjacent tool results, and inserting between any of
+            # them splits the block (assistant, tool, <insert>, tool).
+            if idx < len(messages) and messages[idx].get("role") == "tool":
+                # Walk back over any contiguous tool rows already emitted for
+                # this block, so the owning assistant is found even when idx
+                # lands on the SECOND result of a multi-tool turn (where
+                # messages[idx - 1] is another tool row, not the assistant).
+                owner = idx - 1
+                while owner >= 0 and messages[owner].get("role") == "tool":
+                    owner -= 1
+                if (
+                    owner >= 0
+                    and messages[owner].get("role") == "assistant"
+                    and messages[owner].get("tool_calls")
+                ):
+                    while idx < len(messages) and messages[idx].get("role") == "tool":
+                        idx += 1
+                        advanced = True
+            # (b) Skip past an equal-timestamp run whose left neighbour shares
+            # this message's role — inserting there would re-order an
+            # already-matched same-role turn (user, <inserted user>, assistant).
+            # The agent core merges adjacent users before send, so this is benign
+            # in practice, but advancing keeps the merged transcript ordered.
+            while (
+                idx < len(messages)
+                and idx > 0
+                and messages[idx - 1].get("role") == msg.get("role")
+                and _message_timestamp_as_float(messages[idx]) == timestamp
+                and not _tool_call_assistant_should_precede_content_assistant(messages[idx], msg)
+            ):
+                idx += 1
+                advanced = True
+            if not advanced:
+                break
+        messages.insert(idx, msg)
+        return True
+    messages.append(msg)
+    return True
+
+
+def merge_session_messages_append_only(
+    sidecar_messages: list,
+    state_messages: list,
+    *,
+    truncation_watermark=None,
+    truncation_boundary=None,
+    incoming_provenance: Literal["unverified", "state_db"] = "unverified",
+    cancelled_journal_owner_messages: list | None = None,
+    cancelled_journal_source_messages: list | None = None,
+    cancelled_journal_prefix_start_verified: bool = False,
+) -> list:
+    """Merge sidecar/context and state.db messages without deleting local rows.
+
+    Thin wrapper that scopes the structured-content identity memo to this one
+    call; see :func:`_merge_session_messages_append_only_impl` for the merge.
+    """
+    token = _STRUCTURED_IDENTITY_MEMO.set({})
+    try:
+        return _merge_session_messages_append_only_impl(
+            sidecar_messages,
+            state_messages,
+            truncation_watermark=truncation_watermark,
+            truncation_boundary=truncation_boundary,
+            incoming_provenance=incoming_provenance,
+            cancelled_journal_owner_messages=cancelled_journal_owner_messages,
+            cancelled_journal_source_messages=cancelled_journal_source_messages,
+            cancelled_journal_prefix_start_verified=cancelled_journal_prefix_start_verified,
+        )
+    finally:
+        _STRUCTURED_IDENTITY_MEMO.reset(token)
+
+
+def _project_native_image_payload_conflicts_for_display(
+    sidecar_messages,
+    state_messages,
+    merged_messages,
+):
+    """Project a proven same-row native-image conflict onto its sidecar bubble."""
+    sidecar_messages = list(sidecar_messages or [])
+    state_messages = list(state_messages or [])
+    if not sidecar_messages or not state_messages:
+        return merged_messages
+
+    sidecar_row_id_counts = collections.Counter(
+        row_id
+        for message in sidecar_messages
+        if (row_id := _state_db_row_identity(message)) is not None
+    )
+    state_row_id_counts = collections.Counter(
+        row_id
+        for message in state_messages
+        if (row_id := _state_db_row_identity(message)) is not None
+    )
+    display_conflicts = {}
+    for incoming in state_messages:
+        if (
+            not isinstance(incoming, dict)
+            or incoming.get(_WEBUI_UNMATCHED_NATIVE_IMAGE_MIRROR_FIELD) is not True
+        ):
+            continue
+        row_id, row_id_valid = _state_db_row_identity_details(incoming)
+        timestamp, timestamp_valid = _message_exact_timestamp_details(incoming)
+        content = incoming.get("content")
+        if (
+            not row_id_valid
+            or row_id is None
+            or sidecar_row_id_counts[row_id] != 1
+            or state_row_id_counts[row_id] != 1
+            or not timestamp_valid
+            or timestamp is None
+            or str(incoming.get("role") or "").lower() != "user"
+            or not isinstance(content, str)
+        ):
+            continue
+        incoming_api_content = _session_message_api_content_key(incoming)
+        if incoming_api_content is None:
+            continue
+        sidecar_owner = next((
+            message for message in sidecar_messages
+            if isinstance(message, dict)
+            and _state_db_row_identity_details(message) == (row_id, True)
+            and _message_identity_compatible(message, incoming)
+            and message.get("content") == content
+            and _message_exact_timestamp_details(message) == (timestamp, True)
+            and _session_message_api_content_key(message)
+            not in (None, incoming_api_content)
+        ), None)
+        if sidecar_owner is not None:
+            display_conflicts[(row_id, timestamp, content)] = (incoming, sidecar_owner)
+
+    if not display_conflicts:
+        return merged_messages
+    visible_messages = []
+    for message in merged_messages:
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            row_id, row_id_valid = _state_db_row_identity_details(message)
+            timestamp, timestamp_valid = _message_exact_timestamp_details(message)
+            conflict = (
+                display_conflicts.get((row_id, timestamp, message["content"]))
+                if row_id_valid and row_id is not None and timestamp_valid
+                else None
+            )
+            if conflict is not None and _message_identity_compatible(message, conflict[0]):
+                incoming, sidecar_owner = conflict
+                is_sidecar_owner = (
+                    _message_identity_compatible(message, sidecar_owner)
+                    and _session_message_api_content_key(message)
+                    == _session_message_api_content_key(sidecar_owner)
+                )
+                if not is_sidecar_owner:
+                    continue
+        visible_messages.append(message)
+    return visible_messages
+
+
+def _merge_session_messages_append_only_impl(
+    sidecar_messages: list,
+    state_messages: list,
+    *,
+    truncation_watermark=None,
+    truncation_boundary=None,
+    incoming_provenance=None,
+    cancelled_journal_owner_messages=None,
+    cancelled_journal_source_messages=None,
+    cancelled_journal_prefix_start_verified=False,
+) -> list:
+    """Merge sidecar/context and state.db messages without deleting local rows.
+
+    ``truncation_boundary``: the original truncate cutoff — the
+    timestamp of the last message kept by the truncate operation.  When the
+    watermark is later advanced (new turn committed), this boundary is preserved
+    so the empty-sidecar recovery can distinguish a legitimate prefix from a
+    deleted suffix instead of guessing by dropping one turn pair.
+    """
+    sidecar_messages = list(sidecar_messages or [])
+    state_messages = list(state_messages or [])
+    owner_messages = sidecar_messages if cancelled_journal_owner_messages is None else cancelled_journal_owner_messages
+    post_cancel_state = False
+    owns_live_partial = _selected_history_owns_live_partial(sidecar_messages, owner_messages)
+    cancelled_turn = _cancelled_journal_turn_owner(owner_messages, include_live_partial=owns_live_partial)
+    latest_error = next((row for row in reversed(owner_messages)
+                         if isinstance(row, dict) and row.get('role') == 'assistant'
+                         and row.get('_error')), None)
+    owns_live_stop = (owns_live_partial and cancelled_turn is not None
+                      and cancelled_turn[1] is latest_error)
+    if ((owns_live_partial and not owns_live_stop)
+            or (incoming_provenance != 'state_db'
+                and (owns_live_partial or _sidecar_has_terminal_partial_error(owner_messages)))):
+        # The selected history owns the veto. Deferred model context can still
+        # precede the displayed Stop; SQLite must fill that older snapshot.
+        state_messages = []
+    elif incoming_provenance == 'state_db' and cancelled_turn:
+        source_messages = state_messages if cancelled_journal_source_messages is None else cancelled_journal_source_messages
+        owner_index, successor_index = _state_db_cancelled_journal_turn_bounds(
+            owner_messages, source_messages, turn_owner=cancelled_turn,
+        )
+        if owner_index is not None and truncation_watermark is None and not owns_live_partial:
+            allowed_rows = {id(row) for row in state_messages}
+            prefix = [row for row in source_messages[:owner_index] if id(row) in allowed_rows]
+            # Earlier saved Stops own their raw execution blocks as well. A
+            # later cancellation must not turn those blocks into prefix gaps.
+            for carrier_index, carrier in enumerate(owner_messages):
+                if not carrier.get('_error'):
+                    continue
+                earlier = owner_messages[:carrier_index + 1]
+                earlier_turn = _cancelled_journal_turn_owner(earlier, include_live_partial=True)
+                if (not earlier_turn or earlier_turn[1] is not carrier
+                        or earlier_turn[0] is cancelled_turn[0]):
+                    continue
+                earlier_owner, earlier_successor = _state_db_cancelled_journal_turn_bounds(
+                    earlier, source_messages, turn_owner=earlier_turn,
+                    allow_legacy_integer_clock=True,
+                )
+                if earlier_owner is None:
+                    prefix = []
+                    break
+                end = earlier_successor if earlier_successor is not None else len(source_messages)
+                excluded = {id(row) for row in source_messages[earlier_owner + 1:end]}
+                prefix = [row for row in prefix if id(row) not in excluded]
+                source_owner = source_messages[earlier_owner]
+                if _message_exact_timestamp(source_owner) != _message_exact_timestamp(earlier_turn[0]):
+                    # The uniquely proved legacy integer/fractional owner is
+                    # one turn. Project its canonical saved owner, without
+                    # rewriting either durable source or its execution clock.
+                    prefix = [earlier_turn[0] if row is source_owner else row for row in prefix]
+            _reconcile_api_content_sidecars(sidecar_messages, prefix)
+            sidecar_messages = _restore_cancelled_journal_prefix(
+                sidecar_messages, prefix, owner_messages,
+                verified_start=cancelled_journal_prefix_start_verified,
+            )
+        proved_suffix = list(source_messages[successor_index:]) if successor_index is not None else []
+        proved_suffix = _state_db_after_saved_cancel_successors(
+            owner_messages, proved_suffix, sidecar_messages, turn_owner=cancelled_turn,
+        )
+        if cancelled_journal_source_messages is None:
+            state_messages = proved_suffix
+        else:
+            # Context/compression slicing retains these invocation-local row
+            # objects. Intersect with the proved suffix of the full read, so an
+            # anchor cannot erase owner proof or re-admit a pre-anchor row.
+            suffix_row_ids = {id(row) for row in proved_suffix}
+            state_messages = [row for row in state_messages if id(row) in suffix_row_ids]
+        post_cancel_state = bool(state_messages)
+    _reconcile_api_content_sidecars(sidecar_messages, state_messages)
+    # Rows admitted from state.db in this invocation stay individually
+    # addressable for the #7237 [False] stopped-context splice (see the
+    # `_stopped_db_successor` stamp below). Capture their object ids now,
+    # before the merge loop, because only THIS list's rows may be stamped.
+    _admitted_state_row_objects = {
+        id(row) for row in state_messages if isinstance(row, dict)
+    }
+    # The reconciler's quarantine sets are invocation-local. Mirror the
+    # identity-bucket guards here because this append-only merge has its own
+    # row-id fast path that must not re-admit a row isolated above.
+    sidecar_row_id_counts = collections.Counter()
+    state_row_id_counts = collections.Counter()
+    for message in sidecar_messages:
+        row_id, row_id_valid = _state_db_row_identity_details(message)
+        if row_id_valid and row_id is not None:
+            sidecar_row_id_counts[row_id] += 1
+    for message in state_messages:
+        row_id, row_id_valid = _state_db_row_identity_details(message)
+        if row_id_valid and row_id is not None:
+            state_row_id_counts[row_id] += 1
+
+    def _row_id_fast_path_allowed(existing, incoming) -> bool:
+        if not isinstance(existing, dict) or not isinstance(incoming, dict):
+            return False
+        existing_row_id, existing_row_id_valid = _state_db_row_identity_details(existing)
+        incoming_row_id, incoming_row_id_valid = _state_db_row_identity_details(incoming)
+        if (
+            not existing_row_id_valid
+            or not incoming_row_id_valid
+            or existing_row_id is None
+            or existing_row_id != incoming_row_id
+        ):
+            return False
+        if (
+            sidecar_row_id_counts.get(existing_row_id, 0) > 1
+            or state_row_id_counts.get(existing_row_id, 0) > 1
+        ):
+            return False
+        _, existing_timestamp_valid = _message_exact_timestamp_details(existing)
+        _, incoming_timestamp_valid = _message_exact_timestamp_details(incoming)
+        return (
+            existing_timestamp_valid
+            and incoming_timestamp_valid
+            and _message_identity_compatible(existing, incoming)
+        )
+
+    # Per-invocation cache keyed by message identity. Sidecar/state message objects
+    # are retained for this call, and this function does not mutate key-defining
+    # fields before each helper call.
+    _MESSAGE_CACHE_MISSING = object()
+    _cached_msg_prepared: dict[int, dict[str, object]] = {}
+    _cached_msg_keys: dict[tuple[int, str], object] = {}
+
+    _message_key_helpers = {
+        "merge": _session_message_merge_key,
+        "dedup": _session_message_dedup_key,
+        "content_sidecar": lambda msg: _session_message_content_key(
+            msg, normalize_workspace_prefix=False
+        ),
+        "content_state": lambda msg: _session_message_content_key(
+            msg, normalize_workspace_prefix=True
+        ),
+        "visible_sidecar": lambda msg: _session_message_visible_key(
+            msg, normalize_workspace_prefix=False
+        ),
+        "visible_state": lambda msg: _session_message_visible_key(
+            msg, normalize_workspace_prefix=True
+        ),
+    }
+
+    def _cached_message_key(msg, kind):
+        if not isinstance(msg, dict):
+            return _message_key_helpers[kind](msg)
+
+        cache_key = (id(msg), kind)
+        value = _cached_msg_keys.get(cache_key, _MESSAGE_CACHE_MISSING)
+        if value is not _MESSAGE_CACHE_MISSING:
+            return value
+
+        helper = _message_key_helpers[kind]
+        msg_cache_key = id(msg)
+        prepared_msg = _cached_msg_prepared.get(msg_cache_key)
+
+        if kind in {"merge", "dedup"}:
+            if prepared_msg is None:
+                value = helper(msg)
+                # If this is a legacy message key, keep the already-stringified
+                # content payload for downstream helper calls.
+                # Structured content is never substituted: its key component is
+                # an identity token, not content, and writing it back would let
+                # a scalar equal to that token impersonate the rich row.
+                if (
+                    isinstance(value, tuple)
+                    and value
+                    and value[0] == "legacy"
+                    and isinstance(value[2], str)
+                    and not isinstance(msg.get("content"), list)
+                ):
+                    prepared_msg = dict(msg)
+                    prepared_msg["content"] = value[2]
+                    _cached_msg_prepared[msg_cache_key] = prepared_msg
+            else:
+                value = helper(prepared_msg)
+            _cached_msg_keys[cache_key] = value
+            return value
+
+        if prepared_msg is None:
+            # For non-ID messages this is the canonical merge path.
+            merge_key = _cached_message_key(msg, "merge")
+            prepared_msg = _cached_msg_prepared.get(msg_cache_key)
+            if prepared_msg is None:
+                prepared_msg = dict(msg)
+                raw_content = msg.get("content")
+                if isinstance(raw_content, list):
+                    # Keep the real structure; downstream keys derive their own
+                    # out-of-band identity from it.
+                    prepared_msg["content"] = raw_content
+                elif (
+                    isinstance(merge_key, tuple)
+                    and len(merge_key) > 2
+                    and merge_key[0] == "legacy"
+                    and isinstance(merge_key[2], str)
+                ):
+                    prepared_msg["content"] = merge_key[2]
+                else:
+                    prepared_msg["content"] = str(raw_content or "")
+                _cached_msg_prepared[msg_cache_key] = prepared_msg
+
+        value = helper(prepared_msg)
+        _cached_msg_keys[cache_key] = value
+        return value
+
+    watermark_timestamp = _message_timestamp_as_float({"timestamp": truncation_watermark})
+    if not state_messages:
+        return sidecar_messages
+    if not sidecar_messages:
+        if watermark_timestamp is None:
+            # No watermark — keep everything, just dedup.
+            filtered = state_messages
+        elif watermark_timestamp == 0:
+            # Truncate-to-empty sentinel (#2914) — block all replay.
+            return []
+        else:
+            # Positive watermark after edit/retry/undo (#4767).  Without a
+            # sidecar there's no seen_content_keys to check against, so we
+            # reconstruct the correct transcript from state.db alone.
+            #
+            # `at_or_after` (ts >= watermark) is legitimate POST-EDIT content
+            # ONLY when the watermark was ADVANCED strictly past the original
+            # truncate cutoff — i.e. a new turn was committed after the edit, so
+            # truncation_boundary (the original cutoff) is strictly below the
+            # advanced watermark.  In that state we keep the legitimate prefix
+            # (ts <= boundary) plus the post-edit tail (ts >= watermark) and drop
+            # the deleted (boundary, watermark) suffix.
+            #
+            # In every OTHER state the content above the watermark is the deleted
+            # suffix, NOT post-edit content, so keeping it would resurrect deleted
+            # turns (the exact data-loss this fix exists to kill):
+            #   * boundary == watermark — just truncated, no new turn committed
+            #     yet (e.g. crash/cold-load with metadata-vs-sidecar divergence);
+            #   * boundary is None — legacy session saved before this field
+            #     existed.  In the pre-#4767 model committing a turn CLEARED the
+            #     watermark to None, so a persisted positive watermark always
+            #     meant "frozen at cutoff, not advanced".
+            # For all of those, fall back to the conservative pre-#4767 filter
+            # `ts <= watermark`, which never resurrects a deleted suffix.
+            boundary_ts = _message_timestamp_as_float({"timestamp": truncation_boundary})
+            if boundary_ts is not None and boundary_ts < watermark_timestamp:
+                pre_legitimate = [
+                    m for m in state_messages
+                    if (ts := _message_timestamp_as_float(m)) is not None
+                    and ts <= boundary_ts
+                ]
+                at_or_after = [
+                    m for m in state_messages
+                    if (ts := _message_timestamp_as_float(m)) is not None
+                    and ts >= watermark_timestamp
+                ]
+                filtered = pre_legitimate + at_or_after
+            else:
+                filtered = [
+                    m for m in state_messages
+                    if (ts := _message_timestamp_as_float(m)) is not None
+                    and ts <= watermark_timestamp
+                ]
+
+        # Deduplicate true duplicates (same role, content, exact timestamp)
+        # without collapsing legitimately-repeated identical turns (#3346).
+        seen = set()
+        seen_messages = {}
+        deduped = []
+        for msg in filtered:
+            key = _cached_message_key(msg, "dedup")
+            if key not in seen:
+                seen.add(key)
+                seen_messages[key] = msg
+                deduped.append(msg)
+            else:
+                _merge_session_display_metadata(seen_messages.get(key), msg)
+        return deduped
+
+    merged_messages = []
+    seen_message_keys = set()
+    seen_dedup_keys = set()
+    seen_content_keys = set()
+    seen_visible_keys = set()
+    sidecar_visible_sequence = []
+    sidecar_visible_messages = []
+    sidecar_visible_keys = set()
+    sidecar_visible_counts = {}
+    sidecar_multimodal_mirrors = {}
+    ambiguous_multimodal_mirrors = set()
+    merged_by_message_key = {}
+    merged_by_dedup_key = {}
+    merged_by_visible_key = {}
+    merged_by_row_id = {}
+    ambiguous_row_ids = set()
+    max_sidecar_timestamp = None
+
+    def _remember_merged_message(message, *, source: str):
+        if not isinstance(message, dict):
+            return
+        merged_by_message_key.setdefault(_cached_message_key(message, "merge"), message)
+        merged_by_dedup_key.setdefault(_cached_message_key(message, "dedup"), message)
+        merged_by_visible_key.setdefault(
+            _cached_message_key(message, f"visible_{source}"), message
+        )
+        row_id, row_id_valid = _state_db_row_identity_details(message)
+        if row_id_valid and row_id is not None:
+            if row_id in merged_by_row_id:
+                ambiguous_row_ids.add(row_id)
+            else:
+                merged_by_row_id[row_id] = message
+
+    for msg in sidecar_messages:
+        timestamp = _message_timestamp_as_float(msg)
+        if timestamp is not None:
+            max_sidecar_timestamp = timestamp if max_sidecar_timestamp is None else max(max_sidecar_timestamp, timestamp)
+        key = _cached_message_key(msg, "merge")
+        seen_message_keys.add(key)
+        seen_dedup_keys.add(_cached_message_key(msg, "dedup"))
+        content_key = _cached_message_key(msg, "content_sidecar")
+        seen_content_keys.add(content_key)
+        visible_key = _cached_message_key(msg, "visible_sidecar")
+        seen_visible_keys.add(visible_key)
+        sidecar_visible_keys.add(visible_key)
+        sidecar_visible_counts[visible_key] = sidecar_visible_counts.get(visible_key, 0) + 1
+        sidecar_visible_sequence.append(visible_key)
+        sidecar_visible_messages.append(msg)
+        multimodal_mirror_key = _session_message_multimodal_mirror_key(
+            msg,
+            require_image_parts=True,
+        )
+        if multimodal_mirror_key is not None:
+            if multimodal_mirror_key in sidecar_multimodal_mirrors:
+                ambiguous_multimodal_mirrors.add(multimodal_mirror_key)
+            else:
+                sidecar_multimodal_mirrors[multimodal_mirror_key] = msg
+        merged_messages.append(msg)
+        _remember_merged_message(msg, source="sidecar")
+    sidecar_visible_lookup = _build_visible_duplicate_lookup(sidecar_visible_keys)
+    state_multimodal_mirror_keys = {}
+    ambiguous_state_multimodal_mirrors = set()
+    if sidecar_multimodal_mirrors:
+        state_multimodal_mirror_identities = {}
+        for state_message in state_messages:
+            mirror_key = _session_message_multimodal_mirror_key(
+                state_message, require_scalar_mirror=True
+            )
+            state_multimodal_mirror_keys[id(state_message)] = mirror_key
+            if (
+                mirror_key is not None
+                and mirror_key in sidecar_multimodal_mirrors
+                and mirror_key not in ambiguous_multimodal_mirrors
+            ):
+                stable_id, stable_id_valid = _stable_message_identity_details(
+                    state_message
+                )
+                row_id, row_id_valid = _state_db_row_identity_details(state_message)
+                if not stable_id_valid or not row_id_valid:
+                    ambiguous_state_multimodal_mirrors.add(mirror_key)
+                    continue
+                identities = state_multimodal_mirror_identities.setdefault(
+                    mirror_key, set()
+                )
+                identities.add(
+                    (
+                        stable_id,
+                        row_id,
+                        _session_message_api_content_key(state_message),
+                    )
+                )
+                if len(identities) > 1:
+                    ambiguous_state_multimodal_mirrors.add(mirror_key)
+    state_replay_idx = 0
+    skipped_state_visible_counts = {}
+    # Loop-invariant: a session whose original truncate cutoff (truncation_boundary)
+    # is strictly below the watermark is genuinely ADVANCED (a new turn was
+    # committed after the edit). In that state post-watermark state.db rows are
+    # legitimate post-edit content, even when the sidecar's newest row only
+    # EQUALS the watermark (the post-edit user is checkpointed but its assistant
+    # reply exists only in state.db). Conservative for boundary None / == watermark.
+    boundary_ts = _message_timestamp_as_float({"timestamp": truncation_boundary})
+    watermark_advanced_by_boundary = (
+        watermark_timestamp is not None
+        and boundary_ts is not None
+        and boundary_ts < watermark_timestamp
+    )
+    # Self-heal for a STALE (wall-clock) watermark left by the pre-fix
+    # advance helper. A legitimate watermark always equals a real message
+    # timestamp (session_ops._truncation_watermark_for uses the last kept
+    # row's timestamp), so a watermark NEWER than every sidecar row cannot be a
+    # real truncate cutoff -- it is an invented boundary. Because
+    # sidecar_advanced_past_watermark then stays False forever, the filter
+    # below hides exactly the state.db rows that would advance the sidecar past
+    # the watermark: a self-locked transcript that silently drops every later
+    # turn. Detect that and drop the watermark, restoring normal merge order
+    # (fail OPEN toward data, matching the intent of session_recovery's
+    # watermark guards). The replaced-tail suppression still works via the
+    # legitimate boundary/watermark values, which are always <= max_sidecar.
+    #
+    # Provenance guard (#7946 review): manual compression is a LEGITIMATE cutoff
+    # writer that CAN exceed every timestamped sidecar row -- it stamps the
+    # missing timestamps on a compressed COPY with the current time and leaves
+    # session.messages unchanged, so whenever the sidecar's newest row has no
+    # timestamp the real cutoff sits above every timestamped sidecar row.
+    # Every such writer persists truncation_boundary at the SAME value as the
+    # watermark (routes compression, session_ops truncate/retry/undo), while
+    # the pre-fix wall-clock advance never touched the boundary. A watermark
+    # that matches the persisted boundary is therefore a real cutoff and must
+    # keep suppressing the pre-compression rows (#4836); only an unmatched
+    # watermark above the sidecar is the invented wall-clock value.
+    watermark_matches_persisted_boundary = (
+        watermark_timestamp is not None
+        and boundary_ts is not None
+        and boundary_ts == watermark_timestamp
+    )
+    # Ambiguous shape (#7946 gate c17, Codex): a recorded cutoff that EQUALS
+    # the newest timestamped sidecar row (a truncate/edit/undo whose post-edit
+    # turn never reached the sidecar with a timestamp). Nothing persisted marks
+    # where the deleted suffix ends, so state.db rows after the cutoff may be
+    # the rows the user deleted; healing would resurrect them. Stay
+    # conservative there (master behaviour); the writer clamp above prevents
+    # new occurrences.
+    cutoff_is_newest_sidecar_row = (
+        boundary_ts is not None
+        and max_sidecar_timestamp is not None
+        and boundary_ts == max_sidecar_timestamp
+    )
+    watermark_is_stale_wall_clock = (
+        watermark_timestamp is not None
+        and watermark_timestamp != 0
+        and max_sidecar_timestamp is not None
+        and watermark_timestamp > max_sidecar_timestamp
+        and not watermark_matches_persisted_boundary
+        and not cutoff_is_newest_sidecar_row
+    )
+    healed_to_recorded_cutoff = False
+    if watermark_is_stale_wall_clock:
+        # Heal to the newest REAL cutoff instead of dropping the watermark
+        # (#7946 gate, Codex + senior review): clearing it would replay rows a
+        # recorded cutoff deliberately hid -- e.g. a session manually compressed
+        # at C and only later hit by the wall-clock advance (W > C > every
+        # timestamped sidecar row) would get its discarded pre-compression
+        # state.db rows back (#4836). The newest real cutoff is the later of the
+        # recorded boundary and the newest timestamped sidecar row: unseen
+        # state.db rows at or below it stay suppressed exactly as on master
+        # (compression-discarded rows, a truncate's deleted suffix that predates
+        # the newest sidecar row), and the advance guard below is released so
+        # every state.db turn AFTER it -- the turns the self-lock was hiding --
+        # merges back (#7945).
+        heal_candidates = [max_sidecar_timestamp]
+        if boundary_ts is not None and boundary_ts > 0 and boundary_ts < watermark_timestamp:
+            heal_candidates.append(boundary_ts)
+        watermark_timestamp = max(heal_candidates)
+        healed_to_recorded_cutoff = True
+
+    def _state_row_is_truncated(
+        msg, key, content_key, timestamp, checkpoint_consumed,
+        *, retained_native_image_row: bool | None = None,
+    ):
+        # Skip rows ABOVE the watermark only while the sidecar has NOT advanced
+        # past the watermark. Because Session.save() no longer auto-clears the
+        # watermark, an unconditional `timestamp > watermark` skip would become
+        # permanent and silently drop legitimate future state.db-only recovery
+        # rows once the session moves forward past the edit boundary. Once the
+        # sidecar's own max timestamp is beyond the watermark, allow state rows
+        # newer than the sidecar tail to merge.
+        #
+        # The sidecar's max timestamp can also EQUAL the watermark when the new
+        # post-edit USER turn has been checkpointed into the sidecar (its
+        # timestamp == the advanced watermark) but its ASSISTANT reply exists
+        # only in state.db (recovery before the sidecar tail advances). In that
+        # state truncation_boundary < watermark proves the session is genuinely
+        # advanced, so the post-watermark state-only reply is legitimate
+        # post-edit content and must merge through (not be dropped as a replaced
+        # tail). The conservative skip still applies for boundary is None and
+        # boundary == watermark (not-advanced / legacy).
+        #
+        # CRITICAL: the boundary-advanced signal may only bypass the skip AFTER
+        # state replay has consumed the sidecar's visible checkpoint
+        # (state_replay_idx >= len(sidecar_visible_sequence)). A deleted suffix
+        # row with ts > watermark that appears in state.db BEFORE the edited
+        # checkpoint must still be skipped — otherwise the advanced signal would
+        # resurrect it. The sidecar-max-timestamp signal needs no such gate (a
+        # sidecar tail beyond the watermark is itself proof the checkpoint has
+        # advanced).
+        sidecar_advanced_past_watermark = (
+            watermark_timestamp is not None
+            and (
+                healed_to_recorded_cutoff
+                or (max_sidecar_timestamp is not None
+                    and max_sidecar_timestamp > watermark_timestamp)
+                or (watermark_advanced_by_boundary and checkpoint_consumed)
+            )
+        )
+        message_key_seen = key in seen_message_keys
+        content_key_seen = content_key in seen_content_keys
+        if retained_native_image_row is not None:
+            # A marked image mirror needs durable row proof; an equal scalar
+            # projection from another row cannot exempt it from the watermark.
+            message_key_seen = content_key_seen = retained_native_image_row
+        if (
+            watermark_timestamp is not None
+            and timestamp is not None
+            and timestamp > watermark_timestamp
+            and not message_key_seen
+            and (
+                not sidecar_advanced_past_watermark
+                or (max_sidecar_timestamp is not None and timestamp <= max_sidecar_timestamp)
+            )
+        ):
+            return True
+        # When a truncation watermark is active, state.db may contain original
+        # messages that were replaced by Edit (old content with old timestamp).
+        # The timestamp-based filter above catches messages AFTER the watermark,
+        # but messages BEFORE it (like the original pre-edit content) slip through.
+        # If a state.db message's content is not present in the sidecar and its
+        # timestamp is before the watermark, it's a replaced/stale row — skip it.
+        if (
+            watermark_timestamp is not None
+            and timestamp is not None
+            and timestamp < watermark_timestamp
+            and not message_key_seen
+            and not content_key_seen
+        ):
+            return True
+        # Same-second edit: if timestamp equals the watermark and the message
+        # content is not in the sidecar, it's a replaced message edited at the
+        # same second — skip it. The edited version (same timestamp, different
+        # content) is in the sidecar and survives this check.
+        #
+        # Only apply the same-second guard to user messages. An assistant reply
+        # (or tool message) at the same second as the watermark is a legitimate
+        # post-edit recovery row — the sidecar holds only the edited user
+        # checkpoint, so the assistant reply's content won't be in it and would
+        # be silently dropped without this role guard.
+        return (
+            watermark_timestamp is not None
+            and timestamp is not None
+            and timestamp == watermark_timestamp
+            and not message_key_seen
+            and not content_key_seen
+            and str(msg.get("role", "")).lower() == "user"
+        )
+
+    for source_message in state_messages:
+        preserve_native_image_row = (
+            isinstance(source_message, dict)
+            and source_message.get(_WEBUI_UNMATCHED_NATIVE_IMAGE_MIRROR_FIELD) is True
+        )
+        msg = (
+            {
+                key: value
+                for key, value in source_message.items()
+                if key != _WEBUI_UNMATCHED_NATIVE_IMAGE_MIRROR_FIELD
+            }
+            if preserve_native_image_row
+            else source_message
+        )
+        timestamp = _message_timestamp_as_float(msg)
+        key = _cached_message_key(msg, "merge")
+        dedup_key = _cached_message_key(msg, "dedup")
+        visible_key = _cached_message_key(msg, "visible_state")
+        content_key = _cached_message_key(msg, "content_state")
+        if preserve_native_image_row:
+            row_id, row_id_valid = _state_db_row_identity_details(msg)
+            existing = (
+                merged_by_row_id.get(row_id)
+                if row_id_valid and row_id is not None
+                else None
+            )
+            row_id_fast_path_allowed = (
+                existing is not None
+                and row_id not in ambiguous_row_ids
+                and _row_id_fast_path_allowed(existing, msg)
+            )
+            existing_timestamp, existing_timestamp_valid = (
+                _message_exact_timestamp_details(existing)
+            )
+            incoming_timestamp, incoming_timestamp_valid = (
+                _message_exact_timestamp_details(msg)
+            )
+            retained_native_image_row = (
+                row_id_fast_path_allowed
+                and sidecar_row_id_counts.get(row_id, 0) == 1
+                and state_row_id_counts.get(row_id, 0) == 1
+                and existing_timestamp_valid
+                and incoming_timestamp_valid
+                and existing_timestamp is not None
+                and existing_timestamp == incoming_timestamp
+                and str(msg.get("role") or "").lower() == "user"
+            )
+            if _state_row_is_truncated(
+                msg,
+                key,
+                content_key,
+                timestamp,
+                state_replay_idx >= len(sidecar_visible_sequence),
+                retained_native_image_row=retained_native_image_row,
+            ):
+                continue
+            if row_id_fast_path_allowed:
+                # This state row replays the sidecar row it resolved to, so it
+                # consumes that position in the replay sequence exactly like the
+                # ordinary and multimodal-mirror paths do. Without this the
+                # checkpoint never reads as consumed and a later state-only
+                # reply after an edited checkpoint is truncated.
+                if (
+                    state_replay_idx < len(sidecar_visible_messages)
+                    and sidecar_visible_messages[state_replay_idx] is existing
+                ):
+                    state_replay_idx += 1
+                existing_api_content = _session_message_api_content_key(existing)
+                incoming_api_content = _session_message_api_content_key(msg)
+                if (
+                    existing_api_content is not None
+                    and incoming_api_content is not None
+                    and existing_api_content != incoming_api_content
+                ):
+                    # Row identity does not establish which provider payload is
+                    # newer. A unique exact row match proves this row survived
+                    # truncation, so preserve both versions for model context.
+                    pass
+                else:
+                    if existing_api_content is None and incoming_api_content is not None:
+                        _copy_api_content_sidecar(existing, msg)
+                    _merge_session_display_metadata(existing, msg)
+                    continue
+            if dedup_key in seen_dedup_keys:
+                duplicate = merged_by_dedup_key.get(dedup_key)
+                duplicate_row_id, duplicate_row_id_valid = (
+                    _state_db_row_identity_details(duplicate)
+                )
+                two_distinct_durable_rows = (
+                    row_id_valid
+                    and row_id is not None
+                    and duplicate_row_id_valid
+                    and duplicate_row_id is not None
+                    and duplicate_row_id != row_id
+                )
+                if not two_distinct_durable_rows:
+                    _merge_session_display_metadata(duplicate, msg)
+                    continue
+                duplicate = merged_by_row_id.get(row_id)
+                duplicate_row_id, duplicate_row_id_valid = (
+                    _state_db_row_identity_details(duplicate)
+                )
+                same_durable_row = (
+                    row_id not in ambiguous_row_ids
+                    and duplicate_row_id_valid
+                    and duplicate_row_id == row_id
+                    and _cached_message_key(duplicate, "dedup") == dedup_key
+                    and _row_id_fast_path_allowed(duplicate, msg)
+                )
+                if same_durable_row:
+                    _merge_session_display_metadata(duplicate, msg)
+                    continue
+            if not _insert_state_message_chronologically(merged_messages, msg):
+                merged_messages.append(msg)
+            seen_message_keys.add(key)
+            seen_dedup_keys.add(dedup_key)
+            seen_content_keys.add(content_key)
+            seen_visible_keys.add(visible_key)
+            _remember_merged_message(msg, source="state")
+            continue
+        multimodal_mirror_key = (
+            state_multimodal_mirror_keys.get(id(source_message))
+            if sidecar_multimodal_mirrors
+            else None
+        )
+        multimodal_replay_target = (
+            sidecar_multimodal_mirrors.get(multimodal_mirror_key)
+            if (
+                multimodal_mirror_key not in ambiguous_multimodal_mirrors
+                and multimodal_mirror_key not in ambiguous_state_multimodal_mirrors
+            )
+            else None
+        )
+        if (
+            multimodal_replay_target is not None
+            and not _message_private_identity_compatible(multimodal_replay_target, msg)
+        ):
+            multimodal_replay_target = None
+        if multimodal_replay_target is not None:
+            _copy_api_content_sidecar(multimodal_replay_target, msg)
+            _merge_session_display_metadata(multimodal_replay_target, msg)
+            if (
+                state_replay_idx < len(sidecar_visible_messages)
+                and sidecar_visible_messages[state_replay_idx] is multimodal_replay_target
+            ):
+                state_replay_idx += 1
+            seen_dedup_keys.add(dedup_key)
+            continue
+        replays_sidecar_prefix = False
+        replay_target = None
+        if not post_cancel_state and state_replay_idx < len(sidecar_visible_sequence):
+            expected_visible_key = sidecar_visible_sequence[state_replay_idx]
+            if visible_key == expected_visible_key or _has_visible_duplicate(
+                visible_key, {expected_visible_key}
+            ):
+                replays_sidecar_prefix = True
+                replay_target = sidecar_visible_messages[state_replay_idx]
+                state_replay_idx += 1
+        if replays_sidecar_prefix:
+            _merge_session_display_metadata(replay_target, msg)
+            matched_visible_key = _matching_visible_duplicate(
+                visible_key,
+                sidecar_visible_keys,
+                sidecar_visible_lookup,
+            )
+            if matched_visible_key is not None:
+                skipped_state_visible_counts[matched_visible_key] = (
+                    skipped_state_visible_counts.get(matched_visible_key, 0) + 1
+                )
+            # Record dedup key so later duplicates of this replayed message
+            # are caught by the dedup guard (#3346).
+            seen_dedup_keys.add(dedup_key)
+            continue
+        row_id, row_id_valid = _state_db_row_identity_details(msg)
+        row_id_sidecar_conflict = False
+        existing = (
+            merged_by_row_id.get(row_id)
+            if row_id_valid and row_id is not None
+            else None
+        )
+        if (
+            row_id_valid
+            and row_id is not None
+            and existing is not None
+            and row_id not in ambiguous_row_ids
+            and _row_id_fast_path_allowed(existing, msg)
+        ):
+            existing_api_content = _session_message_api_content_key(existing)
+            incoming_api_content = _session_message_api_content_key(msg)
+            row_id_sidecar_conflict = (
+                existing_api_content is not None
+                and incoming_api_content is not None
+                and existing_api_content != incoming_api_content
+            )
+            if not row_id_sidecar_conflict:
+                if existing_api_content is None and incoming_api_content is not None:
+                    _copy_api_content_sidecar(existing, msg)
+                _merge_session_display_metadata(existing, msg)
+                continue
+        checkpoint_consumed = state_replay_idx >= len(sidecar_visible_sequence)
+        if _state_row_is_truncated(
+            msg, key, content_key, timestamp, checkpoint_consumed,
+        ):
+            continue
+        # Check for true duplicates using full-precision timestamp (#3346).
+        # Must run before the merge-key guards so that legitimately distinct
+        # sub-second messages with the same second-level merge key are not
+        # collapsed.  The merge key truncates to seconds; the dedup key does
+        # not.
+        if dedup_key in seen_dedup_keys:
+            _merge_session_display_metadata(merged_by_dedup_key.get(dedup_key), msg)
+            continue
+        if not post_cancel_state and max_sidecar_timestamp is not None and timestamp is not None and timestamp <= max_sidecar_timestamp:
+            # For message_id keys the merge key is authoritative — skip if
+            # already seen.  For legacy keys the dedup check above already
+            # handled true duplicates; same-second distinct messages must
+            # fall through.
+            if key in seen_message_keys and key[0] == "message_id":
+                _merge_session_display_metadata(merged_by_message_key.get(key), msg)
+                continue
+            if not (isinstance(key, tuple) and key[:1] == ("message_id",)):
+                # Legacy key within sidecar timestamp range — only skip if
+                # this exact merge_key was already registered by the sidecar.
+                # Different tool_calls produce different merge_keys even with
+                # identical content/timestamp, so an unchecked continue here
+                # would drop legitimately distinct turns.  (#3346 / PR #3665)
+                if key in seen_message_keys:
+                    _merge_session_display_metadata(merged_by_message_key.get(key), msg)
+                    continue
+        if key in seen_message_keys and key[0] == "message_id":
+            _merge_session_display_metadata(merged_by_message_key.get(key), msg)
+            continue
+        matched_visible_key = _matching_visible_duplicate(
+            visible_key,
+            sidecar_visible_keys,
+            sidecar_visible_lookup,
+        )
+        if matched_visible_key is not None and not post_cancel_state:
+            skipped_count = skipped_state_visible_counts.get(matched_visible_key, 0)
+            sidecar_count = sidecar_visible_counts.get(matched_visible_key, 0)
+            if skipped_count < sidecar_count:
+                skipped_state_visible_counts[matched_visible_key] = skipped_count + 1
+                _merge_session_display_metadata(merged_by_visible_key.get(matched_visible_key), msg)
+                continue
+        # State rows at or before the newest sidecar timestamp are normally
+        # assumed to have already been observed by the sidecar. The <= gate
+        # preserves sidecar-only ordering/metadata for equal timestamps and
+        # prevents duplicate legacy rows when timestamp precision differs
+        # between stores. State rows whose visible content already exists in
+        # the sidecar are also skipped even if state.db restamped them later
+        # during compaction/recovery; otherwise old prompts can be appended
+        # after the assistant tail and make /api/session look like the answer
+        # vanished. Explicit message ids are authoritative for distinct rows
+        # only when their visible content is not already present.
+        if (
+            key[0] != "message_id"
+            and not post_cancel_state
+            and max_sidecar_timestamp is not None
+            and timestamp is not None
+            and timestamp <= max_sidecar_timestamp
+            and not row_id_sidecar_conflict
+        ):
+            # When a truncation watermark is active and the sidecar holds only
+            # the edited user checkpoint, state.db may contain an assistant/tool
+            # reply at the same timestamp that is NOT in the sidecar.  This
+            # block would normally skip it ("sidecar already has this message"),
+            # but the sidecar doesn't — it's a genuine state-only recovery row.
+            # Let it through (CORE-B, #4767).
+            #
+            # Only AFTER the sidecar's visible checkpoint has been consumed
+            # (checkpoint_consumed) — a same-second row appearing in state.db
+            # BEFORE the edited user replay is a deleted/replaced row, not the
+            # post-edit reply, and must stay skipped.
+            if (
+                watermark_timestamp is not None
+                and timestamp == watermark_timestamp
+                and checkpoint_consumed
+                and str(msg.get("role", "")).lower() != "user"
+                and content_key not in seen_content_keys
+            ):
+                pass  # fall through to append below
+            else:
+                # Legacy key within sidecar timestamp range.  Normally skip — the
+                # sidecar already has this message.  Exception: if the state.db
+                # message has tool_calls that DIFFER from the sidecar version
+                # (same content_key but different dedup_key because tool_calls
+                # differ), preserve it — distinct tool_calls must not be collapsed.
+                _tc = msg.get("tool_calls")
+                if _tc:
+                    _ck = content_key
+                    if _ck in seen_content_keys and dedup_key not in seen_dedup_keys:
+                        # Different tool_calls from sidecar — preserve, but keep
+                        # the row in timestamp order. Falling through to the
+                        # generic append path would move older tool-call-only
+                        # assistant rows after the settled final answer.
+                        if _insert_state_message_chronologically(merged_messages, msg):
+                            seen_message_keys.add(key)
+                            seen_dedup_keys.add(dedup_key)
+                            seen_content_keys.add(content_key)
+                            seen_visible_keys.add(visible_key)
+                            _remember_merged_message(msg, source="state")
+                        continue
+                    else:
+                        _merge_session_display_metadata(merged_by_message_key.get(key), msg)
+                        continue
+                else:
+                    if msg.get("role") == "user" and content_key not in seen_content_keys:
+                        if _insert_state_message_chronologically(merged_messages, msg):
+                            seen_message_keys.add(key)
+                            seen_dedup_keys.add(dedup_key)
+                            seen_content_keys.add(content_key)
+                            seen_visible_keys.add(visible_key)
+                            _remember_merged_message(msg, source="state")
+                        continue
+                    _merge_session_display_metadata(merged_by_message_key.get(key), msg)
+                    continue
+        seen_message_keys.add(key)
+        seen_dedup_keys.add(dedup_key)
+        seen_content_keys.add(content_key)
+        seen_visible_keys.add(visible_key)
+        # This terminal path is shared by state.db reconciliation and by ordered
+        # sidecar stitching (notably compression continuations). Only the caller
+        # that read state.db may authorize timestamp-based recovery placement;
+        # stable child-sidecar sequence remains authoritative even when an
+        # archived parent was restamped later.
+        if (
+            incoming_provenance == "state_db"
+            and not post_cancel_state
+            and max_sidecar_timestamp is not None
+            and timestamp is not None
+            and timestamp < max_sidecar_timestamp
+        ):
+            if not _insert_state_message_chronologically(merged_messages, msg):
+                merged_messages.append(msg)
+        else:
+            merged_messages.append(msg)
+        _remember_merged_message(msg, source="state")
+    # #7237 [False] maintainer-call resolution (durable discriminator): when a
+    # terminal partial/error carrier exists but the selected history does NOT
+    # own it (`owns_live_partial` False — the "earlier identical clocks cannot
+    # veto" shape), the assistant rows this merge ADMITS from state.db beyond
+    # the selected context ARE the stopped-context successors. Stamp them so
+    # the Agent-replay splice guard can keep them individually addressable:
+    # streaming._sanitize_messages_for_api rides the stamp through the
+    # projection as the transient `_replay_stop` marker and
+    # `_replay_pair_is_cancelled_history_splice` protects the pair. A plain
+    # float-clock historical pair never enters through this admission path, so
+    # it still merges exactly like the installed Agent (round-5/6 contract).
+    if (
+        incoming_provenance == "state_db"
+        and cancelled_journal_owner_messages is not None
+        and not owns_live_partial
+        and _sidecar_has_terminal_partial_error(owner_messages, live_only=True)
+    ):
+        sidecar_row_objects = {id(row) for row in sidecar_messages if isinstance(row, dict)}
+        for row in merged_messages:
+            if (
+                isinstance(row, dict)
+                and id(row) in _admitted_state_row_objects
+                and id(row) not in sidecar_row_objects
+                and row.get("role") == "assistant"
+            ):
+                row["_stopped_db_successor"] = True
+    return merged_messages
+
+
+@overload
+def reconciled_state_db_messages_for_session(
+    session,
+    *,
+    prefer_context: bool = False,
+    state_messages: list | StateDBSessionMessagesSnapshot | None = None,
+    with_revision: Literal[False] = False,
+) -> list: ...
+
+
+@overload
+def reconciled_state_db_messages_for_session(
+    session,
+    *,
+    prefer_context: bool = False,
+    state_messages: list | StateDBSessionMessagesSnapshot | None = None,
+    with_revision: Literal[True],
+) -> StateDBSessionMessagesSnapshot: ...
+
+
+def reconciled_state_db_messages_for_session(
+    session,
+    *,
+    prefer_context: bool = False,
+    state_messages: list | StateDBSessionMessagesSnapshot | None = None,
+    with_revision: bool = False,
+):
+    """Return append-only messages reconciled with state.db for a WebUI session."""
+    if session is None:
+        return _state_db_session_messages_result([], None, with_revision=with_revision)
+    state_revision = None
+    if isinstance(state_messages, StateDBSessionMessagesSnapshot):
+        state_revision = state_messages.revision
+        state_messages = state_messages.messages
+    local_messages = []
+    using_context_messages = False
+    if prefer_context:
+        context_messages = getattr(session, 'context_messages', None)
+        if isinstance(context_messages, list) and context_messages:
+            local_messages = context_messages
+            using_context_messages = True
+    if not local_messages:
+        local_messages = getattr(session, 'messages', None) or []
+    if state_messages is None:
+        session_id = getattr(session, 'session_id', None)
+        session_profile = getattr(session, 'profile', None)
+        if _cancelled_journal_turn_owner(getattr(session, 'messages', None) or [], include_live_partial=True):
+            state_result = get_state_db_session_messages(
+                session_id, profile=session_profile,
+                with_revision=with_revision, include_row_identity=True,
+            )
+        elif with_revision:
+            state_result = get_state_db_session_messages(
+                session_id,
+                profile=session_profile,
+                with_revision=True,
+            )
+        elif session_profile:
+            state_result = get_state_db_session_messages(
+                session_id,
+                profile=session_profile,
+            )
+        else:
+            # Preserve the historical one-argument call contract for ordinary
+            # reconciliation and for integrations that replace this reader.
+            state_result = get_state_db_session_messages(session_id)
+        if isinstance(state_result, StateDBSessionMessagesSnapshot):
+            state_revision = state_result.revision
+            state_messages = state_result.messages
+        else:
+            state_messages = state_result
+    state_messages = _suppress_native_image_display_mirrors(
+        session,
+        state_messages,
+        suppress_api_content=not using_context_messages,
+        suppress_pending_turn=not prefer_context,
+    )
+    cancelled_journal_source_messages = state_messages
+    cancelled_journal_prefix_start_verified = False
+    if prefer_context and local_messages:
+        if using_context_messages:
+            sidecar_messages = getattr(session, 'messages', None) or []
+            if (
+                getattr(session, 'is_cli_session', False)
+                and not getattr(session, 'read_only', False)
+                and sidecar_messages
+                and len(sidecar_messages) > len(local_messages)
+                and _session_messages_have_prefix(sidecar_messages, local_messages)
+            ):
+                # A claimed CLI sidecar can carry a stale context prefix while the
+                # stitched CLI transcript already landed in session.messages. On the
+                # first WebUI follow-up, prefer that longer authoritative transcript
+                # unless context_messages intentionally diverged via compaction or
+                # another non-prefix transform.
+                local_messages = sidecar_messages
+                using_context_messages = False
+            if using_context_messages:
+                compressed_context = _context_messages_include_compression_marker(local_messages)
+                anchor_key = getattr(session, "compression_anchor_message_key", None)
+                if compressed_context:
+                    if not anchor_key:
+                        logger.debug(
+                            "Compressed context for session %s has no compression anchor; using context_messages only",
+                            getattr(session, "session_id", None),
+                        )
+                        return _state_db_session_messages_result(
+                            local_messages,
+                            state_revision,
+                            with_revision=with_revision,
+                        )
+                    anchor_index = _state_db_anchor_index(state_messages, anchor_key)
+                    if anchor_index is None:
+                        logger.debug(
+                            "Compressed context for session %s has an unverifiable compression anchor; using context_messages only",
+                            getattr(session, "session_id", None),
+                        )
+                        return _state_db_session_messages_result(
+                            local_messages,
+                            state_revision,
+                            with_revision=with_revision,
+                        )
+                    state_messages = list(state_messages or [])[anchor_index + 1 :]
+                    cancelled_journal_prefix_start_verified = True
+        if not (_sidecar_has_terminal_partial_error(getattr(session, 'messages', None) or [])
+                or _cancelled_journal_turn_owner(getattr(session, 'messages', None) or [], include_live_partial=True)):
+            state_messages = state_db_delta_after_context(local_messages, state_messages)
+    reconciled_messages = merge_session_messages_append_only(
+        local_messages,
+        state_messages,
+        truncation_watermark=getattr(session, "truncation_watermark", None),
+        truncation_boundary=getattr(session, "truncation_boundary", None),
+        incoming_provenance="state_db",
+        cancelled_journal_owner_messages=(getattr(session, 'messages', None) or []) if prefer_context else None,
+        cancelled_journal_source_messages=cancelled_journal_source_messages if prefer_context else None,
+        cancelled_journal_prefix_start_verified=cancelled_journal_prefix_start_verified,
+    )
+    if not prefer_context:
+        reconciled_messages = _project_native_image_payload_conflicts_for_display(
+            local_messages,
+            state_messages,
+            reconciled_messages,
+        )
+    return _state_db_session_messages_result(
+        reconciled_messages,
+        state_revision,
+        with_revision=with_revision,
+    )
+
+
+def get_cli_session_messages(sid, *, profile=None) -> list:
+    """Read messages for a single CLI/external-agent session.
+
+    Preserve tool-call/result and reasoning metadata from the agent state.db so
+    CLI-origin transcripts render with the same tool cards as WebUI-native
+    sessions. When the requested session is the tip of a compression/CLI-close
+    continuation chain, return the stitched full transcript across all segments
+    in chronological order. Returns empty list on any error.
+    """
+    if str(sid or '').startswith(f'{CLAUDE_CODE_SOURCE}_'):
+        return get_claude_code_session_messages(sid)
+    return get_state_db_session_messages(sid, stitch_continuations=True, profile=profile)
+
+
+def count_conversation_rounds(sid: str, since: float | None = None) -> int:
+    """Count conversation rounds for a session from state.db.
+
+    A "round" = one user message + one agent reply.  Consecutive user
+    messages are merged into a single round so that multi-part questions
+    don't inflate the count.
+
+    Parameters
+    ----------
+    sid : str
+        Gateway session ID (e.g. ``20260430_151231_7209a0``).
+    since : float | None
+        Unix timestamp.  If provided, only messages **after** this
+        timestamp are counted.
+
+    Returns
+    -------
+    int
+        Number of complete conversation rounds.
+    """
+    import os, sqlite3, datetime
+
+    try:
+        from api.profiles import get_active_hermes_home
+        hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
+    except Exception:
+        hermes_home = Path(os.getenv('HERMES_HOME', str(HOME / '.hermes'))).expanduser().resolve()
+    db_path = hermes_home / 'state.db'
+    if not db_path.exists():
+        return 0
+
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT role, timestamp FROM messages WHERE session_id = ? ORDER BY timestamp ASC",
+                (sid,),
+            )
+            rows = cur.fetchall()
+    except Exception:
+        return 0
+
+    rounds = 0
+    seen_user = False          # have we seen a user msg in the current round?
+    seen_agent_after_user = False  # have we seen an agent reply after that user msg?
+
+    for row in rows:
+        role = (row['role'] or '').strip().lower()
+        ts_raw = row['timestamp']
+
+        # Parse timestamp and apply the ``since`` filter.
+        if since is not None and ts_raw is not None:
+            try:
+                if isinstance(ts_raw, (int, float)):
+                    ts_val = float(ts_raw)
+                else:
+                    # ISO-8601 string
+                    ts_val = datetime.datetime.fromisoformat(
+                        str(ts_raw).replace('Z', '+00:00')
+                    ).timestamp()
+                if ts_val <= since:
+                    continue
+            except Exception:
+                pass
+
+        if role == 'user':
+            if seen_user and not seen_agent_after_user:
+                # Consecutive user message — merge into current round.
+                pass
+            elif seen_user and seen_agent_after_user:
+                # Previous round completed, starting a new one.
+                rounds += 1
+                seen_agent_after_user = False
+            seen_user = True
+        elif role == 'assistant':
+            if seen_user:
+                seen_agent_after_user = True
+
+    # Close the last round if it was completed.
+    if seen_user and seen_agent_after_user:
+        rounds += 1
+
+    return rounds
+
+
+CONVERSATION_ROUND_THRESHOLD = 10
+
+
+@contextmanager
+def _cleanup_manifest_process_lock(hermes_home):
+    """Serialize cleanup across WebUI worker processes for one profile.
+
+    Keep the lock file in place permanently: unlinking it while another process
+    is waiting can split later callers across different inodes and defeat the
+    lock. POSIX uses ``flock``; native Windows locks the first byte with
+    ``msvcrt.locking``. If neither primitive exists, fail closed rather than
+    running destructive cleanup without cross-process serialization.
+    """
+    lock_path = Path(hermes_home) / ".session_cleanup.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "r+b", buffering=0) as lock_file:
+        if _fcntl is not None:
+            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+            return
+
+        if _msvcrt is not None:
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.write(b"\0")
+            lock_file.seek(0)
+            _msvcrt.locking(  # type: ignore[attr-defined]
+                lock_file.fileno(), _msvcrt.LK_LOCK, 1  # type: ignore[attr-defined]
+            )
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                _msvcrt.locking(  # type: ignore[attr-defined]
+                    lock_file.fileno(), _msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined]
+                )
+            return
+
+        raise RuntimeError("cross-process session cleanup locking is unavailable")
+
+
+_cleanup_manifest_locks_guard = threading.Lock()
+_cleanup_manifest_locks = {}
+
+
+def _cleanup_manifest_thread_lock(hermes_home):
+    """Return the in-process cleanup lock for one resolved profile home."""
+    key = os.fspath(Path(hermes_home))
+    with _cleanup_manifest_locks_guard:
+        lock = _cleanup_manifest_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _cleanup_manifest_locks[key] = lock
+        return lock
+
+
+class SessionDeleteRefused(Exception):
+    """The delete would destroy live gateway work, or its ledger cannot be fenced.
+
+    ``code`` is the bounded wire code the API returns: ``session_busy`` /
+    ``unknown_execution`` when the Agent's retirement helper refuses, and
+    ``runtime_ledger_unavailable`` when the helper (or the schema it needs) is
+    missing. Callers must not treat a refusal as an operational failure.
+    """
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+_LEDGER_TABLES = frozenset(
+    {
+        "session_admissions",
+        "worker_executions",
+        "worker_receipts",
+        "state_meta",
+        "gateway_routing",
+    }
+)
+
+
+def _has_gateway_runtime_rows(conn, session_ids, tables):
+    """True when any of these sessions still has gateway runtime rows.
+
+    Admissions point at a session through ``target_session_id``; workers through
+    ``session_id`` (receipts are their children, so a row-free worker table means
+    no receipts either).
+    """
+    placeholders = ",".join("?" * len(session_ids))
+    for table, column in (
+        ("session_admissions", "target_session_id"),
+        ("worker_executions", "session_id"),
+    ):
+        if table not in tables:
+            continue
+        if conn.execute(
+            f"SELECT 1 FROM {table} WHERE {column} IN ({placeholders}) LIMIT 1",
+            session_ids,
+        ).fetchone():
+            return True
+    return False
+
+
+def _retire_gateway_runtime_ledger(conn, session_ids, tables):
+    """Retire gateway runtime rows with the Agent's own deletion fence.
+
+    Terminal receipts survive as exact-retry evidence; live or unknown work
+    refuses the delete instead of being erased. A schema without the ledger
+    tables has nothing to retire. A partial ledger schema fails closed: deleting
+    only some of the ledger would leave the Agent's guards unsatisfied — but only
+    when there is something to retire, so a downgraded or misconfigured Agent
+    cannot block deleting a session that has no runtime rows at all.
+    """
+    if not tables & {"session_admissions", "worker_executions"}:
+        return
+    if not _LEDGER_TABLES.issubset(tables):
+        if not _has_gateway_runtime_rows(conn, session_ids, tables):
+            logger.warning(
+                "Partial gateway ledger schema; deleting row-free session(s) %s "
+                "without the Agent's retirement fence", session_ids,
+            )
+            return
+        raise SessionDeleteRefused("runtime_ledger_unavailable")
+    try:
+        from hermes_state_mutation_retirement import retire_sessions
+    except Exception as exc:
+        if not _has_gateway_runtime_rows(conn, session_ids, tables):
+            logger.warning(
+                "Agent retirement helper unavailable (%s); deleting row-free "
+                "session(s) %s without the fence", exc, session_ids,
+            )
+            return
+        raise SessionDeleteRefused("runtime_ledger_unavailable") from exc
+    # The helper imports the rest of the Agent lazily (hermes_state_common,
+    # tools.tool_result_storage, hermes_state_local, ...). An interpreter that
+    # can import the helper but not the Agent's dependencies fails inside the
+    # call, not at the import above: same degrade, and the savepoint keeps the
+    # soft path free of a half-written fence.
+    conn.execute("SAVEPOINT gateway_fence")
+    try:
+        retire_sessions(conn, session_ids)
+    except ImportError as exc:
+        conn.execute("ROLLBACK TO gateway_fence")
+        conn.execute("RELEASE gateway_fence")
+        if not _has_gateway_runtime_rows(conn, session_ids, tables):
+            logger.warning(
+                "Agent retirement fence not importable here (%s); deleting "
+                "row-free session(s) %s without it", exc, session_ids,
+            )
+            return
+        raise SessionDeleteRefused("runtime_ledger_unavailable") from exc
+    except Exception as exc:
+        # RuntimeStoreError carries the Agent's bounded reason code.
+        reason = getattr(exc, "reason", None)
+        if reason in ("session_busy", "unknown_execution"):
+            raise SessionDeleteRefused(reason) from exc
+        raise
+    conn.execute("RELEASE gateway_fence")
+
+
+def delete_cli_session(sid) -> bool:
+    """Delete a CLI session while serializing manifest and DB cleanup."""
+    try:
+        from api.profiles import get_active_hermes_home
+        hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
+    except Exception:
+        logger.warning("Failed to resolve active profile for session delete", exc_info=True)
+        return False
+    try:
+        with _cleanup_manifest_thread_lock(hermes_home):
+            with _cleanup_manifest_process_lock(hermes_home):
+                return _delete_cli_session_locked(sid, hermes_home)
+    except SessionDeleteRefused:
+        raise
+    except Exception:
+        logger.warning("Failed to delete CLI session %s from state.db", sid, exc_info=True)
+        return False
+
+
+def _delete_cli_session_locked(sid, hermes_home) -> bool:
+    """Delete a CLI session from state.db using Hermes' session semantics.
+
+    A scoped transaction implements the Agent invariant while giving branch and
+    compression evidence precedence over inherited delegate metadata. Current
+    Hermes Agent's canonical helper does not yet make that precedence guarantee,
+    so this destructive path fails closed instead of delegating to it.
+
+    Returns True when the requested state is absent after cleanup, False on an
+    operational error.
+    """
+    try:
+        import sqlite3
+    except ImportError:
+        return False
+
+    # Process any leftover cleanup manifests from a previous failed run.
+    # This runs before the DB-existence check so pending artifact
+    # removals get another chance even when the current session ID
+    # is unrelated.
+    stale_cleanup_complete = _process_stale_cleanup_manifests(hermes_home)
+
+    db_path = hermes_home / 'state.db'
+    if not db_path.exists():
+        # No state.db means no DB rows to retire: a WebUI-only session lives
+        # entirely in its sidecars. It is only an error when a retry manifest
+        # still needs the DB to prove a session dead — that case already failed
+        # closed above, and its artifacts must stay.
+        return stale_cleanup_complete
+
+    try:
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.row_factory = sqlite3.Row
+            # SQLite does not enforce foreign keys by default; enabling
+            # PRAGMA foreign_keys makes the ON DELETE CASCADE clauses on
+            # session_model_usage and telegram_dm_topic_bindings fire
+            # automatically.  Compression locks have no FK, so they are
+            # cleaned explicitly below.
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("BEGIN IMMEDIATE")
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if not {"id", "parent_session_id"}.issubset(columns):
+                return False
+
+            selected = ["id", "parent_session_id"]
+            for column in (
+                "model_config", "source", "end_reason", "started_at", "ended_at"
+            ):
+                selected.append(column if column in columns else f"NULL AS {column}")
+            rows = conn.execute(f"SELECT {', '.join(selected)} FROM sessions").fetchall()
+
+            # _delegate_from is authoritative. source=subagent is the legacy
+            # compatibility signal for rows created before that marker existed,
+            # but legacy branch/compression continuations must remain intact.
+            records = []
+            for row in rows:
+                model_config = {}
+                raw_model_config = row["model_config"]
+                model_config_known = raw_model_config in (None, "")
+                if not model_config_known:
+                    try:
+                        parsed_model_config = json.loads(raw_model_config)
+                    except (TypeError, ValueError):
+                        parsed_model_config = None
+                    if isinstance(parsed_model_config, dict):
+                        model_config = parsed_model_config
+                        model_config_known = True
+                records.append(
+                    {
+                        "id": row["id"],
+                        "parent_id": row["parent_session_id"],
+                        "delegate_from": model_config.get("_delegate_from"),
+                        "branched_from": model_config.get("_branched_from"),
+                        "model_config_known": model_config_known,
+                        "source": row["source"],
+                        "end_reason": row["end_reason"],
+                        "started_at": row["started_at"],
+                        "ended_at": row["ended_at"],
+                    }
+                )
+            records_by_id = {record["id"]: record for record in records}
+
+            def _timestamp_value(value):
+                """Return a comparable UTC timestamp, or None when ambiguous."""
+                if isinstance(value, bool) or value in (None, ""):
+                    return None
+                if isinstance(value, (int, float)):
+                    numeric = float(value)
+                    return numeric if math.isfinite(numeric) else None
+                if isinstance(value, datetime.datetime):
+                    parsed = value
+                elif isinstance(value, str):
+                    raw = value.strip()
+                    if not raw:
+                        return None
+                    try:
+                        numeric = float(raw)
+                        return numeric if math.isfinite(numeric) else None
+                    except ValueError:
+                        try:
+                            parsed = datetime.datetime.fromisoformat(
+                                raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+                            )
+                        except ValueError:
+                            return None
+                else:
+                    return None
+                if parsed.tzinfo is None:
+                    return None
+                try:
+                    numeric = parsed.timestamp()
+                except (OverflowError, OSError, ValueError):
+                    return None
+                return numeric if math.isfinite(numeric) else None
+
+            def _must_preserve(record, parent):
+                """Fail closed when branch/compression evidence is ambiguous."""
+                if record["branched_from"] is not None:
+                    return True
+                end_reason = parent.get("end_reason")
+                if end_reason == "compression":
+                    return True
+                if end_reason != "branched":
+                    return False
+                started_at = _timestamp_value(record["started_at"])
+                parent_ended_at = _timestamp_value(parent.get("ended_at"))
+                if started_at is None or parent_ended_at is None:
+                    return True
+                return started_at >= parent_ended_at
+
+            def _lineage_parent(record):
+                """Return the parent that supplies this row's lineage edge.
+
+                ``_delegate_from`` is authoritative when present. Falling back
+                to the physical parent is only valid for legacy rows without
+                that marker; otherwise a compression continuation whose physical
+                parent differs from its lineage parent could be deleted.
+                """
+                delegate_from = record["delegate_from"]
+                if delegate_from is not None:
+                    return records_by_id.get(delegate_from) or {}
+                return records_by_id.get(record["parent_id"]) or {}
+
+            # Once a branch/compression continuation is preserved, its physical
+            # child tree is outside the delete lineage. Stale inherited delegate
+            # markers must not let traversal re-enter that retained subtree.
+            preserved_ids = {
+                record["id"]
+                for record in records
+                if record["id"] != sid
+                and _must_preserve(record, _lineage_parent(record))
+            }
+            while True:
+                descendants = {
+                    record["id"]
+                    for record in records
+                    if record["id"] != sid
+                    and record["parent_id"] in preserved_ids
+                }
+                new_ids = descendants - preserved_ids
+                if not new_ids:
+                    break
+                preserved_ids.update(new_ids)
+
+            found = {sid}
+            frontier = {sid}
+            while frontier:
+                next_frontier = set()
+                for record in records:
+                    row_id = record["id"]
+                    if row_id in found or row_id in preserved_ids:
+                        continue
+                    parent_id = record["parent_id"]
+                    delegate_from = record["delegate_from"]
+                    linked_to_frontier = (
+                        delegate_from in frontier or parent_id in frontier
+                    )
+                    if not linked_to_frontier:
+                        continue
+                    parent = _lineage_parent(record)
+                    if _must_preserve(record, parent):
+                        continue
+                    # Explicit _delegate_from is authoritative even when a
+                    # migrated legacy row lacks source='subagent'. Branch and
+                    # compression evidence above still wins and preserves it.
+                    if delegate_from is not None:
+                        if delegate_from in frontier:
+                            next_frontier.add(row_id)
+                        continue
+                    # Only marker-less legacy inference requires the historical
+                    # source tag plus a compatible physical-parent edge.
+                    if record["source"] != "subagent":
+                        continue
+                    if (
+                        parent_id in frontier
+                        and record["model_config_known"]
+                    ):
+                        next_frontier.add(row_id)
+
+                found.update(next_frontier)
+                frontier = next_frontier
+
+            delegate_ids = sorted(found - {sid})
+            all_removed_ids = [sid, *delegate_ids]
+            placeholders = ",".join("?" * len(all_removed_ids))
+
+            # Gateway runtime history (session_admissions / worker_executions /
+            # worker_receipts) is ON DELETE RESTRICT and a new-schema trigger
+            # refuses a bare session delete while those rows exist. Retire it
+            # through the Agent's own fence so terminal receipts survive as
+            # retry evidence and live work refuses the delete instead of being
+            # erased.
+            ledger_tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            try:
+                _retire_gateway_runtime_ledger(conn, all_removed_ids, ledger_tables)
+            except SessionDeleteRefused:
+                conn.rollback()
+                raise
+
+            # Delete delegate children first (messages, then orphan their
+            # children, then the rows themselves).
+            for child_id in delegate_ids:
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (child_id,))
+            for child_id in delegate_ids:
+                conn.execute(
+                    "UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?",
+                    (child_id,),
+                )
+            for child_id in delegate_ids:
+                conn.execute("DELETE FROM sessions WHERE id = ?", (child_id,))
+
+            # Preserve every remaining child as an independent row, matching
+            # current SessionDB.delete_session().
+            conn.execute(
+                "UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?",
+                (sid,),
+            )
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+
+            # Referential-integrity cleanup for session-owned rows that are
+            # not covered by ON DELETE CASCADE.  session_model_usage and
+            # telegram_dm_topic_bindings have FK CASCADE (enforced by
+            # PRAGMA foreign_keys = ON above), but compression_locks has no
+            # foreign key, so stale rows would survive.  Gate each table
+            # on existence so this works on older schemas too.
+            table_names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "compression_locks" in table_names:
+                conn.execute(
+                    f"DELETE FROM compression_locks WHERE session_id IN ({placeholders})",
+                    all_removed_ids,
+                )
+            # Belt-and-suspenders: also explicitly clear FK tables in case
+            # PRAGMA foreign_keys is OFF on an older SQLite build or a
+            # future schema drops the CASCADE clause.
+            if "session_model_usage" in table_names:
+                conn.execute(
+                    f"DELETE FROM session_model_usage WHERE session_id IN ({placeholders})",
+                    all_removed_ids,
+                )
+            if "telegram_dm_topic_bindings" in table_names:
+                conn.execute(
+                    f"DELETE FROM telegram_dm_topic_bindings WHERE session_id IN ({placeholders})",
+                    all_removed_ids,
+                )
+
+            # Persist a cleanup manifest BEFORE the commit so artifact
+            # removal is idempotent and retryable.  Each call uses a unique
+            # manifest filename (atomic temp-file + rename) so concurrent
+            # deletes never clobber each other's retry records.
+            sessions_dir = hermes_home / "sessions"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            manifest_basename = f".cleanup_manifest_{uuid.uuid4().hex}"
+            manifest_path = sessions_dir / f"{manifest_basename}.json"
+            manifest_tmp = sessions_dir / f"{manifest_basename}.tmp"
+            try:
+                manifest_tmp.write_text(
+                    json.dumps(sorted(str(i) for i in all_removed_ids)),
+                    encoding="utf-8",
+                )
+                manifest_tmp.rename(manifest_path)
+            except OSError:
+                logger.warning("Failed to write cleanup manifest", exc_info=True)
+                try:
+                    manifest_tmp.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Failed to remove incomplete cleanup manifest %s",
+                        manifest_tmp,
+                        exc_info=True,
+                    )
+                # Publishing the retry record is a prerequisite for making the
+                # DB deletion durable. Without it, committed rows could vanish
+                # while transcript artifacts remain forever and the UI reports
+                # a false success.
+                conn.rollback()
+                return False
+
+            conn.commit()
+
+            # Post-commit artifact cleanup.  Scan ALL outstanding manifests
+            # (including the one just written) and retry every pending ID.
+            # Each manifest entry is re-checked against the DB so a stale
+            # manifest from a failed commit never unlinks a live session's
+            # artifacts.
+            artifact_cleanup_failed = False
+
+            def _is_session_alive(conn, sid):
+                """True when *sid* still has a row in the sessions table.
+                On any query failure, assume alive (fail closed) — an
+                uncertain liveness check must never trigger artifact
+                deletion on this unrecoverable state.db path.
+                """
+                try:
+                    cursor = conn.execute(
+                        "SELECT 1 FROM sessions WHERE id = ?", (sid,)
+                    )
+                    return cursor.fetchone() is not None
+                except Exception:
+                    return True
+
+            def _clean_artifacts_for_id(sessions_dir, removed_id):
+                """Remove on-disk transcript files for one session ID.
+                Returns True when every artifact is gone (or was absent).
+                """
+                if not is_safe_session_id(removed_id):
+                    return False
+                ok = True
+                for suffix in (".json", ".jsonl"):
+                    artifact = sessions_dir / f"{removed_id}{suffix}"
+                    if not artifact.exists():
+                        continue
+                    try:
+                        artifact.unlink(missing_ok=True)
+                    except OSError:
+                        ok = False
+                        logger.warning(
+                            "Failed to remove session artifact %s%s",
+                            removed_id,
+                            suffix,
+                            exc_info=True,
+                        )
+                if not _delete_session_draft_by_dir(removed_id, sessions_dir):
+                    ok = False
+                    logger.warning(
+                        "Failed to remove draft sidecar %s",
+                        removed_id,
+                        exc_info=True,
+                    )
+                try:
+                    for path in list(
+                        sessions_dir.glob(f"request_dump_{removed_id}_*.json")
+                    ):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            ok = False
+                            logger.warning(
+                                "Failed to remove request dump %s",
+                                path,
+                                exc_info=True,
+                            )
+                except OSError:
+                    ok = False
+                    logger.warning(
+                        "Failed to enumerate request dumps for %s",
+                        removed_id,
+                        exc_info=True,
+                    )
+                return ok
+
+            for mp in sorted(sessions_dir.glob(".cleanup_manifest_*.json")):
+                try:
+                    raw = mp.read_text(encoding="utf-8")
+                    pending_ids = json.loads(raw)
+                except (OSError, ValueError, TypeError):
+                    # The IDs are unknown, so deleting the manifest would lose
+                    # the only retry record for potentially orphaned artifacts.
+                    artifact_cleanup_failed = True
+                    continue
+                if not isinstance(pending_ids, list) or not all(
+                    isinstance(item, str) for item in pending_ids
+                ):
+                    artifact_cleanup_failed = True
+                    continue
+                still_pending = []
+                for removed_id in pending_ids:
+                    # Transaction-outcome guard: never unlink artifacts for
+                    # a session that still exists in the DB.  A stale
+                    # manifest from a failed commit must not delete data
+                    # belonging to a live conversation.
+                    if _is_session_alive(conn, removed_id):
+                        still_pending.append(removed_id)
+                        continue
+                    if not _clean_artifacts_for_id(sessions_dir, removed_id):
+                        still_pending.append(removed_id)
+                if still_pending:
+                    # Atomic rewrite using temp-file + rename.
+                    tmp = mp.with_suffix(".tmp")
+                    try:
+                        tmp.write_text(json.dumps(still_pending), encoding="utf-8")
+                        tmp.rename(mp)
+                    except OSError:
+                        logger.warning(
+                            "Failed to rewrite manifest %s", mp, exc_info=True,
+                        )
+                    artifact_cleanup_failed = True
+                else:
+                    mp.unlink(missing_ok=True)
+
+            return stale_cleanup_complete and not artifact_cleanup_failed
+    except SessionDeleteRefused:
+        raise
+    except Exception:
+        logger.warning("Failed to delete CLI session %s from state.db", sid, exc_info=True)
+        return False
+
+# ---------------------------------------------------------------------------
+# ``delete_cli_session`` nests each profile's cross-process file lock inside
+# that profile's in-process lock so stale-manifest read, DB transaction, and
+# post-commit cleanup remain one critical section without blocking unrelated
+# profiles.
+# ---------------------------------------------------------------------------
+def _process_stale_cleanup_manifests(hermes_home) -> bool:
+    """Process any leftover cleanup manifests outside a DB transaction.
+
+    Called at the start of each delete_cli_session run, before the
+    regular transaction, so a previous run whose DB commit succeeded
+    but artifact cleanup failed gets another chance — even when the
+    session ID being deleted this time is unrelated.
+
+    Serialized by the caller's per-profile thread and process locks so that the
+    manifest read → DB transaction → post-commit cleanup triad is
+    never interleaved across concurrent delete calls. Returns ``True`` only
+    when every discovered retry record was processed completely.
+    """
+    try:
+        import sqlite3
+    except ImportError:
+        return False
+    db_path = hermes_home / "state.db"
+    sessions_dir = hermes_home / "sessions"
+    if not sessions_dir.exists():
+        return True
+    manifests = sorted(sessions_dir.glob(".cleanup_manifest_*.json"))
+    if not manifests:
+        return True
+    # Missing state.db is not proof that a manifested session is dead. It may
+    # have been temporarily renamed, unmounted, or made inaccessible. Preserve
+    # every manifest and artifact until a successful query proves absence.
+    if not db_path.exists():
+        return False
+    cleanup_complete = True
+    for mp in manifests:
+        try:
+            raw = mp.read_text(encoding="utf-8")
+            pending_ids = json.loads(raw)
+        except (OSError, ValueError, TypeError):
+            # Preserve malformed/unreadable retry records. Their pending IDs
+            # are unknowable, so silently deleting them would turn an
+            # incomplete cleanup into a false success.
+            cleanup_complete = False
+            continue
+        if not isinstance(pending_ids, list) or not all(
+            isinstance(item, str) for item in pending_ids
+        ):
+            cleanup_complete = False
+            continue
+        pending_ids = list(pending_ids)
+        if not pending_ids:
+            mp.unlink(missing_ok=True)
+            continue
+        # Require a successful read-only query to prove absence. Opening via a
+        # read-only URI also prevents SQLite from creating a fresh empty DB if
+        # state.db disappears between the existence check and connect().
+        try:
+            db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+            with closing(sqlite3.connect(db_uri, uri=True)) as conn:
+                cursor = conn.execute(
+                    "SELECT id FROM sessions WHERE id IN ({})".format(
+                        ",".join("?" * len(pending_ids))
+                    ),
+                    pending_ids,
+                )
+                alive = {row[0] for row in cursor.fetchall()}
+        except Exception:
+            # Liveness query failed (missing DB, lock, timeout, I/O error).
+            # Fail closed: preserve the manifest file on disk and skip it this
+            # round. A later call can retry when DB state is queryable.
+            cleanup_complete = False
+            continue
+
+        still_pending = []
+        for removed_id in pending_ids:
+            if removed_id in alive:
+                # Session still exists — the previous commit never
+                # reached the DB, so this manifest entry is stale.
+                # Drop it silently: never propagate a stale manifest
+                # into the post-commit cleanup loop where it would
+                # cause the current call to report a false failure.
+                continue
+            if not _clean_pending_artifact(sessions_dir, removed_id):
+                still_pending.append(removed_id)
+        if still_pending:
+            tmp = mp.with_suffix(".tmp")
+            try:
+                tmp.write_text(json.dumps(still_pending), encoding="utf-8")
+                tmp.rename(mp)
+            except OSError:
+                cleanup_complete = False
+        else:
+            try:
+                mp.unlink(missing_ok=True)
+            except OSError:
+                cleanup_complete = False
+    return cleanup_complete
+
+
+def _clean_pending_artifact(sessions_dir, removed_id):
+    """Remove on-disk transcript files for one session ID, outside a
+    DB transaction.  Returns True when every artifact is gone (or absent).
+    """
+    if not is_safe_session_id(removed_id):
+        return False
+    ok = True
+    for suffix in (".json", ".jsonl"):
+        artifact = sessions_dir / f"{removed_id}{suffix}"
+        if not artifact.exists():
+            continue
+        try:
+            artifact.unlink(missing_ok=True)
+        except OSError:
+            ok = False
+    if not _delete_session_draft_by_dir(removed_id, sessions_dir):
+        ok = False
+    try:
+        for path in list(sessions_dir.glob(f"request_dump_{removed_id}_*.json")):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                ok = False
+    except OSError:
+        ok = False
+    return ok

@@ -1,0 +1,352 @@
+"""Regression coverage for browser chat model-provider fallback.
+
+The browser send path may fall back to the model dropdown for the model ID on a
+fresh session. The provider must follow only when that dropdown/persisted state
+describes the same model being sent.
+"""
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+UI_JS_PATH = REPO_ROOT / "static" / "ui.js"
+MESSAGES_JS_PATH = REPO_ROOT / "static" / "messages.js"
+NODE = shutil.which("node")
+
+
+def test_messages_payloads_use_model_tied_provider_helper():
+    ui_src = UI_JS_PATH.read_text(encoding="utf-8")
+    messages_src = MESSAGES_JS_PATH.read_text(encoding="utf-8")
+
+    assert "function _modelProviderForSend" in ui_src
+    assert "function _chatPayloadModelState" in messages_src
+    assert "_modelProviderForSend(model)" in messages_src
+
+    chat_start_idx = messages_src.find("api('/api/chat/start'")
+    assert chat_start_idx >= 0, "could not find /api/chat/start POST in messages.js"
+    payload_block = messages_src[chat_start_idx:chat_start_idx + 500]
+    assert "model:_modelState.model" in payload_block
+    assert "model_provider:_modelState.model_provider" in payload_block
+    assert "model_provider:S.session.model_provider||null" not in payload_block
+
+    for idx in [m.start() for m in __import__("re").finditer("queueSessionMessage\\(", messages_src)]:
+        block = messages_src[idx:idx + 260]
+        if "model_provider:" in block:
+            assert "S.session.model_provider||null" not in block
+
+
+_DRIVER_SRC = r"""
+const fs = require('fs');
+const ui = fs.readFileSync(process.argv[2], 'utf8');
+
+function extractFunc(name) {
+  const re = new RegExp('function\\s+' + name + '\\s*\\(');
+  const start = ui.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = ui.indexOf('{', start);
+  let depth = 1;
+  i++;
+  while (depth > 0 && i < ui.length) {
+    if (ui[i] === '{') depth++;
+    else if (ui[i] === '}') depth--;
+    i++;
+  }
+  return ui.slice(start, i);
+}
+
+let modelSelect;
+function $(id) { return id === 'modelSelect' ? modelSelect : null; }
+
+function makeSelect(options, initialValue) {
+  const sel = {options: [], selectedIndex: -1, selectedOptions: []};
+  Object.defineProperty(sel, 'value', {
+    get() { return this._value || ''; },
+    set(v) {
+      this._value = v;
+      const idx = this.options.findIndex(o => o.value === v);
+      this.selectedIndex = idx;
+      this.selectedOptions = idx >= 0 ? [this.options[idx]] : [];
+    }
+  });
+  for (const item of options) {
+    const group = {tagName: 'OPTGROUP', dataset: {provider: item.provider || ''}};
+    const opt = {value: item.value, parentElement: group, dataset: {}};
+    if (item.optionProvider) opt.dataset.provider = item.optionProvider;
+    sel.options.push(opt);
+  }
+  sel.value = initialValue || '';
+  return sel;
+}
+
+const store = new Map();
+const localStorage = {
+  getItem(k) { return store.has(k) ? store.get(k) : null; },
+  setItem(k, v) { store.set(k, String(v)); },
+  removeItem(k) { store.delete(k); },
+};
+const sessionStore = new Map();
+const sessionStorage = {
+  getItem(k) { return sessionStore.has(k) ? sessionStore.get(k) : null; },
+  setItem(k, v) { sessionStore.set(k, String(v)); },
+  removeItem(k) { sessionStore.delete(k); },
+};
+const MODEL_STATE_KEY = 'hermes-webui-model-state';
+
+for (const name of [
+  '_getOptionProviderId',
+  '_providerFromModelValue',
+  '_modelStateForSelect',
+  '_readPersistedModelState',
+  '_pickerExplicitPickKey',
+  '_readExplicitPickerPick',
+  '_rememberExplicitPickerPick',
+  '_clearExplicitPickerPick',
+  '_modelProviderForSend',
+]) {
+  eval(extractFunc(name));
+}
+
+const args = JSON.parse(process.argv[3]);
+modelSelect = makeSelect(args.options || [], args.initialValue || '');
+if (args.persisted) localStorage.setItem(MODEL_STATE_KEY, JSON.stringify(args.persisted));
+var S = {session: {session_id: args.sessionId || 's1', model_provider: args.sessionProvider || null}};
+// #7865 round-2: seed the picker's session-scoped explicit-pick evidence when
+// the scenario declares one (the gate in _modelProviderForSend requires it).
+if (args.explicitPick) {
+  _rememberExplicitPickerPick(args.sessionId || 's1',
+    args.explicitPick.value, args.explicitPick.model_provider);
+}
+
+if (args.mode === 'modelState') {
+  process.stdout.write(JSON.stringify(_modelStateForSelect(modelSelect, args.model)));
+} else {
+  process.stdout.write(JSON.stringify({provider: _modelProviderForSend(args.model)}));
+}
+"""
+
+node_test = pytest.mark.skipif(NODE is None, reason="node not on PATH")
+
+
+@pytest.fixture(scope="module")
+def driver_path(tmp_path_factory):
+    p = tmp_path_factory.mktemp("chat_provider_fallback_driver") / "driver.js"
+    p.write_text(_DRIVER_SRC, encoding="utf-8")
+    return str(p)
+
+
+def _run_helper(driver_path, payload):
+    result = subprocess.run(
+        [NODE, driver_path, str(UI_JS_PATH), json.dumps(payload)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"node driver failed:\nSTDOUT={result.stdout}\nSTDERR={result.stderr}")
+    return json.loads(result.stdout)["provider"]
+
+
+def _run_model_state_helper(driver_path, payload):
+    payload = {"mode": "modelState", **payload}
+    result = subprocess.run(
+        [NODE, driver_path, str(UI_JS_PATH), json.dumps(payload)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"node driver failed:\nSTDOUT={result.stdout}\nSTDERR={result.stderr}")
+    return json.loads(result.stdout)
+
+
+@node_test
+def test_model_provider_for_send_prefers_dropdown_over_stale_session_provider(driver_path):
+    """#7860: a real picker pick outranks a stale session — with pick evidence.
+
+    This case was previously named ``..._preserves_session_provider`` and
+    asserted the session provider won even though the dropdown had already
+    moved to the very model being sent. That expectation contradicted this
+    module's own docstring (the provider follows when the dropdown describes
+    the same model) and the sibling ``..._falls_back_to_matching_dropdown``
+    test, and it encoded exactly the #7860 defect: ``S.session.model_provider``
+    is only refreshed on apply/pending paths, never on a plain picker change,
+    so treating it as authoritative overrode the picker and pinned the session
+    to the previous provider's model.
+
+    Round 2 (#7865): the dropdown only outranks the session when the picker's
+    session-scoped explicit-pick evidence exists — a bare match is not intent,
+    and a catalog repaint after a session restore can leave another provider's
+    identically-valued option selected. See
+    ``test_restored_session_without_pick_keeps_its_own_provider`` for the
+    complement.
+    """
+    provider = _run_helper(driver_path, {
+        "model": "grok-4.3",
+        "sessionProvider": "session-provider",
+        "initialValue": "grok-4.3",
+        "options": [{"provider": "xai-oauth", "value": "grok-4.3"}],
+        "explicitPick": {"value": "grok-4.3", "model_provider": "xai-oauth"},
+    })
+
+    assert provider == "xai-oauth"
+
+
+@node_test
+def test_restored_session_without_pick_keeps_its_own_provider(driver_path):
+    """#7865: WITHOUT pick evidence the session's provider stays authoritative.
+
+    The matching dropdown option is not evidence of intent: after a restore the
+    catalog repaint can leave another provider's identically-valued option
+    selected while the session record holds the correct provider.
+    """
+    provider = _run_helper(driver_path, {
+        "model": "grok-4.3",
+        "sessionProvider": "session-provider",
+        "initialValue": "grok-4.3",
+        "options": [{"provider": "xai-oauth", "value": "grok-4.3"}],
+    })
+
+    assert provider == "session-provider"
+
+
+@node_test
+def test_model_provider_for_send_keeps_session_provider_without_dropdown_intent(driver_path):
+    """No dropdown selection / no matching option → the session provider still leads."""
+    provider = _run_helper(driver_path, {
+        "model": "grok-4.3",
+        "sessionProvider": "session-provider",
+        "initialValue": "",
+        "options": [],
+    })
+
+    assert provider == "session-provider"
+
+
+@node_test
+def test_model_provider_for_send_falls_back_to_matching_dropdown(driver_path):
+    provider = _run_helper(driver_path, {
+        "model": "grok-4.3",
+        "initialValue": "grok-4.3",
+        "options": [{"provider": "xai-oauth", "value": "grok-4.3"}],
+    })
+
+    assert provider == "xai-oauth"
+
+
+@node_test
+def test_model_provider_for_send_does_not_steal_unrelated_dropdown_provider(driver_path):
+    provider = _run_helper(driver_path, {
+        "model": "grok-4.3",
+        "initialValue": "claude-sonnet-4.6",
+        "options": [
+            {"provider": "anthropic", "value": "claude-sonnet-4.6"},
+            {"provider": "xai-oauth", "value": "grok-4.3"},
+        ],
+    })
+
+    assert provider is None
+
+
+@node_test
+def test_model_provider_for_send_uses_only_matching_persisted_state(driver_path):
+    matching = _run_helper(driver_path, {
+        "model": "grok-4.3",
+        "initialValue": "",
+        "persisted": {"model": "grok-4.3", "model_provider": "xai-oauth"},
+    })
+    unrelated = _run_helper(driver_path, {
+        "model": "grok-4.3",
+        "initialValue": "",
+        "persisted": {"model": "claude-sonnet-4.6", "model_provider": "anthropic"},
+    })
+
+    assert matching == "xai-oauth"
+    assert unrelated is None
+
+
+@node_test
+def test_model_state_reads_live_custom_provider_from_option_metadata(driver_path):
+    state = _run_model_state_helper(driver_path, {
+        "model": "llama-3.3-custom",
+        "initialValue": "llama-3.3-custom",
+        "options": [{
+            "provider": "custom:lab",
+            "optionProvider": "custom:lab",
+            "value": "llama-3.3-custom",
+        }],
+    })
+
+    assert state == {"model": "llama-3.3-custom", "model_provider": "custom:lab"}
+
+
+@node_test
+def test_model_state_does_not_use_unrelated_selected_option_provider(driver_path):
+    # If the requested model is not in the options and differs from the currently
+    # selected option, it should return model_provider = null instead of the selected option's provider.
+    state = _run_model_state_helper(driver_path, {
+        "model": "kilo/minimax/minimax-m3",
+        "initialValue": "qwen3.6:27b-mlx",
+        "options": [{
+            "provider": "ollama",
+            "optionProvider": "ollama",
+            "value": "qwen3.6:27b-mlx",
+        }],
+    })
+
+    assert state == {"model": "kilo/minimax/minimax-m3", "model_provider": None}
+
+
+
+def test_live_custom_models_are_tagged_with_provider_metadata():
+    ui_src = UI_JS_PATH.read_text(encoding="utf-8")
+    start = ui_src.index("function _addLiveModelsToSelect")
+    body = ui_src[start:ui_src.index("async function _fetchLiveModels", start)]
+
+    assert "providerGroup.dataset.provider=provider;" in body
+    assert "opt.dataset.provider=provider;" in body
+
+
+def test_new_session_does_not_fallback_to_stale_named_custom_provider():
+    sessions_src = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    start = sessions_src.index("async function newSession(")
+    body = sessions_src[start:sessions_src.index("const data=await api('/api/session/new'", start)]
+    assignment = body[body.index("reqBody.model_provider="):].split(";", 1)[0]
+
+    assert "const _fallbackIsNamedCustom=String(_fallbackProvider||'').toLowerCase().startsWith('custom:');" in body
+    assert "newModelState.model_provider" in assignment
+    assert "!_familyMismatch" in assignment
+    assert "!_fallbackIsNamedCustom" in assignment
+    assert "_fallbackProvider||null" in assignment
+
+
+def test_load_session_clears_picker_marker_of_the_session_being_loaded():
+    """#7865 round-3: the explicit-pick marker lives in `sessionStorage`, so it
+    SURVIVES a page reload. `loadSession` must clear the marker of the session
+    being LOADED, not only the one being left (`currentSid`) — on a fresh boot
+    `S.session` is null, so `currentSid` is null and the restored session's
+    marker was never cleared, letting a stale pick override the restored
+    session's own provider.
+    """
+    sessions_src = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    start = sessions_src.index("async function loadSession(")
+    body = sessions_src[start:]
+
+    # The pre-existing clear of the session being LEFT must stay.
+    assert "_clearExplicitPickerPick(currentSid)" in body
+    # The reload half: the TARGET sid is cleared too. Anchor on the guard's
+    # own shape (`sid!==currentSid`) rather than the comment text, which is
+    # free to be reworded.
+    assert "if(sid&&sid!==currentSid&&typeof _clearExplicitPickerPick==='function')" in body, (
+        "loadSession must clear the explicit-pick marker for the session being "
+        "loaded (target sid), not only currentSid (session being left)"
+    )
+    # The target-sid clear must sit AFTER the same-session no-op guard, so a
+    # no-op reload cannot wipe a marker the user just wrote in this session.
+    guard = body.index("if(currentSid===sid && !forceReload && (!_loadingSessionId || _loadingSessionId===sid))")
+    target_clear = body.index("if(sid&&sid!==currentSid&&typeof _clearExplicitPickerPick==='function')")
+    assert guard < target_clear, (
+        "target-sid marker clear must come after the same-session no-op guard"
+    )

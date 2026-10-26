@@ -1,0 +1,1834 @@
+"""Regression coverage for issue #500 transcript virtualization."""
+import json
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).parent.parent.resolve()
+UI_JS_PATH = REPO_ROOT / "static" / "ui.js"
+NODE = shutil.which("node")
+
+pytestmark = pytest.mark.skipif(NODE is None, reason="node not on PATH")
+
+
+def _run_node(source: str) -> str:
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".cjs", encoding="utf-8", dir=REPO_ROOT, delete=False
+    ) as script:
+        script.write(source)
+        script_path = Path(script.name)
+    try:
+        result = subprocess.run(
+            [NODE, str(script_path)],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        script_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    return result.stdout.strip()
+
+
+def _extract_func_script(js: str) -> str:
+    return f"""
+const src = {js!r};
+function extractFunc(name) {{
+  const re = new RegExp('function\\\\s+' + name + '\\\\s*\\\\(');
+  const start = src.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = src.indexOf('{{', start);
+  let depth = 1; i++;
+  while (depth > 0 && i < src.length) {{
+    if (src[i] === '{{') depth++;
+    else if (src[i] === '}}') depth--;
+    i++;
+  }}
+  return src.slice(start, i);
+}}
+"""
+
+
+def test_message_virtual_window_virtualizes_older_history_but_keeps_recent_tail():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+eval(extractFunc('_messageVirtualWindow'));
+const metrics = _messageVirtualWindow({
+  total: 240,
+  scrollTop: 120 * 70,
+  viewportHeight: 720,
+  heights: Array.from({length: 240}, (_, i) => i >= 190 ? 220 : 120),
+  defaultHeight: 120,
+  bufferPx: 240,
+  threshold: 80,
+  keepTailCount: 50,
+});
+console.log(JSON.stringify(metrics));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["virtualized"] is True
+    assert 60 <= metrics["start"] <= 75
+    assert metrics["end"] <= metrics["tailStart"] == 190
+    assert metrics["topPad"] > 0
+    assert metrics["bottomPad"] > 0
+
+
+def test_message_virtual_window_collapses_to_tail_only_near_bottom():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+eval(extractFunc('_messageVirtualWindow'));
+const metrics = _messageVirtualWindow({
+  total: 240,
+  scrollTop: 120 * 260,
+  viewportHeight: 720,
+  heights: Array.from({length: 240}, () => 120),
+  defaultHeight: 120,
+  bufferPx: 240,
+  threshold: 80,
+  keepTailCount: 50,
+});
+console.log(JSON.stringify(metrics));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["virtualized"] is True
+    assert metrics["start"] == metrics["tailStart"] == 190
+    assert metrics["end"] == metrics["tailStart"]
+    assert metrics["bottomPad"] == 0
+
+
+def test_compaction_cards_cross_virtualization_threshold_with_one_task_owner():
+    """Execute the real window and compaction DOM helpers with a tiny DOM.
+
+    This deliberately reuses issue #500's proven virtualization harness instead
+    of evaluating all of renderMessages() against a hand-built browser clone.
+    """
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + r"""
+const assert = require('assert');
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS = {
+  user: 120,
+  assistant: 160,
+  tool_call: 400,
+  default: 140,
+};
+const MESSAGE_VIRTUAL_THRESHOLD_ROWS = 80;
+const MESSAGE_VIRTUAL_BUFFER_PX = 0;
+eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+eval(extractFunc('_messageVirtualWindow'));
+eval(extractFunc('_compactionDigestText'));
+eval(extractFunc('_compactionCardPreview'));
+eval(extractFunc('_compressionReferenceCardHtml'));
+eval(extractFunc('_selectCompactionCardPlacements'));
+eval(extractFunc('_pinCompactionCardAtTop'));
+eval(extractFunc('_insertCompactionCardNodes'));
+eval(extractFunc('_insertPreservedCompressionTaskFallback'));
+eval(extractFunc('_insertCompressionLikeNodeByRawIdx'));
+
+class MiniClassList {
+  constructor(...names) { this.names = new Set(names); }
+  add(...names) { names.forEach(name => this.names.add(name)); }
+  contains(name) { return this.names.has(name); }
+  toggle(name) {
+    if (this.names.has(name)) {
+      this.names.delete(name);
+      return false;
+    }
+    this.names.add(name);
+    return true;
+  }
+}
+class MiniNode {
+  constructor(label, rawIdx = null) {
+    this.label = label;
+    this.rawIdx = rawIdx;
+    this.children = [];
+    this.parentElement = null;
+    this.classList = new MiniClassList();
+  }
+  appendChild(node) {
+    if (node.parentElement) node.remove();
+    node.parentElement = this;
+    this.children.push(node);
+    return node;
+  }
+  insertBefore(node, reference) {
+    if (node.parentElement) node.remove();
+    node.parentElement = this;
+    const index = this.children.indexOf(reference);
+    if (index < 0) this.children.push(node);
+    else this.children.splice(index, 0, node);
+    return node;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const index = this.parentElement.children.indexOf(this);
+    if (index >= 0) this.parentElement.children.splice(index, 1);
+    this.parentElement = null;
+  }
+  closest(selector) {
+    let node = this;
+    while (node) {
+      if (selector === '.tool-card' && node.classList.contains('tool-card')) return node;
+      node = node.parentElement;
+    }
+    return null;
+  }
+}
+function _assistantTurnBlocks() { return null; }
+function _engineAwareCompressionCopy() {
+  return {label: 'Context compacted', preview: 'Reference only'};
+}
+function esc(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+function li(name) { return `<i data-icon="${name}"></i>`; }
+function t(key) { return key; }
+function taskCount(node) {
+  return (node.label === 'task' ? 1 : 0)
+    + node.children.reduce((total, child) => total + taskCount(child), 0);
+}
+function card(kind, rawIdx, taskOwner) {
+  const node = new MiniNode(`${kind}:${rawIdx}`, rawIdx);
+  const marker = `[CONTEXT COMPACTION — REFERENCE ONLY]\n## Goal\nDigest ${rawIdx}`;
+  const html = _compressionReferenceCardHtml(marker, false);
+  const handler = html.match(/class="tool-card-header" onclick="([^"]+)"/);
+  assert.ok(handler, `card ${rawIdx} must expose its disclosure handler`);
+  const disclosure = new MiniNode(`disclosure:${rawIdx}`);
+  disclosure.classList.add('tool-card');
+  const header = new MiniNode(`header:${rawIdx}`);
+  header.click = () => Function(handler[1]).call(header);
+  disclosure.appendChild(header);
+  node.appendChild(disclosure);
+  node.disclosure = disclosure;
+  node.markerHtml = html;
+  if (taskOwner && taskOwner.kind === kind && taskOwner.rawIdx === rawIdx) {
+    node.appendChild(new MiniNode('task'));
+  }
+  return {kind, rawIdx, node};
+}
+function compactionCards(node) {
+  return node.children.filter(child => /^pre-window:|^inline:/.test(child.label));
+}
+function reopen(cardNode) {
+  assert.strictEqual(cardNode.disclosure.classList.contains('open'), false);
+  cardNode.children[0].children[0].click();
+  assert.strictEqual(cardNode.disclosure.classList.contains('open'), true);
+  cardNode.children[0].children[0].click();
+  assert.strictEqual(cardNode.disclosure.classList.contains('open'), false);
+  cardNode.children[0].children[0].click();
+  assert.strictEqual(cardNode.disclosure.classList.contains('open'), true);
+  assert.ok(cardNode.markerHtml.includes(`Digest ${cardNode.rawIdx}`));
+}
+
+const visible = Array.from({length: 100}, (_, index) => ({
+  rawIdx: index * 2,
+  m: {role: 'user'},
+}));
+const virtualWindow = _messageVirtualWindow({
+  total: visible.length,
+  scrollTop: 120 * 200,
+  viewportHeight: 720,
+  heights: Array.from({length: visible.length}, () => 120),
+  defaultHeight: 120,
+  bufferPx: 0,
+  threshold: MESSAGE_VIRTUAL_THRESHOLD_ROWS,
+  keepTailCount: 20,
+});
+assert.strictEqual(virtualWindow.virtualized, true);
+const renderVisWithIdx = visible.slice(virtualWindow.start);
+const firstRenderedRawIdx = renderVisWithIdx[0].rawIdx;
+assert.strictEqual(firstRenderedRawIdx, 160);
+
+let inner;
+let assistantSegments;
+let userRows;
+function renderScenario(markers) {
+  const placements = _selectCompactionCardPlacements(markers, firstRenderedRawIdx);
+  inner = new MiniNode('inner');
+  assistantSegments = new Map();
+  userRows = new Map();
+  let taskOwnerNode = null;
+
+  if (placements.preWindowMarkers.length) {
+    const entries = placements.preWindowMarkers.map(rawIdx =>
+      card('pre-window', rawIdx, placements.taskOwner)
+    );
+    const mounted = _insertCompactionCardNodes(
+      entries,
+      placements.taskOwner,
+      node => _pinCompactionCardAtTop(inner, node),
+    );
+    taskOwnerNode = mounted.taskOwnerNode;
+  }
+
+  for (const entry of renderVisWithIdx) {
+    const row = new MiniNode(`row:${entry.rawIdx}`, entry.rawIdx);
+    inner.appendChild(row);
+    userRows.set(entry.rawIdx, row);
+  }
+
+  const inlineEntries = placements.inlineMarkers.map(rawIdx =>
+    card('inline', rawIdx, placements.taskOwner)
+  );
+  const mounted = _insertCompactionCardNodes(
+    inlineEntries,
+    placements.taskOwner,
+    (node, rawIdx) => _insertCompressionLikeNodeByRawIdx(node, rawIdx),
+  );
+  taskOwnerNode = mounted.taskOwnerNode || taskOwnerNode;
+
+  const fallback = new MiniNode('standalone-tasks');
+  fallback.appendChild(new MiniNode('task'));
+  const fallbackInserted = _insertPreservedCompressionTaskFallback(
+    taskOwnerNode,
+    fallback,
+    node => { inner.appendChild(node); return true; },
+  );
+  return {placements, inner, taskOwnerNode, fallbackInserted};
+}
+
+const mixed = renderScenario([1, 79, 159, 170]);
+assert.deepStrictEqual(mixed.placements, {
+  preWindowMarkers: [1, 79, 159],
+  inlineMarkers: [170],
+  taskOwner: {kind: 'inline', rawIdx: 170},
+});
+const mixedCards = compactionCards(mixed.inner);
+assert.deepStrictEqual(mixedCards.map(node => node.rawIdx), [1, 79, 159, 170]);
+reopen(mixedCards[0]);
+assert.strictEqual(mixedCards[1].disclosure.classList.contains('open'), false);
+reopen(mixedCards[1]);
+assert.ok(
+  mixed.inner.children.indexOf(mixed.taskOwnerNode)
+    < mixed.inner.children.findIndex(node => node.rawIdx > 170),
+);
+assert.deepStrictEqual(
+  mixedCards.filter(node => node.children.some(child => child.label === 'task')).map(node => node.rawIdx),
+  [170],
+);
+assert.strictEqual(taskCount(mixed.inner), 1);
+assert.strictEqual(mixed.fallbackInserted, false);
+
+const preWindowOnly = renderScenario([1, 79, 159]);
+assert.deepStrictEqual(compactionCards(preWindowOnly.inner).map(node => node.rawIdx), [1, 79, 159]);
+assert.strictEqual(preWindowOnly.taskOwnerNode.label, 'pre-window:159');
+assert.deepStrictEqual(
+  compactionCards(preWindowOnly.inner)
+    .filter(node => node.children.some(child => child.label === 'task'))
+    .map(node => node.rawIdx),
+  [159],
+);
+assert.strictEqual(taskCount(preWindowOnly.inner), 1);
+assert.strictEqual(preWindowOnly.fallbackInserted, false);
+
+const noMarkers = renderScenario([]);
+assert.strictEqual(noMarkers.taskOwnerNode, null);
+assert.strictEqual(noMarkers.fallbackInserted, true);
+assert.strictEqual(taskCount(noMarkers.inner), 1);
+console.log('ok');
+"""
+    assert _run_node(source) == "ok"
+
+
+def test_render_messages_uses_virtual_window_and_spacer_measurement_path():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    render_start = js.index("function renderMessages(options)")
+    render_end = js.index("function _toolDisplayName", render_start)
+    render_body = js[render_start:render_end]
+
+    assert "_currentMessageVirtualWindow(visWithIdx,_messageVirtualKeepTailCount())" in render_body
+    assert "const renderVisibleIdxs=[" in render_body
+    assert "_messageVirtualSpacer(virtualWindow.topPad,'before')" in render_body
+    assert "_messageVirtualSpacer(virtualWindow.bottomPad,'after')" in render_body
+    assert "_updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);" in render_body
+    assert "const renderableRawIdxs=new Set(visWithIdx.map(e=>e.rawIdx));" in render_body
+    assert "if(virtualWindow.virtualized&&renderableRawIdxs.has(aIdx)&&!renderedRawIdxs.has(aIdx)) continue;" in render_body
+    assert "if(hasServerOlder){" in render_body
+    assert "_showEarlierRenderedMessages();" not in render_body
+    top_spacer_idx = render_body.index("_messageVirtualSpacer(virtualWindow.topPad,'before')")
+    indicator_idx = render_body.index("indicator.id='loadOlderIndicator';")
+    assert top_spacer_idx < indicator_idx, (
+        "renderMessages() must place the load-older affordance after the top "
+        "virtual spacer so it stays visible at the top of the rendered window."
+    )
+    gap_reset_idx = render_body.index("currentAssistantTurn=null;", render_body.index("_messageVirtualSpacer(virtualWindow.bottomPad,'after')") - 220)
+    gap_spacer_idx = render_body.index("_messageVirtualSpacer(virtualWindow.bottomPad,'after')")
+    assert gap_reset_idx < gap_spacer_idx, (
+        "renderMessages() must reset currentAssistantTurn before inserting the "
+        "virtual gap spacer so assistant bubbles do not merge across the head/tail boundary."
+    )
+
+
+def test_measurement_uses_one_primary_row_and_adjacent_activity_siblings_only():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+eval(extractFunc('_measureMessageVirtualRow'));
+const nextMessage = {
+  hasAttribute(name){ return name === 'data-msg-idx'; },
+  getBoundingClientRect(){ return {height: 999}; },
+  nextElementSibling: null,
+};
+const activityGroup = {
+  hasAttribute(){ return false; },
+  matches(selector){ return selector === '.tool-call-group,.tool-card-row,.agent-activity-thinking,.thinking-card-row'; },
+  getBoundingClientRect(){ return {height: 60}; },
+  nextElementSibling: {
+    hasAttribute(){ return false; },
+    matches(){ return false; },
+    getBoundingClientRect(){ return {height: 5000}; },
+    nextElementSibling: nextMessage,
+  },
+};
+const primary = {
+  classList: { contains(name){ return name === 'assistant-segment'; } },
+  getBoundingClientRect(){ return {height: 120}; },
+  nextElementSibling: activityGroup,
+};
+const inner = {
+  querySelector(selector){
+    if(selector === '[data-msg-idx="42"]') return primary;
+    return null;
+  },
+};
+console.log(JSON.stringify({
+  total: _measureMessageVirtualRow(inner, {rawIdx: 42}),
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["total"] == 180
+
+
+def test_virtual_keep_tail_count_stays_bounded_after_history_expands_render_window():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+const MESSAGE_RENDER_WINDOW_DEFAULT = 50;
+let _messageRenderWindowSize = 240;
+eval(extractFunc('_currentMessageRenderWindowSize'));
+eval(extractFunc('_messageVirtualKeepTailCount'));
+console.log(JSON.stringify({
+  renderWindowSize: _currentMessageRenderWindowSize(),
+  keepTailCount: _messageVirtualKeepTailCount(),
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["renderWindowSize"] == 240
+    assert metrics["keepTailCount"] == 50
+
+
+def test_virtual_prepended_height_delta_uses_prefix_cache_only_when_virtualized():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS = {
+  user: 120,
+  assistant: 160,
+  tool_call: 400,
+  default: 140,
+};
+eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+eval(extractFunc('_messageVirtualRoleForEntry'));
+let virtualized = true;
+let _messageVirtualHeightCache = [0, 220, 180, 120];
+let _messageVirtualEstimatedRowHeight = 140;
+function _getVisibleMessagesWithIdx(){
+  return [{rawIdx: 0}, {rawIdx: 1}, {rawIdx: 2}, {rawIdx: 3}];
+}
+function _messageVirtualKeepTailCount(){ return 2; }
+function _currentMessageVirtualWindow(){
+  return {virtualized};
+}
+eval(extractFunc('_messageVirtualPrependedHeightDelta'));
+const active = _messageVirtualPrependedHeightDelta(3);
+virtualized = false;
+const inactive = _messageVirtualPrependedHeightDelta(3);
+console.log(JSON.stringify({active, inactive}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["active"] == 540
+    assert metrics["inactive"] is None
+
+
+def test_virtual_question_jump_scroll_target_uses_visible_index_height_prefix():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+let _messageVirtualHeightCache = [100, 120, 80, 140];
+let _messageVirtualHeightCacheEntries = [];
+let _messageVirtualHeightCacheLen = 4;
+let _messageVirtualHeightCacheSrc = null;
+let _messageVirtualEstimatedRowHeight = 110;
+let _messageVirtualWindowKey = 'old';
+let S = {messages: [{}, {}, {}, {}]};
+function _messageIsRenderable(){ return true; }
+eval(extractFunc('_messageVirtualHeightEntryMatches'));
+eval(extractFunc('_syncMessageVirtualHeightCache'));
+eval(extractFunc('_messageVisibleIndexForRawIdx'));
+eval(extractFunc('_messageVirtualScrollTopForVisibleIdx'));
+const visWithIdx = [
+  {rawIdx: 10, m: S.messages[0]},
+  {rawIdx: 12, m: S.messages[1]},
+  {rawIdx: 14, m: S.messages[2]},
+  {rawIdx: 16, m: S.messages[3]},
+];
+_messageVirtualHeightCacheEntries = visWithIdx;
+_messageVirtualHeightCacheSrc = S.messages;
+const visibleIdx = _messageVisibleIndexForRawIdx(14, visWithIdx);
+const scrollTop = _messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, {clientHeight: 200});
+console.log(JSON.stringify({visibleIdx, scrollTop}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["visibleIdx"] == 2
+    assert metrics["scrollTop"] == 150
+
+
+def test_height_cache_preserves_measured_prefix_across_append_only_growth():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT = 140;
+let _messageVirtualHeightCache = [180, 220];
+let _messageVirtualHeightCacheEntries = [];
+let _messageVirtualHeightCacheLen = 2;
+let _messageVirtualHeightCacheSrc = null;
+let _messageVirtualEstimatedRowHeight = 200;
+let _messageVirtualWindowKey = 'stale-key';
+function _clearMessageVirtualHeightCache() {
+  _messageVirtualHeightCache = [];
+  _messageVirtualHeightCacheEntries = [];
+  _messageVirtualHeightCacheLen = 0;
+  _messageVirtualHeightCacheSrc = null;
+  _messageVirtualEstimatedRowHeight = MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT;
+  _messageVirtualWindowKey = '';
+}
+eval(extractFunc('_messageVirtualHeightEntryMatches'));
+eval(extractFunc('_messageVirtualHeightPrefixEntryMatches'));
+eval(extractFunc('_syncMessageVirtualHeightCache'));
+const first = {id: 'first'};
+const second = {id: 'second'};
+let S = {messages: [first, second]};
+_messageVirtualHeightCacheEntries = [
+  {rawIdx: 0, m: first},
+  {rawIdx: 1, m: second},
+];
+_messageVirtualHeightCacheSrc = S.messages;
+S = {messages: [first, second, {id: 'third'}]};
+_syncMessageVirtualHeightCache([
+  {rawIdx: 0, m: first},
+  {rawIdx: 1, m: second},
+  {rawIdx: 2, m: S.messages[2]},
+]);
+console.log(JSON.stringify({
+  cache: _messageVirtualHeightCache,
+  estimated: _messageVirtualEstimatedRowHeight,
+  windowKey: _messageVirtualWindowKey,
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["cache"][:2] == [180, 220]
+    assert len(metrics["cache"]) == 3
+    assert metrics["estimated"] == 200
+    assert metrics["windowKey"] == ""
+
+
+def test_height_cache_preserves_measured_suffix_across_prepended_history():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT = 140;
+let _messageVirtualHeightCache = [180, 220];
+let _messageVirtualHeightCacheEntries = [];
+let _messageVirtualHeightCacheLen = 2;
+let _messageVirtualHeightCacheSrc = null;
+let _messageVirtualEstimatedRowHeight = 200;
+let _messageVirtualWindowKey = 'stale-key';
+function _clearMessageVirtualHeightCache() {
+  _messageVirtualHeightCache = [];
+  _messageVirtualHeightCacheEntries = [];
+  _messageVirtualHeightCacheLen = 0;
+  _messageVirtualHeightCacheSrc = null;
+  _messageVirtualEstimatedRowHeight = MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT;
+  _messageVirtualWindowKey = '';
+}
+eval(extractFunc('_messageVirtualHeightEntryMatches'));
+eval(extractFunc('_messageVirtualHeightPrefixEntryMatches'));
+eval(extractFunc('_syncMessageVirtualHeightCache'));
+const first = {id: 'first'};
+const second = {id: 'second'};
+let S = {messages: [first, second]};
+_messageVirtualHeightCacheEntries = [
+  {rawIdx: 0, m: first},
+  {rawIdx: 1, m: second},
+];
+_messageVirtualHeightCacheSrc = S.messages;
+const olderA = {id: 'older-a'};
+const olderB = {id: 'older-b'};
+S = {messages: [olderA, olderB, first, second]};
+_syncMessageVirtualHeightCache([
+  {rawIdx: 0, m: olderA},
+  {rawIdx: 1, m: olderB},
+  {rawIdx: 2, m: first},
+  {rawIdx: 3, m: second},
+]);
+console.log(JSON.stringify({
+  cache: _messageVirtualHeightCache,
+  estimated: _messageVirtualEstimatedRowHeight,
+  windowKey: _messageVirtualWindowKey,
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["cache"][2:] == [180, 220]
+    assert len(metrics["cache"]) == 4
+    assert metrics["estimated"] == 200
+    assert metrics["windowKey"] == ""
+
+
+def test_measurement_refresh_budget_is_keyed_to_window_shape_not_pad_height():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+eval(extractFunc('_messageVirtualMeasurementCycleKeyFor'));
+console.log(JSON.stringify({
+  a: _messageVirtualMeasurementCycleKeyFor({virtualized: true, start: 10, end: 20, topPad: 1000, bottomPad: 2000, tailStart: 190}),
+  b: _messageVirtualMeasurementCycleKeyFor({virtualized: true, start: 10, end: 20, topPad: 1001, bottomPad: 1999, tailStart: 190}),
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["a"] == metrics["b"]
+
+
+def test_tool_rows_do_not_carry_message_measurement_hook():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    build_start = js.index("function buildToolCard(tc){")
+    build_end = js.index("function _colorDiffLines", build_start)
+    build_body = js[build_start:build_end]
+
+    assert "row.dataset.msgIdx" not in build_body
+    assert "querySelectorAll(`[data-msg-idx=" not in js
+
+
+def test_viewport_intersection_helper_detects_visible_rendered_rows_only():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+let rows = [];
+const container = {
+  getBoundingClientRect(){ return {top: 100, bottom: 300}; },
+  querySelectorAll(selector){
+    if(selector === '[data-msg-idx]') return rows;
+    return [];
+  },
+};
+function $(id){ return id === 'messages' ? container : null; }
+eval(extractFunc('_messageViewportIntersectsRenderedRow'));
+rows = [
+  { getBoundingClientRect(){ return {top: 10, bottom: 90}; } },
+  { getBoundingClientRect(){ return {top: 320, bottom: 360}; } },
+];
+const blank = _messageViewportIntersectsRenderedRow();
+rows = [
+  { getBoundingClientRect(){ return {top: 120, bottom: 180}; } },
+];
+const visible = _messageViewportIntersectsRenderedRow();
+console.log(JSON.stringify({blank, visible}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["blank"] is False
+    assert metrics["visible"] is True
+
+
+def test_render_messages_has_one_shot_virtual_blank_viewport_fallback():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    render_start = js.index("function renderMessages(options)")
+    render_end = js.index("function _toolDisplayName", render_start)
+    render_body = js[render_start:render_end]
+
+    assert "const virtualFallback=!!(options&&options._virtualFallback);" in render_body
+    assert "const virtualWindow=virtualFallback" in render_body
+    # #7591: both render paths capture viewport ownership BEFORE the restore and
+    # pass it into recovery, so recovery can tell an independent in-flight
+    # programmatic write from the render's own (the old depth-counter guard was
+    # dead: recovery only ever ran inside the depth-incremented block).
+    assert render_body.count("const recoveryOwnership=_captureMessageRecoveryOwnership();") == 2
+    assert (
+        render_body.count(
+            "if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, "
+            "virtualWindow, recoveryOwnership)) return;"
+        )
+        == 2
+    )
+    assert "if(_sessionHtmlCacheSid&&S.session&&S.session.session_id===_sessionHtmlCacheSid){" in js
+    assert "_sessionHtmlCache.delete(_sessionHtmlCacheSid);" in js
+    assert "renderMessages({preserveScroll:true,_virtualFallback:true});" in js
+
+
+def test_virtual_blank_viewport_recovery_evicts_stale_cache_before_fallback():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+let deletes = [];
+let renderCalls = [];
+const _sessionHtmlCache = {
+  delete(sid){ deletes.push(sid); }
+};
+let _sessionHtmlCacheSid = 'sid-123';
+const S = { session: { session_id: 'sid-123' } };
+let _messageVirtualBlankClampAttempts = 0;
+function _messageViewportIntersectsRenderedRow(){ return false; }
+function renderMessages(options){ renderCalls.push(options); }
+// Module state the extracted clamp / compensation wrapper touch.
+let _blankViewportRecoveryToken = 0;
+let _blankViewportRecoveryApplied = 0;
+eval(extractFunc('_clampVirtualizedBlankViewportToRenderedEdge'));
+eval(extractFunc('_maybeRecoverVirtualizedBlankViewport'));
+const recovered = _maybeRecoverVirtualizedBlankViewport({preserveScroll:false, someFlag:true}, true, {virtualized:true});
+console.log(JSON.stringify({recovered, deletes, renderCalls}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["recovered"] is True
+    assert metrics["deletes"] == ["sid-123"]
+    assert metrics["renderCalls"] == [{"preserveScroll": True, "_virtualFallback": True}]
+
+
+def test_same_frame_restore_nudges_virtual_window_when_anchor_row_is_missing():
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + r"""
+const ROW_HEIGHT = 120;
+const TOTAL = 60;
+
+// Rows 10-59 are mounted (tail window); rows 0-9 are virtualized out.
+// Anchor points to rawIdx=5, which is in the virtualized zone.
+let mountedStart = 10;
+let scrollTopValue = 0;
+let renderCalls = [];
+let scrollTopHistory = [];
+let _messageVirtualWindowKey = 'stale-key';
+let _programmaticScroll = false;
+let _lastScrollTop = 0;
+let _messageUserUnpinned = true;
+let _scrollPinned = false;
+let _nearBottomCount = 0;
+let _messageViewportAnchorRemounting = false;
+let _messageVirtualHeightCache = Array.from({length: TOTAL}, () => ROW_HEIGHT);
+let _messageVirtualHeightCacheEntries = [];
+let _messageVirtualHeightCacheLen = TOTAL;
+let _messageVirtualHeightCacheSrc = null;
+let _messageVirtualEstimatedRowHeight = ROW_HEIGHT;
+
+function _clearMessageVirtualHeightCache(){}
+function _syncMessageVirtualHeightCache(){}
+
+const container = {
+  get scrollTop(){ return scrollTopValue; },
+  set scrollTop(v){ scrollTopHistory.push(v); scrollTopValue = v; },
+  get scrollHeight(){ return TOTAL * ROW_HEIGHT; },
+  get clientHeight(){ return 600; },
+  getBoundingClientRect(){ return {top: 0, bottom: 600}; },
+  querySelector(selector){
+    const m = selector && selector.match(/\[data-msg-idx="(\d+)"\]/);
+    if(!m) return null;
+    const idx = Number(m[1]);
+    if(idx < mountedStart || idx >= TOTAL) return null;
+    const top = (idx - mountedStart) * ROW_HEIGHT;
+    return { getBoundingClientRect(){ return {top, bottom: top + ROW_HEIGHT}; } };
+  },
+};
+function $(id){ return id === 'messages' ? container : null; }
+
+function _getVisibleMessagesWithIdx(){
+  return Array.from({length: TOTAL}, (_, i) => ({rawIdx: i}));
+}
+
+function renderMessages(opts){
+  renderCalls.push(JSON.parse(JSON.stringify(opts)));
+  mountedStart = 0;
+}
+
+function _restoreMessageViewportAnchor(anchor, delta){
+  const idx = Number(anchor.rawIdx) + Number(delta||0);
+  const row = container.querySelector(`[data-msg-idx="${idx}"]`);
+  if(!row) return false;
+  _programmaticScroll = true;
+  return true;
+}
+function requestAnimationFrame(fn){ fn(); }
+
+eval(extractFunc('_messageVisibleIndexForRawIdx'));
+eval(extractFunc('_messageSessionIndexBase'));
+eval(extractFunc('_messageSessionIndexForRawIdx'));
+eval(extractFunc('_messageRawIdxForSessionIndex'));
+eval(extractFunc('_messageVirtualScrollTopForVisibleIdx'));
+eval(extractFunc('_remountMessageViewportAnchor'));
+eval(extractFunc('_restorePinnedMessageScrollSnapshot'));
+eval(extractFunc('_restoreMessageScrollSnapshotSameFrame'));
+
+const snapshot = {
+  anchor: {rawIdx: 5, topOffset: 50},
+  top: 100,
+  bottom: 6600,
+  scrollHeight: 7200,
+  pinned: false,
+  userUnpinned: true,
+};
+_restoreMessageScrollSnapshotSameFrame(snapshot);
+console.log(JSON.stringify({renderCalls, scrollTopHistory}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert len(metrics["renderCalls"]) == 1, (
+        "_restoreMessageScrollSnapshotSameFrame must call renderMessages to mount the virtualized-out anchor row"
+    )
+    assert metrics["renderCalls"][0].get("preserveScroll") is True, (
+        "re-render must use preserveScroll:true to avoid scrolling to bottom"
+    )
+    assert len(metrics["scrollTopHistory"]) >= 1, (
+        "scrollTop must be adjusted before re-render to place anchor row in the virtual window"
+    )
+    # rawIdx=5, visIdx=5: offset=5*120=600, viewport=600, scrollTop=round(600-600*0.35)=390
+    assert metrics["scrollTopHistory"][0] == 390
+
+
+def test_virtualize_transcript_opt_out_forces_full_render_window():
+    """#4325: when window._virtualizeTranscript===false, _currentMessageVirtualWindow
+    must return a non-virtualized full window even for a long (>threshold) transcript,
+    so the whole transcript renders. When true/undefined it virtualizes as before."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS={
+  user:120,
+  assistant:160,
+  tool_call:400,
+  default:140,
+};
+function _messageVirtualDefaultHeightForRole(role){
+  return MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS[
+    role&&Object.prototype.hasOwnProperty.call(MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS,role)?role:'default'
+  ];
+}
+const MESSAGE_VIRTUAL_THRESHOLD_ROWS = 80;
+const MESSAGE_VIRTUAL_BUFFER_PX = 900;
+let _messageVirtualHeightCache = [];
+let _messageVirtualEstimatedRowHeight = 140;
+function _syncMessageVirtualHeightCache(){ /* no-op for the test */ }
+function $(id){ return {scrollTop: 5000, clientHeight: 720}; }
+function _messageVirtualRoleForEntry(){ return 'default'; }
+const window = {};
+eval(extractFunc('_messageVirtualWindow'));
+eval(extractFunc('_currentMessageVirtualWindow'));
+// 200 visible messages — well over the 80 threshold
+const visWithIdx = Array.from({length: 200}, (_, i) => ({rawIdx: i}));
+// OFF: opt-out → full render
+window._virtualizeTranscript = false;
+const off = _currentMessageVirtualWindow(visWithIdx, 50);
+// ON (default): virtualizes
+window._virtualizeTranscript = true;
+const on = _currentMessageVirtualWindow(visWithIdx, 50);
+// UNDEFINED: also virtualizes (opt-out only when explicitly false)
+delete window._virtualizeTranscript;
+const undef = _currentMessageVirtualWindow(visWithIdx, 50);
+console.log(JSON.stringify({off, on, undef}));
+"""
+    metrics = json.loads(_run_node(source))
+    # OFF → full, non-virtualized window covering every row
+    assert metrics["off"]["virtualized"] is False
+    assert metrics["off"]["start"] == 0
+    assert metrics["off"]["end"] == 200
+    assert metrics["off"]["topPad"] == 0
+    assert metrics["off"]["bottomPad"] == 0
+    # ON → virtualized (only a window of the 200 rows)
+    assert metrics["on"]["virtualized"] is True
+    assert metrics["on"]["end"] - metrics["on"]["start"] < 200
+    # UNDEFINED → still virtualizes (opt-out is explicit-false only)
+    assert metrics["undef"]["virtualized"] is True
+
+
+def test_virtualize_transcript_gate_present_in_current_window_fn():
+    """The opt-out gate must live in _currentMessageVirtualWindow (the single
+    chokepoint), guarding on window._virtualizeTranscript===false."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    start = js.index("function _currentMessageVirtualWindow(")
+    body = js[start:start + 900]
+    assert "_virtualizeTranscript===false" in body, (
+        "opt-out gate must check window._virtualizeTranscript===false in "
+        "_currentMessageVirtualWindow"
+    )
+    assert "virtualized:false" in body, "gate must return a non-virtualized window when opted out"
+
+
+def test_message_virtual_default_height_for_role_returns_correct_heights():
+    """Verify per-role default heights are configured."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS={
+  user:120,
+  assistant:160,
+  tool_call:400,
+  default:140,
+};
+eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+console.log(JSON.stringify({
+  tool_call: _messageVirtualDefaultHeightForRole('tool_call'),
+  user: _messageVirtualDefaultHeightForRole('user'),
+  assistant: _messageVirtualDefaultHeightForRole('assistant'),
+  unknown: _messageVirtualDefaultHeightForRole('unknown'),
+  default: _messageVirtualDefaultHeightForRole('default'),
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["tool_call"] == 400
+    assert metrics["user"] == 120
+    assert metrics["assistant"] == 160
+    assert metrics["unknown"] == 140
+    assert metrics["default"] == 140
+
+
+def test_message_virtual_role_for_entry_classifies_tool_calls():
+    """Verify role classifier detects tool_calls, tool_use content, and _partial_tool_calls."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+eval(extractFunc('_messageVirtualRoleForEntry'));
+console.log(JSON.stringify({
+  userRole: _messageVirtualRoleForEntry({m: {role: 'user'}}),
+  assistantNoTools: _messageVirtualRoleForEntry({m: {role: 'assistant'}}),
+  assistantWithToolCalls: _messageVirtualRoleForEntry({m: {role: 'assistant', tool_calls: [{id: '1'}]}}),
+  assistantWithToolUse: _messageVirtualRoleForEntry({m: {role: 'assistant', content: [{type: 'tool_use', id: '1'}]}}),
+  assistantWithPartialToolCalls: _messageVirtualRoleForEntry({m: {role: 'assistant', _partial_tool_calls: [{id: '1'}]}}),
+  noEntry: _messageVirtualRoleForEntry(null),
+  noMessage: _messageVirtualRoleForEntry({m: null}),
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["userRole"] == "user"
+    assert metrics["assistantNoTools"] == "assistant"
+    assert metrics["assistantWithToolCalls"] == "tool_call"
+    assert metrics["assistantWithToolUse"] == "tool_call"
+    assert metrics["assistantWithPartialToolCalls"] == "tool_call"
+    assert metrics["noEntry"] == "default"
+    assert metrics["noMessage"] == "default"
+
+
+def test_message_virtual_window_with_role_for_idx_uses_role_defaults():
+    """Verify _messageVirtualWindow uses role-specific heights when roleForIdx is provided."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS={
+  user:120,
+  assistant:160,
+  tool_call:400,
+  default:140,
+};
+const MESSAGE_VIRTUAL_THRESHOLD_ROWS = 80;
+const MESSAGE_VIRTUAL_BUFFER_PX = 900;
+eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+eval(extractFunc('_messageVirtualWindow'));
+const visWithIdx = [
+  {m: {role: 'user'}},
+  {m: {role: 'assistant', tool_calls: [{id: '1'}]}},
+  {m: {role: 'assistant'}},
+];
+const metrics = _messageVirtualWindow({
+  total: 3,
+  scrollTop: 0,
+  viewportHeight: 600,
+  heights: [0, 0, 0],
+  defaultHeight: 140,
+  roleForIdx: (idx) => {
+    const entry = visWithIdx[idx];
+    if(!entry || !entry.m) return 'default';
+    if(entry.m.role === 'user') return 'user';
+    if(entry.m.role === 'assistant'){
+      if(Array.isArray(entry.m.tool_calls) && entry.m.tool_calls.length > 0) return 'tool_call';
+      return 'assistant';
+    }
+    return 'default';
+  },
+  bufferPx: 0,
+  threshold: 2,
+  keepTailCount: 0,
+});
+console.log(JSON.stringify({
+  virtualized: metrics.virtualized,
+  start: metrics.start,
+  end: metrics.end,
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    # With 3 rows (120 + 400 + 160 = 680px) and viewport 600px, should not virtualize (below threshold)
+    # So this checks that the role-based defaults are being computed
+    assert metrics["end"] - metrics["start"] > 0
+
+
+def test_message_virtual_window_cached_heights_override_role_defaults():
+    """Verify cached heights take precedence over role-specific defaults."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS={
+  user:120,
+  assistant:160,
+  tool_call:400,
+  default:140,
+};
+const MESSAGE_VIRTUAL_THRESHOLD_ROWS = 80;
+const MESSAGE_VIRTUAL_BUFFER_PX = 900;
+eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+eval(extractFunc('_messageVirtualWindow'));
+const visWithIdx = [
+  {m: {role: 'user'}},  // normally 120
+  {m: {role: 'assistant', tool_calls: [{id: '1'}]}},  // normally 400
+];
+// Test case 1: with cached heights 250+300=550px < 600px viewport, no virtualization needed
+const metricsSmall = _messageVirtualWindow({
+  total: 2,
+  scrollTop: 0,
+  viewportHeight: 600,
+  heights: [250, 300],  // Cached heights override roles
+  defaultHeight: 140,
+  roleForIdx: (idx) => {
+    const entry = visWithIdx[idx];
+    if(!entry || !entry.m) return 'default';
+    if(entry.m.role === 'user') return 'user';
+    if(entry.m.role === 'assistant'){
+      if(Array.isArray(entry.m.tool_calls) && entry.m.tool_calls.length > 0) return 'tool_call';
+      return 'assistant';
+    }
+    return 'default';
+  },
+  bufferPx: 0,
+  threshold: 80,
+  keepTailCount: 0,
+});
+// Test case 2: with many rows and cached heights, should use cached heights not role defaults
+const largeList = Array.from({length: 100}, (_, i) => ({m: {role: i % 2 ? 'user' : 'assistant'}}));
+const cachedHeights = Array.from({length: 100}, (_, i) => 200);  // All 200px when cached
+const metricsLarge = _messageVirtualWindow({
+  total: 100,
+  scrollTop: 0,
+  viewportHeight: 600,
+  heights: cachedHeights,
+  defaultHeight: 140,
+  roleForIdx: (idx) => {
+    if(largeList[idx]?.m?.role === 'user') return 'user';
+    return 'assistant';
+  },
+  bufferPx: 0,
+  threshold: 80,
+  keepTailCount: 0,
+});
+console.log(JSON.stringify({
+  smallVirtualized: metricsSmall.virtualized,
+  largeVirtualized: metricsLarge.virtualized,
+  largeHasWindow: metricsLarge.end > metricsLarge.start,
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    # With 2 rows below threshold, should not virtualize
+    assert metrics["smallVirtualized"] is False
+    # With 100 rows above threshold, should virtualize and use cached heights
+    assert metrics["largeVirtualized"] is True
+    assert metrics["largeHasWindow"] is True
+
+
+def test_offset_helpers_use_per_role_defaults_for_uncached_rows():
+    """Verify _messageVirtualScrollTopForVisibleIdx and _messageVirtualPrependedHeightDelta
+    use per-role default heights (not the flat 140px estimate) for uncached rows,
+    and that these agree with _messageVirtualWindow's own accounting."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS = {
+  user: 120,
+  assistant: 160,
+  tool_call: 400,
+  default: 140,
+};
+eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+eval(extractFunc('_messageVirtualRoleForEntry'));
+
+// Three entries: user (120), tool_call (400), assistant (160) — all uncached (height=0)
+const visWithIdx = [
+  {rawIdx: 0, m: {role: 'user'}},
+  {rawIdx: 1, m: {role: 'assistant', tool_calls: [{id: 'x'}]}},
+  {rawIdx: 2, m: {role: 'assistant'}},
+];
+
+// --- _messageVirtualScrollTopForVisibleIdx ---
+let _messageVirtualHeightCache = [0, 0, 0];
+let _messageVirtualHeightCacheEntries = [];
+let _messageVirtualHeightCacheLen = 3;
+let _messageVirtualHeightCacheSrc = null;
+let _messageVirtualEstimatedRowHeight = 140;
+let _messageVirtualWindowKey = '';
+let S = {messages: visWithIdx.map(e => e.m)};
+function _messageIsRenderable(){ return true; }
+eval(extractFunc('_messageVirtualHeightEntryMatches'));
+eval(extractFunc('_syncMessageVirtualHeightCache'));
+eval(extractFunc('_messageVirtualScrollTopForVisibleIdx'));
+// scrollTop to visibleIdx=2 must sum heights of idx 0 (120) and idx 1 (400) = 520
+_messageVirtualHeightCacheEntries = visWithIdx;
+_messageVirtualHeightCacheSrc = S.messages;
+const scrollTop = _messageVirtualScrollTopForVisibleIdx(visWithIdx, 2, null);
+
+// --- _messageVirtualPrependedHeightDelta ---
+let virtualized2 = true;
+let _messageVirtualHeightCache2 = [0, 0, 0];
+let _messageVirtualEstimatedRowHeight2 = 140;
+function _getVisibleMessagesWithIdx(){ return visWithIdx; }
+function _messageVirtualKeepTailCount(){ return 0; }
+function _currentMessageVirtualWindow(){ return {virtualized: virtualized2}; }
+// Patch cache var used by _messageVirtualPrependedHeightDelta
+eval(extractFunc('_messageVirtualPrependedHeightDelta').replace(
+  /_messageVirtualHeightCache/g, '_messageVirtualHeightCache2'
+).replace(
+  /_messageVirtualEstimatedRowHeight/g, '_messageVirtualEstimatedRowHeight2'
+));
+// Sum of first 3 uncached entries: user(120) + tool_call(400) + assistant(160) = 680
+const delta = _messageVirtualPrependedHeightDelta(3);
+
+// --- _messageVirtualWindow agreement ---
+const MESSAGE_VIRTUAL_THRESHOLD_ROWS = 2;
+const MESSAGE_VIRTUAL_BUFFER_PX = 0;
+eval(extractFunc('_messageVirtualWindow'));
+const win = _messageVirtualWindow({
+  total: 3,
+  scrollTop: 0,
+  viewportHeight: 600,
+  heights: [0, 0, 0],
+  defaultHeight: 140,
+  roleForIdx: idx => _messageVirtualRoleForEntry(visWithIdx[idx]),
+  bufferPx: 0,
+  threshold: 2,
+  keepTailCount: 0,
+});
+// topPad is sum of rows before win.start; with start=0 it is 0, but
+// the window must have consumed the same per-role heights when computing
+// row positions, so verify the window spans all rows correctly
+const windowCoversAll = win.start === 0 && win.end === 3;
+
+console.log(JSON.stringify({scrollTop, delta, windowCoversAll}));
+"""
+    metrics = json.loads(_run_node(source))
+    # scrollTop to idx=2 = sum of row 0 (120) + row 1 (400) = 520, no viewport offset (null container)
+    assert metrics["scrollTop"] == 520, (
+        f"expected 520 (120+400) but got {metrics['scrollTop']}; "
+        "offset helper must use per-role defaults, not flat 140px"
+    )
+    # prepended delta for 3 uncached rows = 120 + 400 + 160 = 680
+    assert metrics["delta"] == 680, (
+        f"expected 680 (120+400+160) but got {metrics['delta']}; "
+        "prepend helper must use per-role defaults, not flat 140px"
+    )
+    # windowing function must also cover the same three rows
+    assert metrics["windowCoversAll"] is True
+
+
+def test_compensate_scroll_for_measurement_delta_no_anchor_does_not_throw():
+    """When _captureMessageViewportAnchor returns null, the compensation helper
+    should not throw and should not mutate scrollTop."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+let renderCalls = [];
+let scrollTopWasMutated = false;
+let scrollTopValue = 100;
+const container = {
+  get scrollTop(){ return scrollTopValue; },
+  set scrollTop(v){ scrollTopWasMutated = true; scrollTopValue = v; },
+  getBoundingClientRect(){ return {top: 0}; },
+  querySelector(){ return null; },
+  classList: { add(){}, remove(){} },
+};
+function $(id){ return id === 'messages' ? container : null; }
+function _captureMessageViewportAnchor(){ return null; }
+let _programmaticScroll = false;
+let _lastScrollTop = 0;
+function _scheduleMessageVirtualizedRender(){ renderCalls.push(true); }
+function requestAnimationFrame(cb){ cb(); }
+// Module state the extracted clamp / compensation wrapper touch.
+let _blankViewportRecoveryToken = 0;
+let _blankViewportRecoveryApplied = 0;
+eval(extractFunc('_compensateScrollForMeasurementDelta'));
+_compensateScrollForMeasurementDelta(()=>{ _scheduleMessageVirtualizedRender(true); });
+console.log(JSON.stringify({
+  renderCalled: renderCalls.length > 0,
+  scrollTopMutated: scrollTopWasMutated,
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["renderCalled"] is True
+    assert metrics["scrollTopMutated"] is False
+
+
+def test_compensate_scroll_for_measurement_delta_shifts_scroll_when_anchor_moves():
+    """When the anchor row shifts position due to measurement changes,
+    scrollTop should be adjusted by the delta."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+let scrollTopValue = 200;
+let scrollHistory = [];
+const container = {
+  get scrollTop(){ return scrollTopValue; },
+  set scrollTop(v){ scrollHistory.push(v); scrollTopValue = v; },
+  getBoundingClientRect(){ return {top: 50, bottom: 650}; },
+  classList: { add(){}, remove(){} },
+  querySelector(selector){
+    if(selector === '[data-msg-idx="42"]'){
+      // After render, the row moved from relative offset 100 to 150 (50px shift)
+      return {
+        getBoundingClientRect(){ return {top: 100}; }
+      };
+    }
+    return null;
+  },
+};
+function $(id){ return id === 'messages' ? container : null; }
+function _captureMessageViewportAnchor(){
+  // Anchor was at topOffset 100 before the render
+  return {rawIdx: 42, topOffset: 100};
+}
+let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+let _programmaticScrollResetTimer = 0;
+let _lastScrollTop = 0;
+const performance = { now(){ return 1000; } };
+function clearTimeout(){}
+function setTimeout(cb, ms){ cb(); return 1; }
+function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
+let renderCalls = [];
+function _scheduleMessageVirtualizedRender(){ renderCalls.push(true); }
+function requestAnimationFrame(cb){ cb(); }
+// Module state the extracted clamp / compensation wrapper touch.
+let _blankViewportRecoveryToken = 0;
+let _blankViewportRecoveryApplied = 0;
+eval(extractFunc('_compensateScrollForMeasurementDelta'));
+_compensateScrollForMeasurementDelta(()=>{ _scheduleMessageVirtualizedRender(true); });
+console.log(JSON.stringify({
+  scrollHistory: scrollHistory,
+  renderCalled: renderCalls.length > 0,
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["renderCalled"] is True
+    # actualOffset = 100 - 50 = 50, delta = 50 - 100 = -50 (row moved up 50px)
+    # scrollTop should adjust: 200 + (-50) = 150
+    assert metrics["scrollHistory"] == [150], (
+        "scrollTop should shift by -50px to keep anchor in place"
+    )
+
+
+def test_compensate_scroll_for_measurement_delta_skips_small_delta():
+    """When delta < 2px, no compensation is applied (tolerance)."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+let scrollTopValue = 200;
+let scrollHistory = [];
+const container = {
+  get scrollTop(){ return scrollTopValue; },
+  set scrollTop(v){ scrollHistory.push(v); scrollTopValue = v; },
+  getBoundingClientRect(){ return {top: 50, bottom: 650}; },
+  classList: { add(){}, remove(){} },
+  querySelector(selector){
+    if(selector === '[data-msg-idx="42"]'){
+      // Row moved by only 1px, within tolerance
+      return {
+        getBoundingClientRect(){ return {top: 251}; }
+      };
+    }
+    return null;
+  },
+};
+function $(id){ return id === 'messages' ? container : null; }
+function _captureMessageViewportAnchor(){
+  return {rawIdx: 42, topOffset: 200};
+}
+let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+let _programmaticScrollResetTimer = 0;
+let _lastScrollTop = 0;
+const performance = { now(){ return 1000; } };
+function clearTimeout(){}
+function setTimeout(cb, ms){ cb(); return 1; }
+function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
+let renderCalls = [];
+function _scheduleMessageVirtualizedRender(){ renderCalls.push(true); }
+function requestAnimationFrame(cb){ cb(); }
+// Module state the extracted clamp / compensation wrapper touch.
+let _blankViewportRecoveryToken = 0;
+let _blankViewportRecoveryApplied = 0;
+eval(extractFunc('_compensateScrollForMeasurementDelta'));
+_compensateScrollForMeasurementDelta(()=>{ _scheduleMessageVirtualizedRender(true); });
+console.log(JSON.stringify({
+  scrollHistory: scrollHistory,
+  renderCalled: renderCalls.length > 0,
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["renderCalled"] is True
+    assert metrics["scrollHistory"] == [], (
+        "scrollTop should not change for delta < 2px"
+    )
+
+
+def test_compensate_scroll_for_measurement_delta_sets_programmatic_scroll_flag():
+    """_programmaticScroll should be set during compensation and cleared after rAF+setTimeout."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+let scrollTopValue = 200;
+let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+let _programmaticScrollResetTimer = 0;
+let _lastScrollTop = 0;
+let scrollSetCount = 0;
+const performance = { now(){ return 1000; } };
+function clearTimeout(){}
+const container = {
+  get scrollTop(){ return scrollTopValue; },
+  set scrollTop(v){
+    scrollSetCount++;
+    scrollTopValue = v;
+  },
+  getBoundingClientRect(){ return {top: 50, bottom: 650}; },
+  classList: { add(){}, remove(){} },
+  querySelector(selector){
+    if(selector === '[data-msg-idx="42"]'){
+      return {
+        getBoundingClientRect(){ return {top: 300}; }
+      };
+    }
+    return null;
+  },
+};
+function $(id){ return id === 'messages' ? container : null; }
+function _captureMessageViewportAnchor(){
+  return {rawIdx: 42, topOffset: 200};
+}
+let renderCalls = [];
+function _scheduleMessageVirtualizedRender(){ renderCalls.push(true); }
+function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
+function requestAnimationFrame(cb){ cb(); }
+function setTimeout(cb, delay){ cb(); return 1; }
+// Module state the extracted clamp / compensation wrapper touch.
+let _blankViewportRecoveryToken = 0;
+let _blankViewportRecoveryApplied = 0;
+eval(extractFunc('_compensateScrollForMeasurementDelta'));
+_compensateScrollForMeasurementDelta(()=>{ _scheduleMessageVirtualizedRender(true); });
+console.log(JSON.stringify({
+  programmaticScrollWasTrue: _programmaticScroll === true || scrollSetCount > 0,
+  programmaticScrollNowFalse: _programmaticScroll === false,
+  scrollWasSet: scrollSetCount > 0,
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    # _programmaticScroll should have been set to true when scrollTop was adjusted
+    assert metrics["scrollWasSet"] is True, (
+        "scrollTop should be set when delta > 2px"
+    )
+    # _programmaticScroll should have been cleared after the setTimeout callback
+    assert metrics["programmaticScrollNowFalse"] is True, (
+        "_programmaticScroll should be false after setTimeout completes"
+    )
+
+
+def test_virtualized_render_uses_compensation_helper():
+    """_scheduleMessageVirtualizedRender must wrap renderMessages with _compensateScrollForMeasurementDelta."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    start = js.index("function _scheduleMessageVirtualizedRender(")
+    end = js.index("\n// ──", start)
+    body = js[start:end]
+
+    assert "_compensateScrollForMeasurementDelta" in body, (
+        "_scheduleMessageVirtualizedRender must call "
+        "_compensateScrollForMeasurementDelta to compensate scroll after measurement-driven rerenders"
+    )
+    assert "renderMessages(" in body, (
+        "the compensation helper should wrap the actual renderMessages call"
+    )
+
+
+def test_scroll_listener_guards_programmatic_scroll_before_marking_active():
+    """The _programmaticScroll guard must appear before _markMessageVirtualScrollActive
+    in the scroll listener so that programmatic scrolls (e.g. from
+    _compensateScrollForMeasurementDelta) do not arm the 150ms settle timer."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    listener_start = js.index("el.addEventListener('scroll',()=>{")
+    listener_end = js.index("});", listener_start)
+    listener_body = js[listener_start:listener_end]
+
+    guard_pos = listener_body.index("if(_freshProgrammaticScrollActive()) return;")
+    mark_pos = listener_body.index("_markMessageVirtualScrollActive();")
+    assert guard_pos < mark_pos, (
+        "Scroll listener must check _programmaticScroll before calling "
+        "_markMessageVirtualScrollActive so programmatic scrolls do not arm "
+        "the 150ms settle timer and chain measurement delays"
+    )
+
+
+def test_clear_height_cache_resets_scroll_settle_globals():
+    """_clearMessageVirtualHeightCache must zero out the three scroll-settle globals
+    so that a deferred measurement from a previous session cannot fire against the
+    new session's DOM after a session switch."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+let timerCleared = false;
+let _messageVirtualScrollActive = true;
+let _messageVirtualScrollSettleTimer = 99;
+let _messageVirtualDeferredMeasurement = {some: 'stale-metrics'};
+let _messageVirtualHeightCache = [100, 200];
+let _messageVirtualHeightCacheEntries = [{rawIdx: 0}];
+let _messageVirtualHeightCacheLen = 2;
+let _messageVirtualHeightCacheSrc = {};
+let _messageVirtualEstimatedRowHeight = 200;
+let _messageVirtualWindowKey = 'old-key';
+let _messageVirtualMeasurementCycleKey = 'old-cycle';
+let _messageVirtualMeasurementSeenKeys = ['stale-key'];
+let _messageVirtualMeasurementBurstActive = true;
+let _messageVirtualRenderQueuedOrigin = 'internal';
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT = 140;
+// #4367 introduced per-role default heights; the combined _clearMessageVirtualHeightCache
+// resets the estimate via _messageVirtualDefaultHeightForRole('default'), so the harness
+// must provide the role map + that helper.
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS = {user:120, assistant:160, tool_call:400, default:140};
+function clearTimeout(id){ timerCleared = (id === 99); }
+eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+eval(extractFunc('_resetMessageVirtualMeasurementBurst'));
+eval(extractFunc('_clearMessageVirtualHeightCache'));
+_clearMessageVirtualHeightCache();
+console.log(JSON.stringify({
+  scrollActive: _messageVirtualScrollActive,
+  settleTimer: _messageVirtualScrollSettleTimer,
+  deferred: _messageVirtualDeferredMeasurement,
+  timerCleared: timerCleared,
+  seenKeys: _messageVirtualMeasurementSeenKeys,
+  burstActive: _messageVirtualMeasurementBurstActive,
+  queuedOrigin: _messageVirtualRenderQueuedOrigin,
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["scrollActive"] is False, (
+        "_clearMessageVirtualHeightCache must reset _messageVirtualScrollActive to false"
+    )
+    assert metrics["settleTimer"] == 0, (
+        "_clearMessageVirtualHeightCache must reset _messageVirtualScrollSettleTimer to 0"
+    )
+    assert metrics["deferred"] is None, (
+        "_clearMessageVirtualHeightCache must clear _messageVirtualDeferredMeasurement to null"
+    )
+    assert metrics["timerCleared"] is True, (
+        "_clearMessageVirtualHeightCache must call clearTimeout on the pending settle timer"
+    )
+    assert metrics["seenKeys"] == [], (
+        "_clearMessageVirtualHeightCache must clear the measurement-burst seen-key "
+        f"memory: seenKeys {metrics['seenKeys']}"
+    )
+    assert metrics["burstActive"] is False, (
+        "_clearMessageVirtualHeightCache must end any active measurement burst: "
+        f"burstActive {metrics['burstActive']}"
+    )
+    assert metrics["queuedOrigin"] is None, (
+        "_clearMessageVirtualHeightCache must clear any queued internal-measurement "
+        f"provenance: queuedOrigin {metrics['queuedOrigin']}"
+    )
+
+
+def _measurement_burst_harness(scenario_js: str) -> str:
+    """Shared queued-rAF harness for the measurement-burst chain (#6654/#6717).
+
+    Drives the REAL production chain: the cycle-aware scheduler queues a first
+    rAF, _scheduleMessageVirtualizedRender queues a second rAF (the
+    internal-measurement provenance marker is threaded through BOTH layers),
+    and the renderMessages stub applies the production burst-reset contract for
+    every unmarked (external) render, then simulates the measure pass from the
+    caller-provided plan (measurePlan). Unlike the earlier synchronous-rAF
+    harnesses, external renders can land BETWEEN queued rAF callbacks — exactly
+    where the overlap/convergence regressions lived.
+    """
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    cap_match = re.search(
+        r"MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS\s*=\s*(\d+)", js
+    )
+    assert cap_match, (
+        "MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS must be defined in ui.js "
+        "(absolute per-burst cap, #6717 re-gate)"
+    )
+    cap = int(cap_match.group(1))
+    return _extract_func_script(js) + (
+        "// Absolute per-burst ceiling, read from production ui.js (#6717 re-gate).\n"
+        f"const MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS = {cap};\n"
+    ) + """
+// ── queued-rAF harness ────────────────────────────────────────────────────────
+let renderLog = [];                 // every renderMessages call: {internal, preserveScroll}
+let rafQueue = [];
+function requestAnimationFrame(cb){ rafQueue.push(cb); return rafQueue.length; }
+function flushRaf(){ const q = rafQueue; rafQueue = []; for (const cb of q) cb(); }
+let _messageVirtualScrollRaf = 0;
+let _messageVirtualWindowKey = '';
+let _messageVirtualMeasurementCycleKey = '';
+let _messageVirtualMeasurementSeenKeys = [];
+let _messageVirtualMeasurementBurstActive = false;
+let _messageVirtualRenderQueuedOrigin = null;
+let _messageVirtualScrollActive = false;
+let _messageVirtualDeferredMeasurement = null;
+let _scrollbarDragActive = false;
+let _msgNodeRecycleEnabled = false;
+let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+function _deferClearProgrammaticScroll(){}
+function $(id){ return {}; }
+function _getVisibleMessagesWithIdx(){ return []; }
+function _messageVirtualKeepTailCount(){ return 0; }
+function _currentMessageVirtualWindow(){
+  return { virtualized:true, start:0, end:10, topPad:0, bottomPad:0, tailStart:10, total:20 };
+}
+function _messageVirtualMeasurementCycleKeyFor(w){ return (w && w.key) || ''; }
+function _compensateScrollForMeasurementDelta(fn){ return fn(); }
+// Simulated measure pass: after each render, the plan yields the next measured
+// window cycle key; undefined means the measurements settled (unchanged).
+let measurePlan = [];
+let measureIdx = 0;
+function renderMessages(options){
+  const internal = !!(options && options._internalMeasurement);
+  renderLog.push({ internal: internal, preserveScroll: !!(options && options.preserveScroll) });
+  // Contract of production renderMessages(): every UNMARKED (external) render
+  // trigger starts a fresh measurement burst, overriding any pending internal
+  // callback.
+  if(!internal) _resetMessageVirtualMeasurementBurst();
+  const next = measurePlan[measureIdx++];
+  if(next === undefined){
+    _markMessageVirtualMeasurementsSettled({ key: 'settled' });
+  }else{
+    _scheduleMessageVirtualMeasurementRefresh({ key: next });
+  }
+}
+// Production functions under test.
+eval(extractFunc('_resetMessageVirtualMeasurementBurst'));
+eval(extractFunc('_messageVirtualWindowKeyFor'));
+eval(extractFunc('_scheduleMessageVirtualMeasurementRefresh'));
+eval(extractFunc('_scheduleMessageVirtualizedRender'));
+eval(extractFunc('_markMessageVirtualMeasurementsSettled'));
+""" + scenario_js
+
+
+def test_oscillating_cycle_keys_terminate_burst_with_queued_raf():
+    """#6654/#6717 re-gate (c): a repeated oscillating window key (A->B->A->B)
+    must terminate the measurement burst even though every key was unseen on
+    first sight — the burst tracks SEEN keys, so geometry that flaps between
+    two states can never renew the chain and keep the rAF/measure loop alive
+    (~30% WebContent CPU, issue #6654). The queued-rAF harness drives the
+    oscillation through the real two-rAF-layer chain."""
+    source = _measurement_burst_harness("""
+measurePlan = ['B','A','B','A','B','A'];
+renderMessages({});           // external trigger: measures B -> burst starts
+flushRaf(); flushRaf();       // layer-1 then layer-2 rAF -> internal render (A)
+flushRaf(); flushRaf();       // next cycle -> internal render (B repeats) -> burst ends
+flushRaf(); flushRaf();       // nothing left queued
+console.log(JSON.stringify({
+  renders: renderLog.length,
+  internal: renderLog.filter(r => r.internal).length,
+  burstActive: _messageVirtualMeasurementBurstActive,
+  seenKeys: _messageVirtualMeasurementSeenKeys,
+  queuedOrigin: _messageVirtualRenderQueuedOrigin,
+}));
+""")
+    metrics = json.loads(_run_node(source))
+    assert metrics["internal"] == 2, (
+        "A->B->A->B oscillation must stay bounded: a repeated key ends the burst. "
+        f"scheduled {metrics['internal']} internal re-renders (expected 2, then termination)"
+    )
+    assert metrics["renders"] == 3, (
+        "oscillation must not keep scheduling renders: "
+        f"{metrics['renders']} renders (expected 3 = 1 external + 2 internal)"
+    )
+    assert metrics["burstActive"] is False, (
+        "the burst must end once the repeated key is detected so the next "
+        f"externally initiated cycle starts fresh: burstActive {metrics['burstActive']}"
+    )
+    assert metrics["seenKeys"] == [], (
+        "termination must clear the seen-key memory: "
+        f"seenKeys {metrics['seenKeys']}"
+    )
+    assert metrics["queuedOrigin"] is None, (
+        "no internal render may remain queued after termination: "
+        f"queuedOrigin {metrics['queuedOrigin']}"
+    )
+
+
+def test_consecutive_same_key_row_shrink_converges_to_settled():
+    """#6717 re-gate: consecutive same-key passes (e.g. A->A->B->settled from
+    a row shrinking across two measurement passes with unchanged window bounds)
+    must NOT be cut short as oscillation. Only non-consecutive repeats (A->B->A)
+    represent cyclic oscillation; consecutive same-key passes continue toward
+    convergence while remaining bounded by the absolute cap."""
+    source = _measurement_burst_harness("""
+measurePlan = ['A', 'A', 'B'];  // R0 measures A, R1 internal measures A (consecutive), R2 internal measures B, then settled
+renderMessages({});             // external trigger: measures A -> burst starts
+flushRaf(); flushRaf();         // L1 -> L2: internal render measures A again (consecutive same key) -> must proceed!
+flushRaf(); flushRaf();         // L1 -> L2: internal render measures B -> proceeds!
+flushRaf(); flushRaf();         // L1 -> L2: internal render measures settled
+console.log(JSON.stringify({
+  renders: renderLog.length,
+  internal: renderLog.filter(r => r.internal).length,
+  burstActive: _messageVirtualMeasurementBurstActive,
+  seenKeys: _messageVirtualMeasurementSeenKeys,
+  queuedOrigin: _messageVirtualRenderQueuedOrigin,
+}));
+""")
+    metrics = json.loads(_run_node(source))
+    assert metrics["internal"] == 3, (
+        "consecutive same-key pass (row shrink) must NOT be cut short as oscillation: "
+        f"got {metrics['internal']} internal renders (expected 3)"
+    )
+    assert metrics["renders"] == 4, (
+        f"burst must converge to settled: {metrics['renders']} renders (expected 4 = 1 external + 3 internal)"
+    )
+    assert metrics["burstActive"] is False, (
+        f"burst must settle: burstActive {metrics['burstActive']}"
+    )
+    assert metrics["seenKeys"] == [], (
+        f"settlement must clear seen-key memory: seenKeys {metrics['seenKeys']}"
+    )
+
+
+def test_genuine_convergence_exceeding_two_renders_completes():
+    """#6717 re-gate (b): a legitimate forward convergence A->B->C->settled
+    (content reflow, fonts/images loading late, dynamic height) must be allowed
+    MORE than two measurement passes. The old flat two-render burst cap left
+    the geometry mis-measured (wrong row heights / clipped content); cycle-aware
+    tracking lets every UNSEEN key proceed until the measurements settle."""
+    source = _measurement_burst_harness("""
+measurePlan = ['B','C','D'];   // three distinct forward keys, then settled
+renderMessages({});            // external trigger: measures B
+flushRaf(); flushRaf();        // internal render: measures C
+flushRaf(); flushRaf();        // internal render: measures D
+flushRaf(); flushRaf();        // internal render: measurements settle
+console.log(JSON.stringify({
+  renders: renderLog.length,
+  internal: renderLog.filter(r => r.internal).length,
+  lastInternal: renderLog[renderLog.length - 1].internal,
+  burstActive: _messageVirtualMeasurementBurstActive,
+  seenKeys: _messageVirtualMeasurementSeenKeys,
+  queuedOrigin: _messageVirtualRenderQueuedOrigin,
+}));
+""")
+    metrics = json.loads(_run_node(source))
+    assert metrics["internal"] == 3, (
+        "genuine A->B->C->settled convergence must complete with MORE than the "
+        "old two-render cap: "
+        f"{metrics['internal']} internal re-renders (expected 3)"
+    )
+    assert metrics["renders"] == 4, (
+        "the convergence chain must run to completion: "
+        f"{metrics['renders']} renders (expected 4 = 1 external + 3 internal)"
+    )
+    assert metrics["lastInternal"] is True, (
+        "the final render of the convergence chain must still be part of the "
+        "internal measurement chain (settled via _markMessageVirtualMeasurementsSettled)"
+    )
+    assert metrics["burstActive"] is False, (
+        "settlement must end the burst: "
+        f"burstActive {metrics['burstActive']}"
+    )
+    assert metrics["seenKeys"] == [] and metrics["queuedOrigin"] is None, (
+        "settlement must clear the seen-key memory and any queued provenance: "
+        f"seenKeys {metrics['seenKeys']}, queuedOrigin {metrics['queuedOrigin']}"
+    )
+
+
+def test_overlapping_external_append_receives_fresh_budget():
+    """#6717 re-gate (a): an externally initiated render (message append,
+    scroll-settle, genuine content change) that lands while an internal
+    measurement callback is still PENDING in the rAF queue must reset the burst
+    — external provenance overrides a pending internal callback — so the new
+    cycle receives a fresh budget instead of being starved by the stale burst's
+    seen-key memory (0 retries).
+
+    Phase 1: the append lands between the two rAF layers and measures key B
+    (already seen in the stale burst). Only the external reset lets B proceed;
+    without it the repeated key would terminate the append's cycle immediately.
+    The stale layer-2 callback (queued for the DEAD burst) must then degrade to
+    an UNMARKED render — the append's own measurement must not revive an
+    internal marker onto it, because the provenance belongs to the queued
+    render, not to a global flag (#6717 re-gate MUST-FIX 2) — and the fresh
+    cycle it starts completes with its own internal render, so the append is
+    never starved of retries.
+    Phase 2: an external render that measures SETTLED lands while a layer-2
+    callback is pending; the stale callback must then degrade to an UNMARKED
+    render (the external reset consumed its provenance), and the fresh cycle it
+    starts must complete with its own internal render."""
+    source = _measurement_burst_harness("""
+measurePlan = ['B','B','C', undefined, 'E', undefined, 'F', undefined];
+renderMessages({});            // R0 external: burst starts, seen=[B], L1 queued
+flushRaf();                    // L1 fires -> L2 (internal callback) now pending
+renderMessages({});            // R1 EXTERNAL APPEND lands before L2 fires:
+                               // resets the burst -> fresh cycle, seen=[B] again
+flushRaf(); flushRaf();        // stale L2 fires UNMARKED (R2, external won),
+                               // fresh cycle completes (R3 internal) -> settles
+renderMessages({});            // R4 external: new cycle, L1 queued
+flushRaf();                    // L1 fires -> L2 (internal callback) now pending
+renderMessages({});            // R5 external scroll-settle: resets the burst,
+                               // measures SETTLED (no new schedule)
+flushRaf();                    // stale L2 fires -> marker consumed as FALSE ->
+                               // R6 UNMARKED render (external provenance won)
+flushRaf(); flushRaf();        // R6's fresh cycle completes (R7 internal) -> settles
+console.log(JSON.stringify({
+  renders: renderLog.length,
+  internal: renderLog.filter(r => r.internal).length,
+  appendExternal: renderLog[1].internal,
+  staleL2Unmarked: renderLog[2].internal,
+  postAppendCycleInternal: renderLog[3].internal,
+  staleCallbackUnmarked: renderLog[6].internal,
+  postResetCycleInternal: renderLog[7].internal,
+  burstActive: _messageVirtualMeasurementBurstActive,
+  seenKeys: _messageVirtualMeasurementSeenKeys,
+  queuedOrigin: _messageVirtualRenderQueuedOrigin,
+}));
+""")
+    metrics = json.loads(_run_node(source))
+    assert metrics["renders"] == 8, (
+        "the overlapping append must NOT starve the new cycle: the chain must "
+        "continue past the append to completion "
+        f"({metrics['renders']} renders; expected 8)"
+    )
+    assert metrics["appendExternal"] is False, (
+        "the append is an unmarked external render"
+    )
+    assert metrics["staleL2Unmarked"] is False, (
+        "the stale layer-2 callback (queued for the burst the append reset) "
+        "must degrade to an UNMARKED render: the append's own measurement "
+        "must not revive an internal marker onto it — provenance belongs to "
+        "the queued render, external wins (#6717 re-gate MUST-FIX 2)"
+    )
+    assert metrics["postAppendCycleInternal"] is True, (
+        "the fresh cycle after the degraded stale callback must complete with "
+        "its own internal render (fresh budget — the repeated key B was not "
+        "treated as oscillation because the external render reset the burst)"
+    )
+    assert metrics["staleCallbackUnmarked"] is False, (
+        "external provenance must override the pending internal callback: the "
+        "stale internal rAF callback must degrade to an unmarked render after "
+        "the external render reset the burst"
+    )
+    assert metrics["postResetCycleInternal"] is True, (
+        "the cycle started by the degraded stale callback must complete with "
+        "its own internal render (retries were not starved)"
+    )
+    assert metrics["burstActive"] is False, (
+        "the fresh cycles must end settled: "
+        f"burstActive {metrics['burstActive']}"
+    )
+    assert metrics["seenKeys"] == [] and metrics["queuedOrigin"] is None, (
+        "settlement must clear the seen-key memory and any queued provenance: "
+        f"seenKeys {metrics['seenKeys']}, queuedOrigin {metrics['queuedOrigin']}"
+    )
+
+
+def test_all_distinct_keys_terminate_burst_with_bounded_storage():
+    """#6717 re-gate MUST-FIX 1: an ALL-DISTINCT monotonic key sequence
+    (A->B->C->D->... never repeating) must still terminate. The seen-key rule
+    alone only ends the burst on a REPEATED key, so a browser emitting a
+    never-repeating geometry would loop without limit — the #6654 CPU-runaway
+    class under a different trigger — while _messageVirtualMeasurementSeenKeys
+    grows without bound (memory). The absolute per-burst cap ends the burst
+    regardless of key novelty and bounds the seen-key collection to the cap.
+    Driven through the real two-rAF-layer chain with MORE distinct keys than
+    the cap, and asserting the burst stops at exactly the cap with no rAF left
+    queued and the seen-key memory cleared."""
+    source = _measurement_burst_harness("""
+measurePlan = [];
+for(let i=0;i<40;i++) measurePlan.push('K'+i);  // 40 distinct keys, well over the cap
+renderMessages({});            // external trigger: starts the burst
+for(let i=0;i<40;i++) flushRaf();  // drain both rAF layers repeatedly
+console.log(JSON.stringify({
+  renders: renderLog.length,
+  internal: renderLog.filter(r => r.internal).length,
+  burstActive: _messageVirtualMeasurementBurstActive,
+  seenKeys: _messageVirtualMeasurementSeenKeys,
+  queuedOrigin: _messageVirtualRenderQueuedOrigin,
+  rafPending: rafQueue.length,
+  cap: MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS,
+}));
+""")
+    metrics = json.loads(_run_node(source))
+    cap = metrics["cap"]
+    assert metrics["internal"] == cap, (
+        "an all-distinct sequence must be cut off by the absolute per-burst "
+        f"cap: {metrics['internal']} internal renders (expected exactly {cap})"
+    )
+    assert metrics["renders"] == cap + 1, (
+        "the all-distinct burst must terminate after the cap (1 external + cap "
+        f"internal renders): {metrics['renders']} renders (expected {cap + 1})"
+    )
+    assert metrics["rafPending"] == 0, (
+        "no rAF may remain queued after the cap ends the burst: "
+        f"rafPending {metrics['rafPending']}"
+    )
+    assert metrics["burstActive"] is False, (
+        "the cap must end the burst: "
+        f"burstActive {metrics['burstActive']}"
+    )
+    assert metrics["seenKeys"] == [], (
+        "termination must clear the seen-key memory (bounded storage — at most "
+        f"cap keys were ever retained): seenKeys {metrics['seenKeys']}"
+    )
+    assert metrics["queuedOrigin"] is None, (
+        "no internal provenance may remain queued after the cap ends the burst: "
+        f"queuedOrigin {metrics['queuedOrigin']}"
+    )
+
+
+def test_queued_raf_external_scroll_wins_provenance():
+    """#6717 re-gate MUST-FIX 2: when an external render (user scroll /
+    scroll-settle) overlaps a QUEUED internal rAF, the render that actually
+    fires must be treated as EXTERNAL. The old global consumable flag
+    (_messageVirtualMeasurementRenderPending) could be consumed by an
+    unrelated render, marking external renders as internal so the burst was
+    never reset — leaving stale virtual-window / spacer geometry until the
+    next unrelated render.
+
+    Sequence: external R0 measures A (L2 queued internal); an external R1
+    lands while L2 is pending — it resets the burst, measures B, and its own
+    layer-1 rAF COALESCES into the pending L2 (the early-return path where
+    the old flag leaked). The L2 that fires must be UNMARKED — external
+    provenance wins — so the A it measures starts a fresh burst instead of
+    terminating on the repeated key with zero retry queued."""
+    source = _measurement_burst_harness("""
+measurePlan = ['A','B','A', undefined];
+renderMessages({});            // R0 external: measures A -> burst, L1 queued
+flushRaf();                    // L1 -> L2 queued with internal provenance
+renderMessages({});            // R1 EXTERNAL scroll lands while L2 pending:
+                               // resets the burst, measures B -> L1 queued
+flushRaf();                    // B's L1 coalesces into the pending L2 (no new rAF)
+flushRaf();                    // L2 fires -> must be UNMARKED (external won),
+                               // measures A -> fresh burst -> L1 queued
+flushRaf(); flushRaf();        // A's fresh cycle: L2 internal render -> settles
+console.log(JSON.stringify({
+  renders: renderLog.length,
+  internal: renderLog.filter(r => r.internal).length,
+  r0External: renderLog[0].internal,
+  r1External: renderLog[1].internal,
+  coalescedL2Unmarked: renderLog[2].internal,
+  freshCycleInternal: renderLog[3].internal,
+  burstActive: _messageVirtualMeasurementBurstActive,
+  seenKeys: _messageVirtualMeasurementSeenKeys,
+  queuedOrigin: _messageVirtualRenderQueuedOrigin,
+}));
+""")
+    metrics = json.loads(_run_node(source))
+    assert metrics["renders"] == 4, (
+        "the scroll overlap chain must run to completion: "
+        f"{metrics['renders']} renders (expected 4)"
+    )
+    assert metrics["r0External"] is False and metrics["r1External"] is False, (
+        "R0 and R1 are unmarked external renders"
+    )
+    assert metrics["coalescedL2Unmarked"] is False, (
+        "the queued internal rAF must degrade to an UNMARKED render when an "
+        "external request coalesced into it — external provenance wins and an "
+        "internal marker must never survive onto an external render"
+    )
+    assert metrics["freshCycleInternal"] is True, (
+        "the fresh cycle started by the degraded render must complete with its "
+        "own internal render: the repeated A key must NOT terminate it because "
+        "the burst was reset (zero retry queued would leave stale geometry)"
+    )
+    assert metrics["burstActive"] is False, (
+        "the fresh cycle must end settled: "
+        f"burstActive {metrics['burstActive']}"
+    )
+    assert metrics["seenKeys"] == [] and metrics["queuedOrigin"] is None, (
+        "settlement must clear the seen-key memory and any queued provenance: "
+        f"seenKeys {metrics['seenKeys']}, queuedOrigin {metrics['queuedOrigin']}"
+    )

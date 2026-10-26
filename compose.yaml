@@ -1,0 +1,30 @@
+name: testhermes
+
+services:
+  hermes-webui:
+    image: ${HERMES_IMAGE:-shanqi-hermes:dev}
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:18788:8787"
+
+    environment:
+      HERMES_WEBUI_HOST: "0.0.0.0"
+      HERMES_WEBUI_PORT: "8787"
+      HERMES_HOME: "/home/hermeswebui/.hermes"
+      HERMES_WEBUI_AGENT_DIR: "/opt/hermes"
+      HERMES_WEBUI_STATE_DIR: "/home/hermeswebui/.hermes/webui"
+      HERMES_WEBUI_DEFAULT_WORKSPACE: "/workspace"
+      HERMES_WEBUI_PASSWORD: "${HERMES_WEBUI_PASSWORD}"
+      CLOUD_API_KEY: "${CLOUD_API_KEY:-}"
+      LOCAL_API_KEY: "${LOCAL_API_KEY:-}"
+      UV_OVERRIDE: "/app/uv-overrides.txt"
+      UV_LINK_MODE: "copy"
+
+    volumes:
+      - hermes-home:/home/hermeswebui/.hermes
+      - hermes-workspace:/workspace
+
+volumes:
+  hermes-home:
+  hermes-workspace:
