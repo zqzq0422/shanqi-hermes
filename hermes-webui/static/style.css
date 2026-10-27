@@ -7679,3 +7679,10 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 /* Settings field highlight (mirrors msg-question-highlight / _highlightQuestionRow pattern) */
 .settings-field-highlight { animation: settings-field-pulse 1.6s ease-out; }
 @keyframes settings-field-pulse { 0% { box-shadow: 0 0 0 0 var(--focus-ring); } 35% { box-shadow: 0 0 0 4px var(--focus-ring); } 100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); } }
+
+/* Business details reuse each tool card's existing disclosure and theme. */
+.tool-execution-detail { padding: 10px 12px; box-sizing: border-box; }
+.tool-execution-detail dl { display: grid; grid-template-columns: minmax(90px, auto) minmax(0, 1fr); gap: 6px 14px; margin: 8px 0; font-size: 12px; line-height: 1.5; }
+.tool-execution-detail dt { opacity: .65; }
+.tool-execution-detail dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 480px) { .tool-execution-detail dl { grid-template-columns: 1fr; gap: 3px; } .tool-execution-detail dd { margin-bottom: 6px; } }

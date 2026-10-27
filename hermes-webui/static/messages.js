@@ -6102,6 +6102,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     if(d.args!==undefined) tc.args=d.args;
     if(d.snippet!==undefined) tc.snippet=d.snippet;
+    if(d.execution&&typeof d.execution==='object') tc.execution=d.execution;
     tc._liveToolCallSignature = _toolCallSignature(tc,tc.activityBurstId,tc.activitySegmentSeq);
     tc.activityBurstId = Number.isFinite(Number(tc.activityBurstId))
       ? Number(tc.activityBurstId)

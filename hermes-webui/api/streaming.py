@@ -12235,6 +12235,13 @@ def _extract_tool_calls_from_messages(messages, live_tool_calls=None):
                 'args': _truncate_tool_args(live_tc.get('args', {}), limit=4),
             })
 
+    live_by_id = {str(tc.get('tid')): tc for tc in live if tc.get('tid')}
+    for tc in tool_calls:
+        evidence = live_by_id.get(str(tc.get('tid')), {})
+        if isinstance(evidence.get('execution'), dict):
+            tc['execution'] = dict(evidence['execution'])
+        if evidence.get('is_error'):
+            tc['is_error'] = True
     return tool_calls
 
 
@@ -14667,6 +14674,7 @@ def _run_agent_streaming(
             _interim_reasoning_idx: list = []
             _unbound_reasoning_idx = [None]
             _live_tool_calls = []  # tool progress fallback when final messages omit tool IDs
+            _business_execution = None
 
             # Throttle: emit metering events at most every 100 ms so the per-message
             # TPS label feels live during fast token streams without flooding SSE.
@@ -15118,6 +15126,8 @@ def _run_agent_streaming(
                     return
 
             def on_tool_start(tool_call_id, name, args):
+                from api.execution_policy import execution_detail
+                execution = execution_detail(_business_execution, tool_call_id)
                 if tool_call_id:
                     _tool_call_reasoning_idx.setdefault(tool_call_id, []).append(_unbound_reasoning_idx[0])
                     _tool_start_order.append(tool_call_id)
@@ -15130,6 +15140,7 @@ def _run_agent_streaming(
                             'name': name,
                             'args': args if isinstance(args, dict) else {},
                             'tid': tool_call_id,
+                            'execution': execution,
                         })
                         # Mirror to shared dict so cancel_stream() can persist it (#1361 §B)
                         # Lock-free GIL-atomic mirror — see STREAMS_LOCK contract in on_token.
@@ -15139,6 +15150,7 @@ def _run_agent_streaming(
                                 'args': args if isinstance(args, dict) else {},
                                 'done': False,
                                 'tid': tool_call_id,
+                                'execution': execution,
                             })
                         put('tool', {
                             'event_type': 'tool.started',
@@ -15146,6 +15158,7 @@ def _run_agent_streaming(
                             'preview': None,
                             'args': _tool_args_snapshot(args),
                             'tid': tool_call_id,
+                            'execution': execution,
                         })
                     _tool_stats = meter().get_stats(stream_id)
                     _tool_stats['session_id'] = session_id
@@ -15155,6 +15168,9 @@ def _run_agent_streaming(
                     logger.debug('Failed to update live prompt estimate on tool start', exc_info=True)
 
             def on_tool_complete(tool_call_id, name, args, function_result):
+                from api.execution_policy import execution_detail, result_is_error
+                execution = execution_detail(_business_execution, tool_call_id)
+                is_error = result_is_error(function_result) or execution.get('status') in {'blocked', 'failed'}
                 try:
                     _record_live_tool_complete(tool_call_id, name, function_result)
                     if tool_call_id and tool_call_id not in _live_tool_event_complete_ids:
@@ -15166,6 +15182,8 @@ def _run_agent_streaming(
                             if live_tc.get('tid') == tool_call_id or (not live_tc.get('tid') and live_tc.get('name') == name):
                                 live_tc['done'] = True
                                 live_tc['snippet'] = result_snippet
+                                live_tc['execution'] = execution
+                                live_tc['is_error'] = is_error
                                 break
                         if stream_id in STREAM_LIVE_TOOL_CALLS:
                             for shared_tc in reversed(STREAM_LIVE_TOOL_CALLS[stream_id]):
@@ -15174,6 +15192,8 @@ def _run_agent_streaming(
                                 if shared_tc.get('tid') == tool_call_id or (not shared_tc.get('tid') and shared_tc.get('name') == name):
                                     shared_tc['done'] = True
                                     shared_tc['snippet'] = result_snippet
+                                    shared_tc['execution'] = execution
+                                    shared_tc['is_error'] = is_error
                                     break
                         _checkpoint_activity[0] += 1
                         put('tool_complete', {
@@ -15182,7 +15202,8 @@ def _run_agent_streaming(
                             'preview': result_snippet,
                             'args': _tool_args_snapshot(args),
                             'tid': tool_call_id,
-                            'is_error': False,
+                            'is_error': is_error,
+                            'execution': execution,
                         })
                         # Mirror the todo tool's in-memory state into
                         # a dedicated SSE event so the Todos panel can
@@ -15372,6 +15393,15 @@ def _run_agent_streaming(
             except Exception:
                 from api.config import get_config as _get_config
                 _cfg = _get_config()
+            from api.execution_policy import BusinessExecution
+            _business_execution = BusinessExecution.from_config(
+                _cfg.get('webui_execution_policy'), workspace=s.workspace,
+                profile=getattr(s, 'profile', None) or 'default', session_id=session_id,
+                api_mode=_runtime_bundle.get('api_mode'),
+                on_blocked=lambda tid, name, args, result: (
+                    on_tool_start(tid, name, args), on_tool_complete(tid, name, args, result)
+                ),
+            )
             _prefill_context = _load_webui_prefill_context(_cfg)
             _prefill_messages = _prefill_messages_with_webui_context(_prefill_context, _cfg)
             _prefill_messages = _normalize_prefill_messages_before_user_turn(_prefill_messages)
@@ -15704,6 +15734,8 @@ def _run_agent_streaming(
                 else:
                     agent = _AIAgent(**_agent_kwargs)
                     _cache_new_agent = True
+
+            agent.business_execution_policy = _business_execution
 
             if not _register_agent_if_current(agent, _agent_sig if _cache_new_agent else None):
                 with _agent_lock:
@@ -16545,6 +16577,7 @@ def _run_agent_streaming(
                             if 'credential_pool' in _agent_params:
                                 _agent_kwargs['credential_pool'] = _runtime_bundle['credential_pool']
                             agent = _AIAgent(**_agent_kwargs)
+                            agent.business_execution_policy = _business_execution
                             _agent_sig = _compute_agent_cache_signature(
                                 resolved_model,
                                 resolved_api_key,
@@ -18018,6 +18051,7 @@ def _run_agent_streaming(
                     if 'credential_pool' in _agent_params:
                         _heal_kwargs['credential_pool'] = _runtime_bundle['credential_pool']
                     _heal_agent = _AIAgent(**_heal_kwargs)
+                    _heal_agent.business_execution_policy = locals().get('_business_execution')
                     # Delta callbacks close over `agent`; the replacement, not
                     # the failed original, owns any successful retry output.
                     agent = _heal_agent
