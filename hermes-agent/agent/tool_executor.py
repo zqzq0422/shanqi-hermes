@@ -744,21 +744,37 @@ def _dispatch_authorized_once(
             block_body=block_body, block_error_type=block_error_type, guardrail_decision=guardrail_decision,
         )
 
-    if ref.name == "memory":
-        agent._turns_since_memory = 0
-    elif ref.name == "skill_manage":
-        agent._iters_since_skill = 0
+    def _execute_native():
+        if ref.name == "memory":
+            agent._turns_since_memory = 0
+        elif ref.name == "skill_manage":
+            agent._iters_since_skill = 0
 
-    from agent.terminal_approval_batch import prepare_current_terminal
-    prepare_current_terminal(ref)
-    _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    from agent.tool_progress_relay import bound_tool_progress
-    from tools.connectors.data_use import collect_data_use
-    with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use:
-        try:
-            return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
-        finally:
-            state.data_use = frozenset(data_use)
+        from agent.terminal_approval_batch import prepare_current_terminal
+        prepare_current_terminal(ref)
+        _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
+        from agent.tool_progress_relay import bound_tool_progress
+        from tools.connectors.data_use import collect_data_use
+        with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use:
+            try:
+                return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+            finally:
+                state.data_use = frozenset(data_use)
+
+    business = getattr(agent, 'business_execution_policy', None)
+    if business is None:
+        return _execute_native()
+
+    def _business_block(body):
+        _advance_start_order()
+        state.blocked = True
+        return _blocked_tool_result(agent, ref, block_body=body,
+                                    block_error_type='business_policy', guardrail_decision=None)
+
+    from agent.runtime_cwd import resolve_agent_cwd
+    return business.execute(ref.name, ref.args, execute=_execute_native,
+                            call_id=ref.call_id, cwd=resolve_agent_cwd, on_block=_business_block,
+                            caller_session_id=getattr(agent, "session_id", None))
 
 
 def _run_agent_tool_execution_middleware(

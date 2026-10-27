@@ -23565,6 +23565,40 @@ function _toolDetailLeadText(kind, tc){
   if(!target) return '';
   return target;
 }
+function _toolExecutionDetailHtml(tc){
+  const zh=String(document.documentElement.lang||'').toLowerCase().startsWith('zh');
+  const label=(cn,en)=>zh?cn:en;
+  const e=tc&&tc.execution&&typeof tc.execution==='object'?tc.execution:{};
+  const rows=[];
+  const state=tc.done===false?label('执行中','Running'):tc.is_error?label('调用失败','Failed'):label('调用已结束','Call finished');
+  rows.push([label('运行状态','Status'),state]);
+  const args=tc.args&&typeof tc.args==='object'?tc.args:{};
+  const tasks=(tc.name==='todo'||tc.name==='todo_list')?args.todos:tc.name==='delegate_task'?args.tasks:null;
+  if(Array.isArray(tasks)){
+    rows.push([tc.name==='delegate_task'?label('委派任务','Delegated tasks'):label('任务规划（本次提交）','Plan submitted'),
+      tasks.slice(0,8).map((task,i)=>`${i+1}. ${String(task&&(task.content||task.goal||task.id)||(typeof task==='string'?task:'')).slice(0,180)}`).join('\n')]);
+    if(tasks.length>8) rows.push([label('更多条目','More items'),String(tasks.length-8)]);
+  }else if(tc.name==='delegate_task'&&args.goal){
+    rows.push([label('委派目标','Delegated goal'),String(args.goal).slice(0,400)]);
+  }else if(tc.name==='subagent_progress'){
+    rows.push([label('子 Agent','Subagent'),String(tc.preview||tc.snippet||'').slice(0,400)]);
+  }
+  const permission={passed:label('通过','Passed'),blocked:label('拒绝调用','Blocked'),pending:label('等待检查','Pending')};
+  rows.push([label('调用前业务检查','Business checks'),e.enabled===true?(permission[e.permission]||label('等待结果','Pending')):
+    e.enabled===false?label('未启用，沿用原有工具权限','Disabled; native tool permissions apply'):label('无业务检查记录','No business check record')]);
+  if(e.enabled===true){
+    const verification={passed:label('通过','Passed'),failed:label('未通过','Failed'),not_configured:label('此工具未配置产物核验','No artifact checks configured'),not_run:label('未执行','Not run')};
+    rows.push([label('结果核验','Result checks'),verification[e.verification]||label('等待工具结果','Awaiting result')]);
+    if(Number.isFinite(e.retry_count)) rows.push([label('业务重试','Business retries'),`${e.retry_count} / ${e.max_retries}`]);
+    if(Number.isFinite(e.call_count)) rows.push([label('本轮工具调用','Turn tool calls'),String(e.call_count)]);
+    if(e.reason) rows.push([label('原因','Reason'),String(e.reason).slice(0,500)]);
+    if(e.retryable===true) rows.push([label('后续处理','Next action'),label('允许 Hermes 修正此步骤后重试','Hermes may correct this step and retry')]);
+    if(e.retryable===false) rows.push([label('后续处理','Next action'),label('停止此步骤重试并说明原因','Stop retrying this step and explain the failure')]);
+    if(Number.isFinite(e.elapsed_ms)) rows.push([label('执行耗时','Duration'),`${e.elapsed_ms} ms`]);
+  }
+  return `<section class="tool-execution-detail"><div class="tool-card-detail-lead-label">${esc(label('执行过程','Execution details'))}</div><dl>${rows.map(([key,value])=>`<dt>${esc(key)}</dt><dd>${esc(typeof _redactToolTargetLabel==='function'?_redactToolTargetLabel(String(value)):value)}</dd>`).join('')}</dl></section>`;
+}
+
 function buildToolCard(tc){
   const row=document.createElement('div');
   row.className='tool-card-row';
@@ -23580,7 +23614,8 @@ function buildToolCard(tc){
   const icon=toolIcon(tc.name);
   const hasRawDetail=!!(tc.snippet)||(tc.args&&Object.keys(tc.args).length>0);
   const allowsDetail=typeof _toolCardAllowsDetail==='function'?_toolCardAllowsDetail(toolKind,tc):true;
-  const hasDetail=hasRawDetail&&allowsDetail;
+  const executionDetail=typeof _toolExecutionDetailHtml==='function'?_toolExecutionDetailHtml(tc):'';
+  const hasDetail=!!executionDetail||(hasRawDetail&&allowsDetail);
   let displaySnippet='';
   if(tc.snippet){
     const s=tc.snippet;
@@ -23607,11 +23642,12 @@ function buildToolCard(tc){
   const argPreview=_formatToolArgPreview(tc&&tc.args);
   if(toolKind==='shell'||previewText===argPreview||previewText==='Completed'||previewText==='Running'||previewText==='Failed') previewText='';
   if(isSubagent) previewText=previewText.replace(/^(?:\u{1F500}|↳)\s*/u,'');
-  const detailLeadText=hasDetail&&typeof _toolDetailLeadText==='function'?_toolDetailLeadText(toolKind,tc):'';
+  const detailLeadText=hasDetail&&allowsDetail&&typeof _toolDetailLeadText==='function'?_toolDetailLeadText(toolKind,tc):'';
   const detailLeadLabel=typeof _toolDetailLeadLabel==='function'?_toolDetailLeadLabel(toolKind):(toolKind==='shell'?'Shell':'Input');
   const detailLead=detailLeadText?`<div class="tool-card-detail-lead"><div class="tool-card-detail-lead-label">${esc(detailLeadLabel)}</div><pre>${esc(detailLeadText)}</pre></div>`:'';
-  const argsEntries=tc.args&&Object.keys(tc.args).length?Object.entries(tc.args):[];
-  const visibleArgs=(detailLeadText&&toolKind==='shell')?[]:argsEntries;
+  const argsEntries=tc.args&&Object.keys(tc.args).length?Object.entries(tc.args).filter(([key])=>
+    !(executionDetail&&((tc.name==='delegate_task'&&key==='tasks')||((tc.name==='todo'||tc.name==='todo_list')&&key==='todos')))):[];
+  const visibleArgs=!allowsDetail||(detailLeadText&&toolKind==='shell')?[]:argsEntries;
   row.innerHTML=`
     <div class="${cardClass}">
       <div class="tool-card-header"${headerClick}>
@@ -23622,6 +23658,7 @@ function buildToolCard(tc){
         ${hasDetail?`<span class="tool-card-toggle">${li('chevron-right',12)}</span>`:''}
       </div>
       ${hasDetail?`<div class="tool-card-detail">
+        ${executionDetail}
         ${detailLead}
         ${visibleArgs.length?`<div class="tool-card-args">${
           visibleArgs.map(([k,v])=>{
@@ -23630,7 +23667,7 @@ function buildToolCard(tc){
             return `<div class="tool-arg-pair"><span class="tool-arg-key">${esc(k)}</span><span class="tool-arg-val">${esc(sv)}</span></div>`;
           }).join('')
         }</div>`:''}
-        ${displaySnippet?`<div class="tool-card-result">
+        ${allowsDetail&&displaySnippet?`<div class="tool-card-result">
           <pre>${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?`<code class="diff-block" data-highlighted="1">${_colorDiffLines(displaySnippet)}</code>`:esc(displaySnippet)}</pre>
           ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
         </div>`:''}

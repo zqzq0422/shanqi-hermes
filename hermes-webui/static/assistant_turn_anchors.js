@@ -941,6 +941,7 @@
       args:_sanitizePayload(args||{}),
       preview:preview||'',
       snippet:snippet||'',
+      execution:_sanitizePayload(_own(payload,'execution'))??null,
       result:_sanitizePayload(_own(payload,'result'))??null,
       output:_sanitizePayload(_own(payload,'output'))??null,
       done,

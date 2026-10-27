@@ -793,6 +793,8 @@ class _ChildRun:
     def seed_workspace(self) -> None:
         """Seed cwd/container aliases and optional worktree isolation for the child;
         ``goal`` is extended with the worktree contract note when isolation engaged."""
+        # Share only the optional turn budget; native child permission rules stay unchanged.
+        self.child.business_execution_policy = getattr(self.parent_agent, "business_execution_policy", None)
         import uuid as _uuid
         self.child_task_id = self.subagent_id or f"subagent-{self.task_index}-{_uuid.uuid4().hex[:8]}"
         self.parent_task_id = getattr(self.parent_agent, "_current_task_id", None)
